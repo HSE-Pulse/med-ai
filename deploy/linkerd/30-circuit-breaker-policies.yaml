@@ -1,0 +1,101 @@
+# Linkerd 2.15+ native outbound circuit breakers.
+#
+# Failure-accrual is configured per Service via annotations. When a
+# downstream endpoint returns 5xx / times out past the threshold, Linkerd
+# evicts it from the load-balancer for the backoff window so retries
+# don't hammer a failing pod.
+#
+# This replaces (or complements) the in-code circuit breakers in
+# shared/integration/service_client.py. Keep both initially — the code-
+# level breaker survives even when Linkerd isn't present (dev, tests).
+#
+# Apply:
+#   kubectl apply -n medai -f deploy/linkerd/30-circuit-breaker-policies.yaml
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bed-management
+  namespace: medai
+  annotations:
+    # Evict endpoint after 5 consecutive failures; restore after 10s.
+    balancer.linkerd.io/failure-accrual: "consecutive"
+    balancer.linkerd.io/failure-accrual-consecutive-max-failures: "5"
+    balancer.linkerd.io/failure-accrual-consecutive-min-penalty: "2s"
+    balancer.linkerd.io/failure-accrual-consecutive-max-penalty: "10s"
+    balancer.linkerd.io/failure-accrual-consecutive-jitter-ratio: "0.5"
+spec:
+  selector: { app.kubernetes.io/name: bed-management }
+  ports: [{ port: 8208, targetPort: http, name: http }]
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hospital-ops
+  namespace: medai
+  annotations:
+    balancer.linkerd.io/failure-accrual: "consecutive"
+    balancer.linkerd.io/failure-accrual-consecutive-max-failures: "3"
+    balancer.linkerd.io/failure-accrual-consecutive-max-penalty: "30s"
+spec:
+  selector: { app.kubernetes.io/name: hospital-ops }
+  ports: [{ port: 8203, targetPort: http, name: http }]
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: waiting-list
+  namespace: medai
+  annotations:
+    balancer.linkerd.io/failure-accrual: "consecutive"
+    balancer.linkerd.io/failure-accrual-consecutive-max-failures: "5"
+    balancer.linkerd.io/failure-accrual-consecutive-max-penalty: "10s"
+spec:
+  selector: { app.kubernetes.io/name: waiting-list }
+  ports: [{ port: 8209, targetPort: http, name: http }]
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ed-triage
+  namespace: medai
+  annotations:
+    balancer.linkerd.io/failure-accrual: "consecutive"
+    balancer.linkerd.io/failure-accrual-consecutive-max-failures: "5"
+    balancer.linkerd.io/failure-accrual-consecutive-max-penalty: "10s"
+spec:
+  selector: { app.kubernetes.io/name: ed-triage }
+  ports: [{ port: 8201, targetPort: http, name: http }]
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sepsis-icu
+  namespace: medai
+  annotations:
+    balancer.linkerd.io/failure-accrual: "consecutive"
+    balancer.linkerd.io/failure-accrual-consecutive-max-failures: "5"
+    balancer.linkerd.io/failure-accrual-consecutive-max-penalty: "15s"
+spec:
+  selector: { app.kubernetes.io/name: sepsis-icu }
+  ports: [{ port: 8202, targetPort: http, name: http }]
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: clinical-chat
+  namespace: medai
+  annotations:
+    # LLM backend is slow + expensive — lower tolerance, longer backoff
+    balancer.linkerd.io/failure-accrual: "consecutive"
+    balancer.linkerd.io/failure-accrual-consecutive-max-failures: "2"
+    balancer.linkerd.io/failure-accrual-consecutive-max-penalty: "30s"
+spec:
+  selector: { app.kubernetes.io/name: clinical-chat }
+  ports: [{ port: 8206, targetPort: http, name: http }]

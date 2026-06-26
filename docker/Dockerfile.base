@@ -1,0 +1,48 @@
+# hse-base: Python venv with all backend deps + shared/ + config.py.
+# Each per-service image (Dockerfile.service) extends this and only
+# copies its own app_NN/ directory so we don't rebuild torch + scipy
+# 19 times.
+FROM python:3.14-slim
+
+# ── System deps ──────────────────────────────────────────────────────────
+# libgomp1: required by lightgbm + xgboost-cpu.
+# build-essential: for any source-only wheels (kept here so the cache
+#   line containing apt-get is invalidated only when we change deps).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libgomp1 build-essential \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# ── Python venv ──────────────────────────────────────────────────────────
+ENV VIRTUAL_ENV=/venv \
+    PATH=/venv/bin:$PATH \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app
+
+# Install build deps first so editable install of med-ai works.
+RUN python -m venv $VIRTUAL_ENV \
+ && pip install --no-cache-dir --upgrade pip setuptools wheel
+
+# Install project deps via pyproject.toml (editable). Copy only the
+# manifest so Docker caches the (slow) dep install across rebuilds.
+COPY pyproject.toml ./
+COPY shared/ ./shared/
+COPY config.py ./
+RUN pip install --no-cache-dir -e . \
+ && pip install --no-cache-dir \
+      prometheus-client lightgbm aiokafka redis \
+      python-logging-loki openai xgboost-cpu \
+      opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp \
+      opentelemetry-instrumentation-fastapi \
+      opentelemetry-instrumentation-httpx \
+      opentelemetry-instrumentation-logging \
+      opentelemetry-instrumentation-pymongo
+
+# Bind-mount these at runtime instead of copying (1.9 GB datasets,
+# 36 MB models). docker-compose.services.yml mounts ./{models,datasets}.
+VOLUME ["/models", "/datasets"]
+
+# Sanity check the install at build time so we fail fast.
+RUN python -c "import fastapi, uvicorn, pymongo, torch, sklearn, xgboost, openai, lightgbm; print('hse-base ok')"

@@ -1,0 +1,91 @@
+# Grafana + Prometheus for MedAI observability.
+#
+# Wires into the existing `cancer_default` network (where Redpanda,
+# OTel Collector, Redis, Jaeger already live) so Prometheus can scrape
+# each container directly by its service name.
+#
+# Ports:
+#   3001   Grafana UI        (3000 is taken by the React dashboard)
+#   9091   Prometheus UI     (9090 is taken by the external hse-pulse stack)
+#
+# Start:
+#   docker compose -f docker-compose.grafana.yml up -d
+#
+# First-time login: admin / medai-dev
+#
+# Dashboards are auto-provisioned (no manual import needed):
+#   - Services overview  — per-service RPS, error rate, p95 latency from OTel
+#   - Kafka / Redpanda   — consumer group lag, partition high-water, produce rate
+#   - Patient flow       — admissions/discharges/occupancy from MedAI metrics
+#
+# Stop + keep data:   docker compose -f docker-compose.grafana.yml down
+# Stop + wipe data:   docker compose -f docker-compose.grafana.yml down -v
+
+services:
+  # Prometheus — scrapes OTel Collector, Redpanda, and each MedAI service's
+  # /metrics endpoint. Config provisioned via the mounted config file.
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: medai-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=30d
+      - --storage.tsdb.retention.size=2GB
+      - --web.enable-lifecycle        # /-/reload without restart
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom_data:/prometheus
+    ports:
+      - "9091:9090"
+    networks:
+      - cancer_default
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  grafana:
+    image: grafana/grafana:11.3.1
+    container_name: medai-grafana
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: medai-dev
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_INSTALL_PLUGINS: grafana-piechart-panel
+      GF_LOG_MODE: console
+      # Disable Grafana's own anonymous reporting
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      # Datasource + dashboard provisioning — Grafana reads these on boot
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3001:3000"
+    networks:
+      - cancer_default
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:3000/api/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+volumes:
+  prom_data:
+    name: medai-prom-data
+  grafana_data:
+    name: medai-grafana-data
+
+# Join the existing network that the OTel, Redpanda, and Redis stacks
+# already created. Marked as external so this compose doesn't try to
+# create it — it's owned by docker-compose.kafka.yml (first up wins).
+networks:
+  cancer_default:
+    external: true

@@ -1,0 +1,10 @@
+apiVersion: v2
+name: medai-service
+description: |
+  Parametric Helm chart for a MedAI FastAPI microservice. One chart, one
+  values file per service — keeps 17 services in sync without copy-paste.
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+maintainers:
+  - name: HSE-Pulse

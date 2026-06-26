@@ -1,0 +1,16 @@
+# Auto-provision dashboards from /var/lib/grafana/dashboards
+# (mounted from deploy/grafana/dashboards in the host).
+
+apiVersion: 1
+
+providers:
+  - name: MedAI
+    orgId: 1
+    folder: MedAI
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30        # re-read JSONs every 30s so edits show up
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

@@ -1,0 +1,214 @@
+{
+  "uid": "medai-obs-stack",
+  "title": "MedAI — Observability Stack Health",
+  "tags": ["medai", "observability", "meta"],
+  "description": "Who watches the watchers? Health of OTel Collector, Jaeger, Prometheus, Loki, and Redpanda.",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "15s",
+  "time": { "from": "now-1h", "to": "now" },
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "title": "OTel Collector",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 0, "w": 4, "h": 4 },
+      "targets": [
+        { "expr": "up{job=\"otel-collector\"}", "legendFormat": "up" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          },
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } }
+          ]
+        }
+      }
+    },
+    {
+      "id": 2,
+      "title": "Prometheus",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 4, "y": 0, "w": 4, "h": 4 },
+      "targets": [ { "expr": "up{job=\"prometheus\"}", "legendFormat": "up" } ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          },
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } }
+          ]
+        }
+      }
+    },
+    {
+      "id": 3,
+      "title": "Redpanda broker",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 8, "y": 0, "w": 4, "h": 4 },
+      "targets": [ { "expr": "up{job=\"redpanda\"}", "legendFormat": "up" } ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          },
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } }
+          ]
+        }
+      }
+    },
+    {
+      "id": 4,
+      "title": "Jaeger",
+      "description": "Indirect: if no traces arrive via Collector for 60s, Jaeger is likely unreachable.",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 12, "y": 0, "w": 4, "h": 4 },
+      "targets": [
+        {
+          "expr": "clamp_max(sum(rate(otelcol_exporter_sent_spans_total{exporter=\"otlp/jaeger\"}[5m])) * 0 + 1, 1) OR on() vector(0)",
+          "legendFormat": "up"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "IDLE", "color": "orange" }, "1": { "text": "UP", "color": "green" } } }
+          ]
+        }
+      }
+    },
+    {
+      "id": 5,
+      "title": "Span export success ratio",
+      "description": "OTel Collector — % of spans successfully exported vs dropped. Should be 100% in healthy state.",
+      "type": "gauge",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 16, "y": 0, "w": 8, "h": 4 },
+      "targets": [
+        {
+          "expr": "sum(rate(otelcol_exporter_sent_spans_total[5m])) / (sum(rate(otelcol_exporter_sent_spans_total[5m])) + sum(rate(otelcol_exporter_send_failed_spans_total[5m]))) * 100 OR on() vector(100)",
+          "legendFormat": "success %"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 95 },
+              { "color": "green", "value": 99.5 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 10,
+      "title": "OTel Collector — span pipeline",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "sum(rate(otelcol_receiver_accepted_spans_total[1m]))", "legendFormat": "received/s" },
+        { "expr": "sum(rate(otelcol_exporter_sent_spans_total[1m]))", "legendFormat": "sent/s" },
+        { "expr": "sum(rate(otelcol_exporter_send_failed_spans_total[1m]))", "legendFormat": "failed/s" },
+        { "expr": "sum(rate(otelcol_processor_dropped_spans_total[1m]))", "legendFormat": "dropped/s" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" } }
+    },
+    {
+      "id": 11,
+      "title": "OTel Collector — memory",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "otelcol_process_memory_rss",
+          "legendFormat": "RSS"
+        },
+        {
+          "expr": "otelcol_process_runtime_heap_alloc_bytes",
+          "legendFormat": "heap"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "bytes" } }
+    },
+    {
+      "id": 20,
+      "title": "Prometheus TSDB — series count",
+      "description": "Total number of unique time-series Prometheus is tracking. Cardinality explosion = runaway label.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 12, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "prometheus_tsdb_head_series", "legendFormat": "head series" }
+      ]
+    },
+    {
+      "id": 21,
+      "title": "Prometheus scrape duration (p95)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 12, "y": 12, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, job) (rate(prometheus_target_scrape_duration_seconds_bucket[5m])))",
+          "legendFormat": "p95 {{job}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "id": 30,
+      "title": "Loki — log ingestion rate",
+      "description": "Log lines per second per service, as observed by Loki.",
+      "type": "timeseries",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "x": 0, "y": 20, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum by (service) (rate({source=\"medai\"} [1m]))",
+          "legendFormat": "{{service}}"
+        }
+      ]
+    },
+    {
+      "id": 31,
+      "title": "Redpanda — disk + mem",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 12, "y": 20, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "sum(redpanda_storage_disk_total_bytes - redpanda_storage_disk_free_bytes)", "legendFormat": "disk used" },
+        { "expr": "sum(redpanda_memory_allocated_memory)", "legendFormat": "mem allocated" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "bytes" } }
+    }
+  ]
+}

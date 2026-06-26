@@ -1,0 +1,124 @@
+# Redpanda — Kafka-wire-compatible broker for MedAI event streaming.
+#
+# Why Redpanda, not Apache Kafka?
+#   - Single Go binary, no JVM, no ZooKeeper
+#   - One-node dev cluster starts in ~3 seconds on Windows
+#   - Drop-in Kafka protocol so aiokafka works unchanged
+#   - Opt-in: services fall back to MongoDB event_log when broker is absent
+#
+# Start:
+#   docker compose -f docker-compose.kafka.yml up -d
+#
+# Then launch services with KAFKA_BOOTSTRAP pointing at the broker:
+#   set KAFKA_BOOTSTRAP=localhost:19092      :: Windows cmd
+#   export KAFKA_BOOTSTRAP=localhost:19092   # bash
+#   python scripts/start_all_services.py
+#
+# Console:  http://localhost:8080           (Redpanda Console — topic browser, consumer groups)
+# Broker:   localhost:19092                 (external Kafka API)
+# Admin:    http://localhost:9644           (health + metrics)
+#
+# Stop + wipe:
+#   docker compose -f docker-compose.kafka.yml down -v
+
+services:
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.3.1
+    container_name: medai-redpanda
+    command:
+      - redpanda
+      - start
+      - --kafka-addr
+      - internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr
+      - internal://redpanda:9092,external://localhost:19092
+      - --pandaproxy-addr
+      - internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr
+      - internal://redpanda:8082,external://localhost:18082
+      - --schema-registry-addr
+      - internal://0.0.0.0:8081,external://0.0.0.0:18081
+      - --rpc-addr
+      - redpanda:33145
+      - --advertise-rpc-addr
+      - redpanda:33145
+      - --mode
+      - dev-container
+      - --smp
+      - "1"
+      - --default-log-level=info
+    ports:
+      - "18081:18081"   # Schema Registry
+      - "18082:18082"   # Pandaproxy (REST)
+      - "19092:19092"   # Kafka external
+      - "9644:9644"     # Admin API
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  console:
+    image: docker.redpanda.com/redpandadata/console:v2.8.3
+    container_name: medai-redpanda-console
+    entrypoint: /bin/sh
+    command: |-
+      -c 'echo "$$CONSOLE_CONFIG_FILE" > /tmp/config.yml && /app/console'
+    environment:
+      CONFIG_FILEPATH: /tmp/config.yml
+      CONSOLE_CONFIG_FILE: |
+        kafka:
+          brokers: ["redpanda:9092"]
+          schemaRegistry:
+            enabled: true
+            urls: ["http://redpanda:8081"]
+        redpanda:
+          adminApi:
+            enabled: true
+            urls: ["http://redpanda:9644"]
+    ports:
+      - "18080:8080"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+
+  # Optional topic bootstrap — creates the domain topics used by the platform.
+  # Runs once and exits. Re-run manually with: docker compose -f ... run topic-init
+  topic-init:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.3.1
+    container_name: medai-topic-init
+    entrypoint: /bin/sh
+    command: |-
+      -c '
+      set -e
+      for t in \
+        medai.patient_admitted medai.patient_discharged medai.patient_transferred \
+        medai.bed_allocated medai.bed_released medai.capacity_alert \
+        medai.deterioration_alert medai.deterioration_critical \
+        medai.pet_breach_risk medai.lwbs_risk medai.surge_alert medai.bottleneck_detected \
+        medai.admission_predicted medai.admission_complete \
+        medai.note_generated medai.note_approved medai.coding_suggested \
+        medai.priority_updated medai.schedule_generated medai.referral_triaged \
+        medai.trolley_alert medai.discharge_predicted \
+        medai.digital_twin_admission_complete; do
+        rpk topic create "$$t" \
+          --brokers redpanda:9092 \
+          --partitions 3 \
+          --replicas 1 \
+          --config retention.ms=2592000000 \
+          --config retention.bytes=1073741824 \
+          --config cleanup.policy=delete \
+          || echo "topic $$t already exists"
+      done
+      echo "MedAI topics initialised."
+      '
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  redpanda_data:
+    name: medai-redpanda-data

@@ -1,0 +1,22 @@
+# Per-service image. Inherits hse-base (which already has the venv +
+# shared/ + config.py) and copies just the requested app_NN/ tree, then
+# starts uvicorn pointed at the right module.
+ARG BASE_IMAGE=hse-base:latest
+FROM ${BASE_IMAGE}
+
+ARG APP                # e.g. app_01_ed_triage
+ARG MODULE_PATH        # e.g. app_01_ed_triage.backend.app.main
+ARG PORT               # e.g. 8201
+
+ENV APP_NAME=${APP} \
+    APP_MODULE=${MODULE_PATH} \
+    APP_PORT=${PORT}
+
+# Each app's source. Tests, pycache, and notebooks are excluded via .dockerignore.
+COPY ${APP}/ ./${APP}/
+
+EXPOSE ${PORT}
+
+# Use shell form so $APP_MODULE / $APP_PORT expand at run time; this
+# lets a single image be reused across rebuilds without bake-time gotchas.
+CMD ["sh", "-c", "exec uvicorn ${APP_MODULE} --host 0.0.0.0 --port ${APP_PORT}"]

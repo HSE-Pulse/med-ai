@@ -1,0 +1,157 @@
+# Prometheus scrape config for the MedAI stack.
+#
+# All targets use their docker-compose service name (resolvable inside
+# the cancer_default network). Host.docker.internal lets Prometheus
+# reach the 17 Python services running on the host machine.
+
+global:
+  scrape_interval: 10s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: medai-dev
+    environment: dev
+
+scrape_configs:
+  # ─────────────────────────────────────────────────────────────
+  # Prometheus itself
+  # ─────────────────────────────────────────────────────────────
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # ─────────────────────────────────────────────────────────────
+  # OTel Collector — exposes its own telemetry + anything the
+  # Collector's prometheus exporter re-emits
+  # ─────────────────────────────────────────────────────────────
+  - job_name: otel-collector
+    static_configs:
+      - targets: ["otel-collector:8888"]
+        labels:
+          component: telemetry
+
+  # ─────────────────────────────────────────────────────────────
+  # Redpanda — Kafka-wire broker metrics (consumer lag, partition
+  # sizes, produce/consume rates, etc.)
+  # ─────────────────────────────────────────────────────────────
+  - job_name: redpanda
+    static_configs:
+      - targets: ["redpanda:9644"]
+        labels:
+          component: messaging
+
+  # ─────────────────────────────────────────────────────────────
+  # MedAI microservices — scraped from the host machine because the
+  # Python services run directly via uvicorn (not containerised yet).
+  # When the Helm/k8s migration lands, replace with kubernetes_sd.
+  # ─────────────────────────────────────────────────────────────
+  - job_name: medai-services
+    metrics_path: /metrics
+    scrape_interval: 15s
+    static_configs:
+      - targets:
+          - "host.docker.internal:8201"
+          - "host.docker.internal:8202"
+          - "host.docker.internal:8203"
+          - "host.docker.internal:8204"
+          - "host.docker.internal:8205"
+          - "host.docker.internal:8206"
+          - "host.docker.internal:8207"
+          - "host.docker.internal:8208"
+          - "host.docker.internal:8209"
+          - "host.docker.internal:8210"
+          - "host.docker.internal:8214"
+          - "host.docker.internal:8215"
+          - "host.docker.internal:8216"
+          - "host.docker.internal:8217"
+          - "host.docker.internal:8218"
+          - "host.docker.internal:8219"
+          - "host.docker.internal:8220"
+          - "host.docker.internal:8221"
+    relabel_configs:
+      # Use the port as the 'service' label so panels can group per-service.
+      - source_labels: [__address__]
+        regex: ".*:(\\d+)$"
+        target_label: service_port
+        replacement: "$1"
+      - source_labels: [service_port]
+        regex: "8201"
+        target_label: service
+        replacement: "ed_triage"
+      - source_labels: [service_port]
+        regex: "8202"
+        target_label: service
+        replacement: "sepsis_icu"
+      - source_labels: [service_port]
+        regex: "8203"
+        target_label: service
+        replacement: "hospital_ops"
+      - source_labels: [service_port]
+        regex: "8204"
+        target_label: service
+        replacement: "oncology_ai"
+      - source_labels: [service_port]
+        regex: "8205"
+        target_label: service
+        replacement: "patient_journey"
+      - source_labels: [service_port]
+        regex: "8206"
+        target_label: service
+        replacement: "clinical_chat"
+      - source_labels: [service_port]
+        regex: "8207"
+        target_label: service
+        replacement: "data_ingestion"
+      - source_labels: [service_port]
+        regex: "8208"
+        target_label: service
+        replacement: "bed_management"
+      - source_labels: [service_port]
+        regex: "8209"
+        target_label: service
+        replacement: "waiting_list"
+      - source_labels: [service_port]
+        regex: "8210"
+        target_label: service
+        replacement: "clinical_scribe"
+      - source_labels: [service_port]
+        regex: "8214"
+        target_label: service
+        replacement: "ed_flow"
+      - source_labels: [service_port]
+        regex: "8215"
+        target_label: service
+        replacement: "erp"
+      - source_labels: [service_port]
+        regex: "8216"
+        target_label: service
+        replacement: "trolley_watch"
+      - source_labels: [service_port]
+        regex: "8217"
+        target_label: service
+        replacement: "gdpr"
+      - source_labels: [service_port]
+        regex: "8218"
+        target_label: service
+        replacement: "xai"
+      - source_labels: [service_port]
+        regex: "8219"
+        target_label: service
+        replacement: "fhir"
+      - source_labels: [service_port]
+        regex: "8220"
+        target_label: service
+        replacement: "deterioration"
+      - source_labels: [service_port]
+        regex: "8221"
+        target_label: service
+        replacement: "discharge_lounge"
+
+  # ─────────────────────────────────────────────────────────────
+  # Dashboard-specific domain metrics — patient throughput comes
+  # from hospital_ops' /api/metrics/history endpoint. Prometheus
+  # can't scrape it directly (it's not in OpenMetrics format) so
+  # we'll expose a small bridge exporter instead. Placeholder:
+  # ─────────────────────────────────────────────────────────────
+  # - job_name: medai-domain-bridge
+  #   static_configs:
+  #     - targets: ["domain-exporter:9200"]

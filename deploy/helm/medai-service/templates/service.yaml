@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "medai-service.fullname" . }}
+  labels:
+    {{- include "medai-service.labels" . | nindent 4 }}
+  {{- with .Values.kubeService.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.kubeService.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "medai-service.selectorLabels" . | nindent 4 }}

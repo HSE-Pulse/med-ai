@@ -1,0 +1,134 @@
+# Zero-trust east-west — each service explicitly authorizes its callers.
+#
+# Without these, Linkerd's default `all-authenticated` still allows any
+# meshed pod to call any service. These policies lock it down to the
+# actual DT-driven call graph so a compromised service can only reach
+# the services it's supposed to.
+#
+# Apply:
+#   kubectl apply -n medai -f deploy/linkerd/20-authorization-policies.yaml
+
+---
+# ─── Service Accounts (one per service) ──────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: sa-data-ingestion, namespace: medai }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: sa-hospital-ops, namespace: medai }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: sa-bed-management, namespace: medai }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: sa-waiting-list, namespace: medai }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: sa-ed-triage, namespace: medai }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: sa-dashboard-gateway, namespace: medai }
+
+---
+# ─── Server selectors (protect each service's port) ──────────────────
+apiVersion: policy.linkerd.io/v1beta1
+kind: Server
+metadata:
+  name: bed-management-http
+  namespace: medai
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: bed-management
+  port: http
+  proxyProtocol: HTTP/1
+---
+apiVersion: policy.linkerd.io/v1beta1
+kind: Server
+metadata:
+  name: waiting-list-http
+  namespace: medai
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: waiting-list
+  port: http
+  proxyProtocol: HTTP/1
+---
+apiVersion: policy.linkerd.io/v1beta1
+kind: Server
+metadata:
+  name: hospital-ops-http
+  namespace: medai
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: hospital-ops
+  port: http
+  proxyProtocol: HTTP/1
+
+---
+# ─── AuthorizationPolicies — explicit allowlists ─────────────────────
+# Bed Management accepts calls from: data_ingestion (DT cascade),
+# hospital_ops (notify-census back), dashboard-gateway (UI).
+apiVersion: policy.linkerd.io/v1alpha1
+kind: AuthorizationPolicy
+metadata:
+  name: bed-management-allow
+  namespace: medai
+spec:
+  targetRef:
+    group: policy.linkerd.io
+    kind: Server
+    name: bed-management-http
+  requiredAuthenticationRefs:
+    - kind: MeshTLSAuthentication
+      name: medai-services
+      group: policy.linkerd.io
+
+---
+apiVersion: policy.linkerd.io/v1alpha1
+kind: MeshTLSAuthentication
+metadata:
+  name: medai-services
+  namespace: medai
+spec:
+  identities:
+    - "sa-data-ingestion.medai.serviceaccount.identity.linkerd.cluster.local"
+    - "sa-hospital-ops.medai.serviceaccount.identity.linkerd.cluster.local"
+    - "sa-dashboard-gateway.medai.serviceaccount.identity.linkerd.cluster.local"
+    # Add more identities as services need bed_management access.
+
+---
+# Waiting List — accepts from data_ingestion (DT), bed_management
+# (notify-discharge-re-rank), dashboard-gateway.
+apiVersion: policy.linkerd.io/v1alpha1
+kind: AuthorizationPolicy
+metadata:
+  name: waiting-list-allow
+  namespace: medai
+spec:
+  targetRef:
+    group: policy.linkerd.io
+    kind: Server
+    name: waiting-list-http
+  requiredAuthenticationRefs:
+    - kind: MeshTLSAuthentication
+      name: waiting-list-callers
+      group: policy.linkerd.io
+---
+apiVersion: policy.linkerd.io/v1alpha1
+kind: MeshTLSAuthentication
+metadata:
+  name: waiting-list-callers
+  namespace: medai
+spec:
+  identities:
+    - "sa-data-ingestion.medai.serviceaccount.identity.linkerd.cluster.local"
+    - "sa-bed-management.medai.serviceaccount.identity.linkerd.cluster.local"
+    - "sa-dashboard-gateway.medai.serviceaccount.identity.linkerd.cluster.local"

@@ -1,0 +1,70 @@
+# OpenTelemetry stack — Collector + Jaeger for distributed tracing.
+#
+# Start:
+#   docker compose -f docker-compose.otel.yml up -d
+#
+# Then launch services with OTEL_EXPORTER_OTLP_ENDPOINT set so they
+# emit spans:
+#   export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+#   python scripts/start_all_services.py
+#
+# Access:
+#   Jaeger UI:        http://localhost:16686    (search traces, service graph)
+#   OTel Collector:   localhost:4317  (gRPC)    localhost:4318 (HTTP)
+#   Collector health: http://localhost:13133/health/status
+#
+# Stop + wipe:
+#   docker compose -f docker-compose.otel.yml down -v
+
+services:
+  # OpenTelemetry Collector — receives OTLP from services, fans out to
+  # Jaeger + optional Prometheus/Tempo backends. Keeping the Collector
+  # as a middle layer means services don't need to know which trace
+  # backend is in use; swap Jaeger for Tempo or Datadog by editing the
+  # exporters section only.
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.115.1
+    container_name: medai-otel-collector
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    networks: [cancer_default]
+    volumes:
+      - ./deploy/otel/collector-config.yaml:/etc/otel-collector-config.yaml:ro
+    ports:
+      - "4337:4317"              # OTLP gRPC — services push spans here (host 4337 to avoid netdata otel-plugin on 4317)
+      - "4318:4318"              # OTLP HTTP — alternative protocol
+      - "13133:13133"            # /health/status
+      - "8888:8888"              # Collector's own Prometheus metrics
+      - "55679:55679"            # zpages (debug UI)
+    depends_on:
+      jaeger:
+        condition: service_healthy
+
+  # Jaeger all-in-one — acts as the trace storage + UI backend. Good
+  # enough for dev / demo. In production, replace with Tempo (backed
+  # by S3/GCS) or Jaeger with Elasticsearch.
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    container_name: medai-jaeger
+    networks: [cancer_default]
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      SPAN_STORAGE_TYPE: memory
+      MEMORY_MAX_TRACES: "100000"         # retain last 100k traces in RAM
+      METRICS_STORAGE_TYPE: prometheus
+      PROMETHEUS_SERVER_URL: http://prometheus:9090
+      # Reasonable dev settings — raise if demo traffic is heavier
+      JAEGER_DISABLED: "false"
+    ports:
+      - "16686:16686"           # UI
+      - "14250:14250"           # Collector gRPC (Thrift)
+      - "14268:14268"           # Collector HTTP (zipkin-compatible)
+      - "4327:4317"             # OTLP gRPC (distinct from Collector's 4317)
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:16686"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+networks:
+  cancer_default:
+    external: true

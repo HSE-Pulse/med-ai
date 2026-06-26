@@ -1,0 +1,36 @@
+HSE-Pulse / med-ai
+Copyright 2026 HSE-Pulse Contributors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+================================================================================
+Third-party data, models, and services
+================================================================================
+
+This repository contains SOURCE CODE ONLY. It ships no patient data and no
+model weights. The platform depends on the following third-party resources,
+which users must obtain themselves under their own respective licenses:
+
+1. MIMIC-IV (Medical Information Mart for Intensive Care IV)
+   - Source: PhysioNet (https://physionet.org/content/mimiciv/)
+   - License: PhysioNet Credentialed Health Data License 1.5.0
+   - Requires CITI "Data or Specimens Only Research" training + a signed DUA.
+   - NOT redistributable. See docs/DATA_ACCESS.md.
+
+2. Large Language Models (pulled at runtime via Ollama; not vendored here)
+   - Meta Llama 3.2 — Llama 3.2 Community License ("Built with Llama").
+   - DeepSeek-R1 (distill) — MIT weights over a Llama base.
+   - Google MedGemma / Gemma — Gemma Terms of Use + Health AI Developer
+     Foundations terms ("not for clinical use").
+   - OpenBioLLM — Llama 3 Community License (research-oriented).
+   See docs/MODELS.md for each model's license and acceptable-use terms.
+
+3. Runtime infrastructure services (pulled as containers, invoked over the
+   network — not linked into this codebase): MongoDB, Redis, Prometheus,
+   Grafana, Loki, Redpanda, OpenTelemetry Collector, Jaeger. Each retains its
+   own license; none is imposed on this project's source.
+
+================================================================================
+This software is provided for research and educational purposes only and is
+NOT a medical device. See DISCLAIMER.md.
+================================================================================

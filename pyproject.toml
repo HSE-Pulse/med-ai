@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "med-ai"
+version = "0.1.0"
+description = "Healthcare AI monorepo — oncology-focused clinical ML pipelines built on MIMIC-IV"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+]
+
+dependencies = [
+    "pymongo>=4.6",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pandas>=2.1",
+    "numpy>=1.26",
+    "scikit-learn>=1.4",
+    "torch>=2.1",
+    "xgboost>=2.0",
+    "lightgbm>=4.0",
+    "gymnasium>=0.29",
+    "matplotlib>=3.8",
+    "structlog>=24.1",
+    "pydantic-settings>=2.1",
+    "httpx>=0.27",
+    "joblib>=1.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.3",
+    "mypy>=1.8",
+    "ipykernel>=6.29",
+]
+imbalance = [
+    "imbalanced-learn>=0.12",
+]
+chat = [
+    # app_06 clinical chat: only needed to use a hosted OpenAI-compatible
+    # endpoint; without it, app_06 falls back to local Ollama models.
+    "openai>=1.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["shared*", "config*", "app_*"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

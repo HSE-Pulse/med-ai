@@ -1,0 +1,65 @@
+# Auto-provisioned data sources — Grafana picks these up on boot.
+# Reload manually (without restart):  curl -X POST http://admin:medai-dev@localhost:3001/api/admin/provisioning/datasources/reload
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      timeInterval: 10s
+      # Link metrics → traces via exemplars (requires Tempo/Jaeger with
+      # trace_id on histograms). Enables the "Show trace" arrow in panels.
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: jaeger
+    editable: false
+
+  - name: Jaeger
+    uid: jaeger
+    type: jaeger
+    access: proxy
+    url: http://jaeger:16686
+    # Link traces → metrics via node graph + service map
+    jsonData:
+      tracesToMetrics:
+        datasourceUid: prometheus
+        tags:
+          - key: service.name
+            value: service
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: -1m
+        spanEndTimeShift: 1m
+        filterByTraceID: true
+        tags:
+          - key: service.name
+            value: service
+      nodeGraph:
+        enabled: true
+      search:
+        hide: false
+      spanBar:
+        type: Tag
+        tag: http.status_code
+    editable: false
+
+  - name: Loki
+    uid: loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    jsonData:
+      # Click a log line → jump to the Jaeger trace it belongs to
+      derivedFields:
+        - name: TraceID
+          matcherRegex: "\"trace_id\":\\s*\"([a-f0-9]+)\""
+          url: "$${__value.raw}"
+          datasourceUid: jaeger
+          urlDisplayLabel: "View trace in Jaeger"
+      maxLines: 5000
+    editable: false

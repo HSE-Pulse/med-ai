@@ -1,0 +1,213 @@
+{
+  "uid": "medai-patient-flow",
+  "title": "MedAI — Patient Flow",
+  "tags": ["medai", "patient-flow", "des"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "department",
+        "label": "Department",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(medai_department_occupancy_ratio, department)",
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" },
+        "refresh": 2
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Sim time (hours)",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 0, "w": 4, "h": 4 },
+      "targets": [
+        { "expr": "medai_simulation_time_hours", "legendFormat": "sim_t" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "h", "decimals": 1 } }
+    },
+    {
+      "id": 2,
+      "title": "Total active patients",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 4, "y": 0, "w": 4, "h": 4 },
+      "targets": [
+        { "expr": "sum(medai_active_patients)" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Total queue",
+      "description": "Patients waiting for a bed across every department. Sustained >20 = capacity pressure.",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 8, "y": 0, "w": 4, "h": 4 },
+      "targets": [
+        { "expr": "sum(medai_department_queue_length)" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 20 },
+              { "color": "red", "value": 50 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 4,
+      "title": "Admissions (lifetime)",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 12, "y": 0, "w": 4, "h": 4 },
+      "targets": [
+        { "expr": "medai_admissions_total", "legendFormat": "adm" }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Discharges (lifetime)",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 16, "y": 0, "w": 4, "h": 4 },
+      "targets": [
+        { "expr": "medai_discharges_total", "legendFormat": "disc" }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Occupancy by department",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 4, "w": 24, "h": 10 },
+      "targets": [
+        {
+          "expr": "medai_department_occupancy_ratio{department=~\"$department\"}",
+          "legendFormat": "{{department}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 1,
+          "unit": "percentunit",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 0.75 },
+              { "color": "red", "value": 0.95 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 11,
+      "title": "Queue length by department",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 14, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "medai_department_queue_length{department=~\"$department\"}",
+          "legendFormat": "{{department}}"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "title": "Mean wait (minutes) by department",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 12, "y": 14, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "medai_department_avg_wait_minutes{department=~\"$department\"}",
+          "legendFormat": "{{department}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "m" } }
+    },
+    {
+      "id": 13,
+      "title": "Admission rate (per minute)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 22, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "rate(medai_admissions_total[1m]) * 60", "legendFormat": "admissions/min" },
+        { "expr": "rate(medai_discharges_total[1m]) * 60", "legendFormat": "discharges/min" }
+      ]
+    },
+    {
+      "id": 14,
+      "title": "Net flow (admissions - discharges)",
+      "description": "Positive = hospital filling up. Negative = emptying.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 12, "y": 22, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "rate(medai_admissions_total[5m]) - rate(medai_discharges_total[5m])",
+          "legendFormat": "net rate"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "fillOpacity": 30 },
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 0 },
+              { "color": "red", "value": 0.5 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 15,
+      "title": "Occupancy heatmap",
+      "description": "Department occupancy over time. Bright red = saturation.",
+      "type": "heatmap",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 30, "w": 24, "h": 10 },
+      "targets": [
+        {
+          "expr": "medai_department_occupancy_ratio{department=~\"$department\"}",
+          "legendFormat": "{{department}}",
+          "format": "time_series"
+        }
+      ],
+      "options": {
+        "calculate": false,
+        "cellGap": 1,
+        "color": {
+          "scheme": "RdYlGn",
+          "reverse": true,
+          "mode": "scheme"
+        }
+      }
+    }
+  ]
+}

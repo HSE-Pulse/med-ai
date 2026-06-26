@@ -1,0 +1,79 @@
+# OpenTelemetry Collector — receives spans from every service and
+# fans them out. This config is intentionally dev-friendly; for
+# production you'd add tail sampling, rate limiting, and TLS.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Batch spans before export — reduces load on the backend
+  batch:
+    timeout: 1s
+    send_batch_size: 512
+    send_batch_max_size: 1024
+
+  # Drop noisy low-value spans (readiness/liveness probes)
+  filter/healthcheck:
+    error_mode: ignore
+    traces:
+      span:
+        - 'attributes["http.route"] == "/health"'
+        - 'attributes["http.target"] == "/health"'
+        - 'name == "GET /health"'
+
+  # Tag every span with the environment so traces from dev / staging
+  # / prod can be separated in Jaeger search
+  resource:
+    attributes:
+      - key: deployment.environment
+        value: dev
+        action: upsert
+      - key: service.namespace
+        value: medai
+        action: upsert
+
+  # Keep spans under a size bound so a runaway payload can't blow up
+  # the exporter
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+    spike_limit_mib: 64
+
+exporters:
+  # Jaeger — primary dev backend (UI at :16686)
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+
+  # Debug exporter — pipes every span to stdout. Useful when you want
+  # to see what's being emitted without opening the Jaeger UI.
+  debug:
+    verbosity: basic
+    sampling_initial: 2
+    sampling_thereafter: 100
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  zpages:
+    endpoint: 0.0.0.0:55679
+
+service:
+  extensions: [health_check, zpages]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, filter/healthcheck, resource, batch]
+      exporters: [otlp/jaeger, debug]
+
+  telemetry:
+    metrics:
+      address: 0.0.0.0:8888
+    logs:
+      level: info

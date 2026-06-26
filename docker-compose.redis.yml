@@ -1,0 +1,56 @@
+# Redis — shared cache for patient context, bed summaries, chat responses.
+#
+# Start:
+#   docker compose -f docker-compose.redis.yml up -d
+#
+# Services auto-detect Redis via the REDIS_URL env var. When unset or
+# unreachable, the cache transparently falls back to no-op — so this
+# container is strictly opt-in.
+#
+# Verify:
+#   docker exec medai-redis redis-cli ping        → PONG
+#   docker exec medai-redis redis-cli info memory → shows used_memory
+#   docker exec medai-redis redis-cli keys '*' | head
+#
+# Stop + wipe:
+#   docker compose -f docker-compose.redis.yml down -v
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: medai-redis
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"                                # AOF persistence — survives restart
+      - --maxmemory
+      - "256mb"
+      - --maxmemory-policy
+      - "allkeys-lru"                        # evict LRU when full
+      - --save
+      - "60 100"                             # snapshot every 60s if ≥100 writes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+
+  # Optional: Redis Insight UI (http://localhost:8082) for inspection.
+  # Was 8001 but that conflicted with another local listener; moved to
+  # 8082 so the container actually starts.
+  redisinsight:
+    image: redis/redisinsight:latest
+    container_name: medai-redisinsight
+    ports:
+      - "8082:5540"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes:
+  redis_data:
+    name: medai-redis-data

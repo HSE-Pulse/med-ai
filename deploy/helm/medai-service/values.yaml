@@ -1,0 +1,121 @@
+# Default values for a MedAI service. Override per service via values-<name>.yaml.
+#
+# Example:
+#   helm install bed-management ./medai-service -f values-bed-management.yaml
+
+service:
+  name: ""                  # MUST be set per service: "bed-management" etc.
+  module: ""                # Python module path: "app_08_bed_management.backend.app.main:app"
+  port: 8000                # Container port
+  replicaCount: 2           # Default; overridden per service by HPA
+
+image:
+  repository: ghcr.io/hse-pulse/medai
+  tag: ""                   # CI fills this with the git SHA
+  pullPolicy: IfNotPresent
+  pullSecret: ""            # Name of a dockerconfigjson Secret, if registry is private
+
+# Resource requests/limits — tuned per-service in overrides
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# Horizontal Pod Autoscaler — off by default; turn on in per-service override
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 8
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+# Liveness / readiness — every service exposes /health
+probes:
+  liveness:
+    httpGet:
+      path: /health
+      port: http
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  readiness:
+    httpGet:
+      path: /health
+      port: http
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 2
+
+# Environment — populated from a shared ConfigMap + Secret
+env:
+  # Broker
+  KAFKA_BOOTSTRAP: "redpanda:9092"
+  REDIS_URL: "redis://redis:6379"
+  MONGO_URI: ""             # injected from Secret
+  # Observability
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+  OTEL_SERVICE_NAME: ""     # defaults to service.name
+  LOG_LEVEL: "INFO"
+  # Deployment mode
+  DEPLOYMENT_MODE: "production"
+
+secrets:
+  # Reference existing Secrets created by SealedSecrets / external-secrets;
+  # the chart does NOT create them (those belong in the gitops pipeline).
+  mongoSecret: medai-mongo-credentials
+  kafkaSecret: medai-kafka-credentials
+
+# Service mesh — Linkerd sidecar injection
+linkerd:
+  inject: enabled           # "enabled" | "disabled"; sidecar auto-injected
+  # Per-route policies applied via ServiceProfile (see deploy/linkerd/)
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# Service mesh / gateway exposure
+ingress:
+  enabled: false            # Gateway-routed; no direct ingress per service
+  className: ""
+  hosts: []
+
+# Kubernetes Service (ClusterIP; mesh handles east-west traffic)
+kubeService:
+  type: ClusterIP
+  annotations: {}
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Pod security — non-root, read-only FS
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  fsGroup: 10001
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# Volumes for /tmp, /app/cache when RO root FS is enabled
+volumes:
+  - name: tmp
+    emptyDir: {}
+  - name: cache
+    emptyDir: {}
+
+volumeMounts:
+  - name: tmp
+    mountPath: /tmp
+  - name: cache
+    mountPath: /app/.cache

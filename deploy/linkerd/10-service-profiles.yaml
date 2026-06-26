@@ -1,0 +1,224 @@
+# Linkerd ServiceProfile — per-route timeouts, retries, metrics.
+#
+# Each service gets a profile describing its routes so Linkerd can:
+#   - Emit per-route latency + success metrics (visible in Viz)
+#   - Apply retry policies on idempotent GETs
+#   - Apply request timeouts aligned to SLO targets
+#
+# Apply:
+#   linkerd inject . | kubectl apply -n medai -f -
+#   kubectl apply -n medai -f deploy/linkerd/10-service-profiles.yaml
+
+---
+# Bed Management — read-heavy, low latency
+apiVersion: linkerd.io/v1alpha2
+kind: ServiceProfile
+metadata:
+  name: bed-management
+  namespace: medai
+spec:
+  routes:
+    - name: get_beds_summary
+      condition:
+        method: GET
+        pathRegex: "/beds/summary"
+      timeout: 2s
+      isRetryable: true
+    - name: allocate_bed
+      condition:
+        method: POST
+        pathRegex: "/allocate"
+      timeout: 5s
+      # Allocations are stateful — do NOT auto-retry (idempotency key
+      # needed first; retries without it double-allocate)
+      isRetryable: false
+    - name: notify_discharge
+      condition:
+        method: POST
+        pathRegex: "/notify-discharge/.*"
+      timeout: 3s
+      isRetryable: true              # guarded by bed_management's own idempotency cache
+  retryBudget:
+    retryRatio: 0.2
+    minRetriesPerSecond: 10
+    ttl: 10s
+
+---
+# Waiting List
+apiVersion: linkerd.io/v1alpha2
+kind: ServiceProfile
+metadata:
+  name: waiting-list
+  namespace: medai
+spec:
+  routes:
+    - name: by_department
+      condition:
+        method: GET
+        pathRegex: "/waiting-list/by-department"
+      timeout: 3s
+      isRetryable: true
+    - name: notify_admission
+      condition:
+        method: POST
+        pathRegex: "/notify-admission"
+      timeout: 5s
+      isRetryable: true
+  retryBudget:
+    retryRatio: 0.2
+    minRetriesPerSecond: 10
+    ttl: 10s
+
+---
+# Hospital Ops — DES + MARL singleton
+apiVersion: linkerd.io/v1alpha2
+kind: ServiceProfile
+metadata:
+  name: hospital-ops
+  namespace: medai
+spec:
+  routes:
+    - name: api_metrics
+      condition:
+        method: GET
+        pathRegex: "/api/metrics"
+      timeout: 2s
+      isRetryable: true
+    - name: api_state
+      condition:
+        method: GET
+        pathRegex: "/api/state"
+      timeout: 2s
+      isRetryable: true
+    - name: notify_census
+      condition:
+        method: POST
+        pathRegex: "/notify-census"
+      timeout: 10s                    # engine.step() can take a while
+      isRetryable: false
+    - name: admit_patient
+      condition:
+        method: POST
+        pathRegex: "/admit-patient"
+      timeout: 5s
+      isRetryable: false
+  retryBudget:
+    retryRatio: 0.1
+    minRetriesPerSecond: 5
+    ttl: 10s
+
+---
+# ED Triage — inference-heavy
+apiVersion: linkerd.io/v1alpha2
+kind: ServiceProfile
+metadata:
+  name: ed-triage
+  namespace: medai
+spec:
+  routes:
+    - name: predict
+      condition:
+        method: POST
+        pathRegex: "/predict"
+      timeout: 2s
+      isRetryable: true
+  retryBudget:
+    retryRatio: 0.2
+    minRetriesPerSecond: 10
+    ttl: 10s
+
+---
+# Sepsis ICU
+apiVersion: linkerd.io/v1alpha2
+kind: ServiceProfile
+metadata:
+  name: sepsis-icu
+  namespace: medai
+spec:
+  routes:
+    - name: sepsis_screen
+      condition:
+        method: POST
+        pathRegex: "/sepsis-screen"
+      timeout: 3s
+      isRetryable: true
+  retryBudget:
+    retryRatio: 0.2
+    minRetriesPerSecond: 10
+    ttl: 10s
+
+---
+# Deterioration — fast scoring
+apiVersion: linkerd.io/v1alpha2
+kind: ServiceProfile
+metadata:
+  name: deterioration
+  namespace: medai
+spec:
+  routes:
+    - name: news2_score
+      condition:
+        method: POST
+        pathRegex: "/deterioration/score/(news2|pews|imews)"
+      timeout: 1s
+      isRetryable: true
+    - name: active_alerts
+      condition:
+        method: GET
+        pathRegex: "/deterioration/active-alerts"
+      timeout: 2s
+      isRetryable: true
+  retryBudget:
+    retryRatio: 0.3
+    minRetriesPerSecond: 15
+    ttl: 10s
+
+---
+# Clinical Chat — LLM is slow; no retry to avoid wasted compute
+apiVersion: linkerd.io/v1alpha2
+kind: ServiceProfile
+metadata:
+  name: clinical-chat
+  namespace: medai
+spec:
+  routes:
+    - name: chat
+      condition:
+        method: POST
+        pathRegex: "/chat"
+      timeout: 60s
+      isRetryable: false
+    - name: chat_fast
+      condition:
+        method: POST
+        pathRegex: "/chat/fast"
+      timeout: 5s
+      isRetryable: true
+    - name: chat_stream
+      condition:
+        method: POST
+        pathRegex: "/chat/stream"
+      timeout: 120s                   # streaming SSE
+      isRetryable: false
+
+---
+# FHIR — EHR gateway
+apiVersion: linkerd.io/v1alpha2
+kind: ServiceProfile
+metadata:
+  name: fhir
+  namespace: medai
+spec:
+  routes:
+    - name: resource_get
+      condition:
+        method: GET
+        pathRegex: "/fhir/.*"
+      timeout: 3s
+      isRetryable: true
+    - name: resource_post
+      condition:
+        method: POST
+        pathRegex: "/fhir/.*"
+      timeout: 5s
+      isRetryable: false              # write side is not idempotent without client ID

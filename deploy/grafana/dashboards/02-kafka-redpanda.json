@@ -1,0 +1,178 @@
+{
+  "uid": "medai-kafka",
+  "title": "MedAI — Kafka / Redpanda",
+  "tags": ["medai", "kafka", "redpanda"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "topic",
+        "label": "Topic",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(redpanda_kafka_request_bytes_total, redpanda_topic)",
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" },
+        "refresh": 2
+      },
+      {
+        "name": "group",
+        "label": "Consumer group",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(redpanda_kafka_consumer_group_committed_offset, redpanda_group)",
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" },
+        "refresh": 2
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Broker up",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 0, "w": 4, "h": 4 },
+      "targets": [
+        { "expr": "up{job=\"redpanda\"}", "legendFormat": "up" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 2,
+      "title": "Active partitions",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 4, "y": 0, "w": 4, "h": 4 },
+      "targets": [
+        { "expr": "sum(redpanda_cluster_partitions)" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Consumer groups",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 8, "y": 0, "w": 4, "h": 4 },
+      "targets": [
+        { "expr": "count(count by (redpanda_group) (redpanda_kafka_consumer_group_committed_offset))" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Under-replicated partitions",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 12, "y": 0, "w": 4, "h": 4 },
+      "targets": [
+        { "expr": "sum(redpanda_cluster_unavailable_partitions)" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 5,
+      "title": "Publish rate (msgs/sec)",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 16, "y": 0, "w": 4, "h": 4 },
+      "targets": [
+        { "expr": "sum(rate(redpanda_kafka_request_bytes_total{redpanda_request=\"produce\"}[1m]))" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "Bps" } }
+    },
+    {
+      "id": 10,
+      "title": "Consumer lag by group/topic",
+      "description": "LAG = (log_end_offset - group_committed_offset). Sustained nonzero lag means that consumer isn't keeping up with producers.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 4, "w": 24, "h": 10 },
+      "targets": [
+        {
+          "expr": "max by (redpanda_group, redpanda_topic) (redpanda_kafka_max_offset) - on(redpanda_topic, redpanda_partition) group_right(redpanda_group) max by (redpanda_group, redpanda_topic, redpanda_partition) (redpanda_kafka_consumer_group_committed_offset{redpanda_group=~\"$group\", redpanda_topic=~\"$topic\"})",
+          "legendFormat": "{{redpanda_group}} / {{redpanda_topic}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8
+          }
+        }
+      }
+    },
+    {
+      "id": 11,
+      "title": "Partition high-water mark by topic",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 14, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum by (redpanda_topic) (redpanda_kafka_max_offset{redpanda_topic=~\"$topic\"})",
+          "legendFormat": "{{redpanda_topic}}"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "title": "Produce vs fetch request rate",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 12, "y": 14, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum by (redpanda_request) (rate(redpanda_kafka_request_bytes_total[1m]))",
+          "legendFormat": "{{redpanda_request}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "Bps" } }
+    },
+    {
+      "id": 13,
+      "title": "Request latency p95 (ms)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 22, "w": 24, "h": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, redpanda_request) (rate(redpanda_kafka_request_latency_seconds_bucket[1m]))) * 1000",
+          "legendFormat": "p95 {{redpanda_request}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        }
+      }
+    }
+  ]
+}

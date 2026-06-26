@@ -1,0 +1,78 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Environment
+.env
+.venv/
+venv/
+
+# Data & Models (too large for git)
+datasets/
+models/
+*.parquet
+*.npz
+*.pt
+*.joblib
+*.pkl
+*.rar
+
+# Node
+node_modules/
+dashboard/dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
+runs/
+ray_results/
+
+# Linux-side runtime artefacts (Windows→Linux migration, 2026-05)
+.mongo-data/
+.mongo-data.corrupt/
+.mongo-dump/
+.tmp/
+.tmp_*/
+.tmp_post_fix_audit.py
+.claude/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Windows debug artefacts that drifted in via the rsync from D: drive
+*.stackdump
+du.exe.stackdump
+
+# Open-source hygiene: never re-add patient-view screenshots, office binaries,
+# or confidential business docs to a public fork.
+dashboard/screenshots/
+*.docx
+*.pptx
+*.xlsx
+docs/BRD.md
+
+# Confidential / working dirs and artifacts — never publish to a public fork
+personal/
+pitch/
+.tmp_*
+*.tsbuildinfo
+app_04b_oncology_clone.zip
+app_04b_oncology_clone/

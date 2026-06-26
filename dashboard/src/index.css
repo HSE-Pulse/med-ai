@@ -1,0 +1,288 @@
+@import "tailwindcss";
+
+@theme {
+  --color-critical: #DC2626;
+  --color-emergent: #F97316;
+  --color-urgent: #EAB308;
+  --color-less-urgent: #22C55E;
+  --color-non-urgent: #3B82F6;
+  --color-bg-primary: #F8FAFC;
+  --color-bg-card: #FFFFFF;
+  --color-bg-input: #F1F5F9;
+  --color-border: #E2E8F0;
+  --color-sidebar-bg: #FFFFFF;
+  --color-sidebar-active: #EFF6FF;
+  --color-chart-grid: #E2E8F0;
+  --color-text-primary: #0F172A;
+  --color-text-secondary: #475569;
+  --color-text-muted: #94A3B8;
+  --color-bg-hover: #F1F5F9;
+  --color-bg-stripe: rgba(241,245,249,0.5);
+  --color-bg-widget: #F1F5F9;
+  --color-tooltip-bg: #FFFFFF;
+  --color-tooltip-border: #E2E8F0;
+  --color-tag-bg: #E2E8F0;
+  --color-segment-empty: #E2E8F0;
+  --color-segment-border: #CBD5E1;
+  --color-timeline-dot-bg: #FFFFFF;
+  --color-progress-bg: #E2E8F0;
+}
+
+/* Light theme (default) */
+:root {
+  color-scheme: light;
+  --color-bg-primary: #F8FAFC;
+  --color-bg-card: #FFFFFF;
+  --color-bg-input: #F1F5F9;
+  --color-border: #E2E8F0;
+  --color-text-primary: #0F172A;
+  --color-text-secondary: #475569;
+  --color-text-muted: #94A3B8;
+  --color-sidebar-bg: #FFFFFF;
+  --color-sidebar-active: #EFF6FF;
+  --color-chart-grid: #E2E8F0;
+  --color-bg-hover: #F1F5F9;
+  --color-bg-stripe: rgba(241,245,249,0.5);
+  --color-bg-widget: #F1F5F9;
+  --color-tooltip-bg: #FFFFFF;
+  --color-tooltip-border: #E2E8F0;
+  --color-tag-bg: #E2E8F0;
+  --color-segment-empty: #E2E8F0;
+  --color-segment-border: #CBD5E1;
+  --color-timeline-dot-bg: #FFFFFF;
+  --color-progress-bg: #E2E8F0;
+}
+
+/* Dark theme (toggle) */
+.dark {
+  color-scheme: dark;
+  --color-bg-primary: #0F172A;
+  --color-bg-card: #1E293B;
+  --color-bg-input: #0F172A;
+  --color-border: #334155;
+  --color-text-primary: #F8FAFC;
+  --color-text-secondary: #94A3B8;
+  --color-text-muted: #64748B;
+  --color-sidebar-bg: #1E293B;
+  --color-sidebar-active: rgba(59, 130, 246, 0.1);
+  --color-chart-grid: #1E293B;
+  --color-bg-hover: rgba(51,65,85,0.3);
+  --color-bg-stripe: rgba(30,41,59,0.2);
+  --color-bg-widget: rgba(30,41,59,0.5);
+  --color-tooltip-bg: #1E293B;
+  --color-tooltip-border: #334155;
+  --color-tag-bg: #334155;
+  --color-segment-empty: #1E293B;
+  --color-segment-border: #334155;
+  --color-timeline-dot-bg: #0F172A;
+  --color-progress-bg: #334155;
+}
+
+/* Scrollbar - Light */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #CBD5E1 #F1F5F9;
+}
+
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+*::-webkit-scrollbar-track {
+  background: #F1F5F9;
+}
+
+*::-webkit-scrollbar-thumb {
+  background-color: #CBD5E1;
+  border-radius: 3px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background-color: #94A3B8;
+}
+
+/* Scrollbar - Dark */
+.dark * {
+  scrollbar-color: #475569 #1E293B;
+}
+
+.dark *::-webkit-scrollbar-track {
+  background: #1E293B;
+}
+
+.dark *::-webkit-scrollbar-thumb {
+  background-color: #475569;
+}
+
+.dark *::-webkit-scrollbar-thumb:hover {
+  background-color: #64748b;
+}
+
+html {
+  background-color: #F8FAFC;
+}
+
+.dark html,
+html.dark {
+  background-color: #0F172A;
+}
+
+body {
+  font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+  min-height: 100vh;
+  color: var(--color-text-primary);
+}
+
+/* Utility classes for theme-aware text */
+.text-primary { color: var(--color-text-primary); }
+.text-secondary { color: var(--color-text-secondary); }
+.text-muted { color: var(--color-text-muted); }
+
+/* ═══ Light mode overrides for hardcoded dark-theme colors ═══ */
+
+/* Text colors — exclude elements on colored backgrounds (buttons) */
+:root:not(.dark) .text-white:not([class*="bg-blue-"]):not([class*="bg-red-"]):not([class*="bg-green-"]):not([class*="bg-yellow-"]):not([class*="bg-purple-"]) { color: #0F172A; }
+:root:not(.dark) .text-slate-100 { color: #1E293B; }
+:root:not(.dark) .text-slate-200 { color: #334155; }
+:root:not(.dark) .text-slate-300 { color: #334155; }
+:root:not(.dark) .text-slate-400 { color: #64748B; }
+:root:not(.dark) .text-slate-500 { color: #94A3B8; }
+:root:not(.dark) .text-slate-600 { color: #94A3B8; }
+
+/* Hover text colors */
+:root:not(.dark) .hover\:text-white:hover { color: #0F172A; }
+:root:not(.dark) .hover\:text-slate-200:hover { color: #1E293B; }
+:root:not(.dark) .hover\:text-slate-300:hover { color: #334155; }
+
+/* Background colors */
+:root:not(.dark) .bg-slate-700 { background-color: #E2E8F0; }
+:root:not(.dark) .bg-slate-700\/20 { background-color: rgba(241, 245, 249, 0.4); }
+:root:not(.dark) .bg-slate-700\/30 { background-color: rgba(241, 245, 249, 0.5); }
+:root:not(.dark) .bg-slate-700\/50 { background-color: rgba(241, 245, 249, 0.6); }
+:root:not(.dark) .bg-slate-800 { background-color: #F1F5F9; }
+:root:not(.dark) .bg-slate-800\/20 { background-color: rgba(241, 245, 249, 0.4); }
+:root:not(.dark) .bg-slate-800\/30 { background-color: rgba(241, 245, 249, 0.5); }
+:root:not(.dark) .bg-slate-800\/50 { background-color: #F1F5F9; }
+:root:not(.dark) .bg-slate-900 { background-color: #F8FAFC; }
+
+/* Hover backgrounds */
+:root:not(.dark) .hover\:bg-slate-700:hover { background-color: #E2E8F0; }
+:root:not(.dark) .hover\:bg-slate-700\/20:hover { background-color: rgba(241, 245, 249, 0.5); }
+:root:not(.dark) .hover\:bg-slate-700\/30:hover { background-color: rgba(241, 245, 249, 0.5); }
+:root:not(.dark) .hover\:bg-slate-700\/50:hover { background-color: rgba(241, 245, 249, 0.6); }
+:root:not(.dark) .hover\:bg-slate-600\/50:hover { background-color: rgba(241, 245, 249, 0.6); }
+:root:not(.dark) .hover\:bg-slate-800\/30:hover { background-color: rgba(241, 245, 249, 0.5); }
+:root:not(.dark) .hover\:bg-slate-800\/50:hover { background-color: #F1F5F9; }
+
+/* Disabled state overrides */
+:root:not(.dark) .disabled\:bg-slate-700:disabled { background-color: #E2E8F0; }
+:root:not(.dark) .disabled\:bg-blue-800:disabled { background-color: #93C5FD; }
+:root:not(.dark) .disabled\:text-slate-500:disabled { color: #94A3B8; }
+:root:not(.dark) .disabled\:text-slate-400:disabled { color: #64748B; }
+
+/* Border colors */
+:root:not(.dark) .border-slate-600 { border-color: #E2E8F0; }
+:root:not(.dark) .border-slate-600\/30 { border-color: rgba(226, 232, 240, 0.5); }
+:root:not(.dark) .border-slate-700 { border-color: #E2E8F0; }
+:root:not(.dark) .border-slate-700\/50 { border-color: rgba(226, 232, 240, 0.5); }
+:root:not(.dark) .border-slate-800 { border-color: #E2E8F0; }
+:root:not(.dark) .hover\:border-slate-500:hover { border-color: #CBD5E1; }
+:root:not(.dark) .hover\:border-slate-600:hover { border-color: #CBD5E1; }
+
+/* ═══ Recharts overrides for light mode ═══ */
+:root:not(.dark) .recharts-default-tooltip {
+  background-color: #FFFFFF !important;
+  border-color: #E2E8F0 !important;
+  color: #0F172A !important;
+}
+
+:root:not(.dark) .recharts-tooltip-wrapper .recharts-default-tooltip {
+  background-color: #FFFFFF !important;
+  border: 1px solid #E2E8F0 !important;
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1) !important;
+}
+
+:root:not(.dark) .recharts-tooltip-label {
+  color: #0F172A !important;
+}
+
+:root:not(.dark) .recharts-tooltip-item {
+  color: #475569 !important;
+}
+
+:root:not(.dark) .recharts-cartesian-axis-tick-value {
+  fill: #64748B !important;
+}
+
+:root:not(.dark) .recharts-legend-item-text {
+  color: #475569 !important;
+}
+
+:root:not(.dark) .recharts-pie-label-text {
+  fill: #0F172A !important;
+}
+
+/* Skeleton loading - Light */
+.skeleton {
+  background: linear-gradient(90deg, #F1F5F9 25%, #E2E8F0 50%, #F1F5F9 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s ease-in-out infinite;
+  border-radius: 4px;
+}
+
+.dark .skeleton {
+  background: linear-gradient(90deg, #1E293B 25%, #334155 50%, #1E293B 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s ease-in-out infinite;
+}
+
+.font-mono-clinical {
+  font-family: "JetBrains Mono", "Fira Code", "SF Mono", "Cascadia Code", monospace;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.3s ease-out forwards;
+}
+
+@keyframes pulse-glow {
+  0%, 100% { box-shadow: 0 0 4px rgba(220, 38, 38, 0.4); }
+  50% { box-shadow: 0 0 12px rgba(220, 38, 38, 0.8); }
+}
+
+.pulse-critical {
+  animation: pulse-glow 2s ease-in-out infinite;
+}
+
+@keyframes pulse-border {
+  0%, 100% { border-color: rgba(239, 68, 68, 0.3); box-shadow: 0 0 4px rgba(239, 68, 68, 0.2); }
+  50% { border-color: rgba(239, 68, 68, 0.7); box-shadow: 0 0 12px rgba(239, 68, 68, 0.4); }
+}
+
+.animate-pulse-border {
+  animation: pulse-border 2s ease-in-out infinite;
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+/* Heart-rate pulse — visceral "live heartbeat" for the HR vital tile.
+ * Apply with `style={{ animationDuration: `${60 / hr}s` }}` to match the
+ * patient's actual heart rate. */
+@keyframes heartbeat {
+  0%, 60%, 100% { transform: scale(1); }
+  10%, 30% { transform: scale(1.12); }
+  20% { transform: scale(1.04); }
+}
+
+.animate-heartbeat {
+  animation: heartbeat 0.8s ease-in-out infinite;
+  transform-origin: center;
+}

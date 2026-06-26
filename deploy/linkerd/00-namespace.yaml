@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: medai
+  labels:
+    linkerd.io/inject: enabled
+    # Access control — only the mesh proxy can talk to pods
+    config.linkerd.io/default-inbound-policy: all-authenticated
+    # HSE data-protection tag
+    hse.ie/data-class: phi

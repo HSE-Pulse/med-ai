@@ -1,0 +1,134 @@
+# Umbrella values — one block per service. Every block merges onto the
+# medai-service default values. Override only what differs.
+#
+# Resource footprint sized for a medium Irish hospital (~150 beds, 75
+# admits/day). Scale HPA maxReplicas with patient throughput.
+
+# -------- common env fragments pulled in via YAML anchors --------
+_sharedEnv: &sharedEnv
+  KAFKA_BOOTSTRAP: "medai-redpanda:9092"
+  REDIS_URL: "redis://medai-redis:6379"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+  LOG_LEVEL: "INFO"
+  DEPLOYMENT_MODE: "production"
+
+# -------- per-service blocks --------
+
+ed-triage:
+  service: { name: ed-triage, module: "app_01_ed_triage.backend.app.main:app", port: 8201 }
+  resources: { requests: { cpu: 200m, memory: 512Mi }, limits: { cpu: 1000m, memory: 1Gi } }
+  autoscaling: { enabled: true, minReplicas: 2, maxReplicas: 6 }
+  env: { <<: *sharedEnv }
+
+sepsis-icu:
+  service: { name: sepsis-icu, module: "app_02_sepsis_icu.backend.app.main:app", port: 8202 }
+  resources: { requests: { cpu: 300m, memory: 1Gi }, limits: { cpu: 1500m, memory: 2Gi } }
+  autoscaling: { enabled: true, minReplicas: 2, maxReplicas: 4 }
+  env: { <<: *sharedEnv }
+
+hospital-ops:
+  service: { name: hospital-ops, module: "app_03_hospital_ops.backend.app.main:app", port: 8203 }
+  resources: { requests: { cpu: 500m, memory: 1Gi }, limits: { cpu: 2000m, memory: 2Gi } }
+  # Hospital Ops runs the DES + MARL agent — singleton, not horizontally scalable.
+  autoscaling: { enabled: false }
+  service: { replicaCount: 1 }
+  env: { <<: *sharedEnv }
+
+oncology-ai:
+  service: { name: oncology-ai, module: "app_04_oncology_ai.backend.app.main:app", port: 8204 }
+  resources: { requests: { cpu: 200m, memory: 512Mi }, limits: { cpu: 1000m, memory: 1Gi } }
+  autoscaling: { enabled: true, minReplicas: 1, maxReplicas: 3 }
+  env: { <<: *sharedEnv }
+
+patient-journey:
+  service: { name: patient-journey, module: "app_05_patient_journey.backend.api.main:app", port: 8205 }
+  resources: { requests: { cpu: 200m, memory: 512Mi }, limits: { cpu: 1000m, memory: 1Gi } }
+  autoscaling: { enabled: true, minReplicas: 2, maxReplicas: 6 }
+  env: { <<: *sharedEnv }
+
+clinical-chat:
+  service: { name: clinical-chat, module: "app_06_clinical_chat.backend.main:app", port: 8206 }
+  # LLM service — heavier memory for Ollama context, GPU node pool in prod
+  resources: { requests: { cpu: 500m, memory: 2Gi }, limits: { cpu: 2000m, memory: 4Gi } }
+  autoscaling: { enabled: true, minReplicas: 2, maxReplicas: 8 }
+  env:
+    <<: *sharedEnv
+    OLLAMA_BASE_URL: "http://ollama:11434"
+
+data-ingestion:
+  service: { name: data-ingestion, module: "app_07_data_ingestion.backend.api.main:app", port: 8207 }
+  # Sim engine is the Kafka producer + DT orchestrator — singleton
+  resources: { requests: { cpu: 500m, memory: 1Gi }, limits: { cpu: 2000m, memory: 2Gi } }
+  autoscaling: { enabled: false }
+  service: { replicaCount: 1 }
+  env: { <<: *sharedEnv }
+
+bed-management:
+  service: { name: bed-management, module: "app_08_bed_management.backend.app.main:app", port: 8208 }
+  # In-memory bed state — singleton until PersistentState moves to Mongo as source of truth
+  resources: { requests: { cpu: 200m, memory: 512Mi }, limits: { cpu: 1000m, memory: 1Gi } }
+  autoscaling: { enabled: false }
+  service: { replicaCount: 1 }
+  env: { <<: *sharedEnv }
+
+waiting-list:
+  service: { name: waiting-list, module: "app_09_waiting_list.backend.app.main:app", port: 8209 }
+  resources: { requests: { cpu: 100m, memory: 256Mi }, limits: { cpu: 500m, memory: 512Mi } }
+  autoscaling: { enabled: true, minReplicas: 2, maxReplicas: 4 }
+  env: { <<: *sharedEnv }
+
+clinical-scribe:
+  service: { name: clinical-scribe, module: "app_10_clinical_scribe.backend.app.main:app", port: 8210 }
+  resources: { requests: { cpu: 300m, memory: 1Gi }, limits: { cpu: 1500m, memory: 2Gi } }
+  autoscaling: { enabled: true, minReplicas: 2, maxReplicas: 6 }
+  env: { <<: *sharedEnv }
+
+ed-flow:
+  service: { name: ed-flow, module: "app_14_ed_flow.backend.app.main:app", port: 8214 }
+  resources: { requests: { cpu: 200m, memory: 512Mi }, limits: { cpu: 1000m, memory: 1Gi } }
+  autoscaling: { enabled: true, minReplicas: 2, maxReplicas: 6 }
+  env: { <<: *sharedEnv }
+
+erp:
+  service: { name: erp, module: "app_15_erp.backend.app.main:app", port: 8215 }
+  resources: { requests: { cpu: 100m, memory: 256Mi }, limits: { cpu: 500m, memory: 512Mi } }
+  autoscaling: { enabled: true, minReplicas: 1, maxReplicas: 3 }
+  env: { <<: *sharedEnv }
+
+trolley-watch:
+  service: { name: trolley-watch, module: "app_16_trolley_watch.backend.app.main:app", port: 8216 }
+  resources: { requests: { cpu: 100m, memory: 256Mi }, limits: { cpu: 500m, memory: 512Mi } }
+  autoscaling: { enabled: true, minReplicas: 1, maxReplicas: 3 }
+  env: { <<: *sharedEnv }
+
+gdpr:
+  service: { name: gdpr, module: "app_17_gdpr.backend.app.main:app", port: 8217 }
+  # GDPR service consumes every topic — higher memory for audit ring buffer
+  resources: { requests: { cpu: 200m, memory: 512Mi }, limits: { cpu: 1000m, memory: 1Gi } }
+  autoscaling: { enabled: true, minReplicas: 2, maxReplicas: 4 }
+  env: { <<: *sharedEnv }
+
+xai:
+  service: { name: xai, module: "app_18_xai.backend.app.main:app", port: 8218 }
+  # SHAP explanations are CPU-heavy
+  resources: { requests: { cpu: 500m, memory: 1Gi }, limits: { cpu: 2000m, memory: 2Gi } }
+  autoscaling: { enabled: true, minReplicas: 1, maxReplicas: 4 }
+  env: { <<: *sharedEnv }
+
+fhir:
+  service: { name: fhir, module: "app_19_fhir.backend.app.main:app", port: 8219 }
+  resources: { requests: { cpu: 200m, memory: 512Mi }, limits: { cpu: 1000m, memory: 1Gi } }
+  autoscaling: { enabled: true, minReplicas: 2, maxReplicas: 6 }
+  env: { <<: *sharedEnv }
+
+deterioration:
+  service: { name: deterioration, module: "app_20_deterioration.backend.app.main:app", port: 8220 }
+  resources: { requests: { cpu: 200m, memory: 512Mi }, limits: { cpu: 1000m, memory: 1Gi } }
+  autoscaling: { enabled: true, minReplicas: 2, maxReplicas: 6 }
+  env: { <<: *sharedEnv }
+
+discharge-lounge:
+  service: { name: discharge-lounge, module: "app_21_discharge_lounge.backend.app.main:app", port: 8221 }
+  resources: { requests: { cpu: 100m, memory: 256Mi }, limits: { cpu: 500m, memory: 512Mi } }
+  autoscaling: { enabled: true, minReplicas: 1, maxReplicas: 3 }
+  env: { <<: *sharedEnv }

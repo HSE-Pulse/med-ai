@@ -1,0 +1,305 @@
+# Containerized backends + dashboard for the HSE/cancer stack.
+#
+# Run AFTER the 5 medai-* infra composes are up (they own cancer_default
+# network and the cancer-mongo container):
+#
+#   docker compose -p cancer -f docker-compose.services.yml up -d
+#
+# Stop start_all.py on the host first (or its uvicorn workers will hold
+# the 8201-8222 / 3010 ports and these containers can't bind).
+#
+# Cross-service URLs use docker-DNS service names (resolved on the
+# cancer_default bridge). The dashboard's Vite proxy is overridden via
+# VITE_*_URL env vars so it talks to sibling containers, not 127.0.0.1.
+
+x-svc-env: &svc-env
+  KAFKA_BOOTSTRAP: redpanda:9092
+  MONGO_URI: mongodb://cancer-mongo:27017/
+  MONGO_URL: mongodb://cancer-mongo:27017
+  REDIS_URL: redis://redis:6379
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+  OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+  LOKI_URL: http://loki:3100
+  CUDA_VISIBLE_DEVICES: ""
+  # Cross-service URLs — each backend resolves siblings by service name.
+  ED_TRIAGE_URL: http://ed_triage:8201
+  SEPSIS_ICU_URL: http://sepsis_icu:8202
+  HOSPITAL_OPS_URL: http://hospital_ops:8203
+  ONCOLOGY_AI_URL: http://oncology_ai:8204
+  PATIENT_JOURNEY_URL: http://patient_journey:8205
+  CLINICAL_CHAT_URL: http://clinical_chat:8206
+  DATA_INGESTION_URL: http://data_ingestion:8207
+  BED_MANAGEMENT_URL: http://bed_management:8208
+  WAITING_LIST_URL: http://waiting_list:8209
+  CLINICAL_SCRIBE_URL: http://clinical_scribe:8210
+  ED_FLOW_URL: http://ed_flow:8214
+  ERP_URL: http://erp:8215
+  TROLLEY_WATCH_URL: http://trolley_watch:8216
+  GDPR_URL: http://gdpr:8217
+  XAI_URL: http://xai:8218
+  FHIR_URL: http://fhir:8219
+  DETERIORATION_URL: http://deterioration:8220
+  DISCHARGE_LOUNGE_URL: http://discharge_lounge:8221
+  ALERTS_URL: http://alerts:8222
+
+x-svc-volumes: &svc-volumes
+  - ./models:/models:ro
+  - ./datasets:/datasets:ro
+
+x-svc-defaults: &svc-defaults
+  restart: unless-stopped
+  networks: [cancer_default]
+  volumes: *svc-volumes
+  # No depends_on for cancer-mongo / medai-redpanda — those containers
+  # are owned by separate compose files / docker run, so referencing
+  # them here would be "undefined service" errors. The services have
+  # their own connect-retry against Mongo + Kafka.
+
+services:
+  # ── 19 backend services ──────────────────────────────────────────────
+  ed_triage:
+    <<: *svc-defaults
+    image: hse-svc-ed_triage:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args: { APP: app_01_ed_triage, MODULE_PATH: app_01_ed_triage.backend.app.main:app, PORT: 8201 }
+    container_name: hse-ed_triage
+    environment:
+      <<: *svc-env
+      MODEL_DIR: /models/ed_triage
+      DATASET_DIR: /datasets/ed_triage
+    ports: ["100.118.170.33:8201:8201"]
+
+  sepsis_icu:
+    <<: *svc-defaults
+    image: hse-svc-sepsis_icu:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args: { APP: app_02_sepsis_icu, MODULE_PATH: app_02_sepsis_icu.backend.app.main:app, PORT: 8202 }
+    container_name: hse-sepsis_icu
+    environment:
+      <<: *svc-env
+      MODEL_DIR: /models/sepsis_icu
+    ports: ["100.118.170.33:8202:8202"]
+
+  hospital_ops:
+    <<: *svc-defaults
+    image: hse-svc-hospital_ops:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args: { APP: app_03_hospital_ops, MODULE_PATH: app_03_hospital_ops.backend.app.main:app, PORT: 8203 }
+    container_name: hse-hospital_ops
+    environment:
+      <<: *svc-env
+      MODEL_DIR: /models/hospital_ops
+    ports: ["100.118.170.33:8203:8203"]
+
+  oncology_ai:
+    <<: *svc-defaults
+    image: hse-svc-oncology_ai:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args: { APP: app_04_oncology_ai, MODULE_PATH: app_04_oncology_ai.backend.app.main:app, PORT: 8204 }
+    container_name: hse-oncology_ai
+    environment:
+      <<: *svc-env
+      MODEL_DIR: /models/oncology
+    ports: ["100.118.170.33:8204:8204"]
+
+  patient_journey:
+    <<: *svc-defaults
+    image: hse-svc-patient_journey:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args: { APP: app_05_patient_journey, MODULE_PATH: app_05_patient_journey.backend.api.main:app, PORT: 8205 }
+    container_name: hse-patient_journey
+    environment:
+      <<: *svc-env
+    ports: ["100.118.170.33:8205:8205"]
+
+  clinical_chat:
+    <<: *svc-defaults
+    image: hse-svc-clinical_chat:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args: { APP: app_06_clinical_chat, MODULE_PATH: app_06_clinical_chat.backend.main:app, PORT: 8206 }
+    container_name: hse-clinical_chat
+    environment:
+      <<: *svc-env
+      OLLAMA_BASE: http://ollama:11434
+    ports: ["100.118.170.33:8206:8206"]
+
+  data_ingestion:
+    <<: *svc-defaults
+    image: hse-svc-data_ingestion:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args: { APP: app_07_data_ingestion, MODULE_PATH: app_07_data_ingestion.backend.api.main:app, PORT: 8207 }
+    container_name: hse-data_ingestion
+    environment: *svc-env
+    ports: ["100.118.170.33:8207:8207"]
+
+  bed_management:
+    <<: *svc-defaults
+    image: hse-svc-bed_management:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args: { APP: app_08_bed_management, MODULE_PATH: app_08_bed_management.backend.app.main:app, PORT: 8208 }
+    container_name: hse-bed_management
+    environment:
+      <<: *svc-env
+      MODEL_DIR: /models/bed_management
+    ports: ["100.118.170.33:8208:8208"]
+
+  waiting_list:
+    <<: *svc-defaults
+    image: hse-svc-waiting_list:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args: { APP: app_09_waiting_list, MODULE_PATH: app_09_waiting_list.backend.app.main:app, PORT: 8209 }
+    container_name: hse-waiting_list
+    environment:
+      <<: *svc-env
+      MODEL_DIR: /models/waiting_list
+    ports: ["100.118.170.33:8209:8209"]
+
+  clinical_scribe:
+    <<: *svc-defaults
+    image: hse-svc-clinical_scribe:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args: { APP: app_10_clinical_scribe, MODULE_PATH: app_10_clinical_scribe.backend.app.main:app, PORT: 8210 }
+    container_name: hse-clinical_scribe
+    environment:
+      <<: *svc-env
+      MODEL_DIR: /models/clinical_scribe
+    ports: ["100.118.170.33:8210:8210"]
+
+  ed_flow:
+    <<: *svc-defaults
+    image: hse-svc-ed_flow:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args: { APP: app_14_ed_flow, MODULE_PATH: app_14_ed_flow.backend.app.main:app, PORT: 8214 }
+    container_name: hse-ed_flow
+    environment:
+      <<: *svc-env
+      MODEL_DIR: /models/ed_flow
+    ports: ["100.118.170.33:8214:8214"]
+
+  erp:
+    <<: *svc-defaults
+    image: hse-svc-erp:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args: { APP: app_15_erp, MODULE_PATH: app_15_erp.backend.app.main:app, PORT: 8215 }
+    container_name: hse-erp
+    environment: *svc-env
+    ports: ["100.118.170.33:8215:8215"]
+
+  trolley_watch:
+    <<: *svc-defaults
+    image: hse-svc-trolley_watch:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args: { APP: app_16_trolley_watch, MODULE_PATH: app_16_trolley_watch.backend.app.main:app, PORT: 8216 }
+    container_name: hse-trolley_watch
+    environment: *svc-env
+    ports: ["100.118.170.33:8216:8216"]
+
+  gdpr:
+    <<: *svc-defaults
+    image: hse-svc-gdpr:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args: { APP: app_17_gdpr, MODULE_PATH: app_17_gdpr.backend.app.main:app, PORT: 8217 }
+    container_name: hse-gdpr
+    environment: *svc-env
+    ports: ["100.118.170.33:8217:8217"]
+
+  xai:
+    <<: *svc-defaults
+    image: hse-svc-xai:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args: { APP: app_18_xai, MODULE_PATH: app_18_xai.backend.app.main:app, PORT: 8218 }
+    container_name: hse-xai
+    environment: *svc-env
+    ports: ["100.118.170.33:8218:8218"]
+
+  fhir:
+    <<: *svc-defaults
+    image: hse-svc-fhir:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args: { APP: app_19_fhir, MODULE_PATH: app_19_fhir.backend.app.main:app, PORT: 8219 }
+    container_name: hse-fhir
+    environment: *svc-env
+    ports: ["100.118.170.33:8219:8219"]
+
+  deterioration:
+    <<: *svc-defaults
+    image: hse-svc-deterioration:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args: { APP: app_20_deterioration, MODULE_PATH: app_20_deterioration.backend.app.main:app, PORT: 8220 }
+    container_name: hse-deterioration
+    environment: *svc-env
+    ports: ["100.118.170.33:8220:8220"]
+
+  discharge_lounge:
+    <<: *svc-defaults
+    image: hse-svc-discharge_lounge:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args: { APP: app_21_discharge_lounge, MODULE_PATH: app_21_discharge_lounge.backend.app.main:app, PORT: 8221 }
+    container_name: hse-discharge_lounge
+    environment: *svc-env
+    ports: ["100.118.170.33:8221:8221"]
+
+  alerts:
+    <<: *svc-defaults
+    image: hse-svc-alerts:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args: { APP: app_22_alerts, MODULE_PATH: app_22_alerts.backend.app.main:app, PORT: 8222 }
+    container_name: hse-alerts
+    environment: *svc-env
+    ports: ["100.118.170.33:8222:8222"]
+
+  # ── Dashboard (nginx serving the vite build + reverse-proxy /api/*) ──
+  # Source lives in ./dashboard/ — edits picked up by `docker compose
+  # build dashboard` (rebuilds the bundle inside the image). The image
+  # itself is nginx:1.27-alpine with dist baked in; no node at runtime.
+  dashboard:
+    image: hse-dashboard:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dashboard
+    container_name: hse-dashboard
+    restart: unless-stopped
+    networks: [cancer_default]
+    ports: ["100.118.170.33:3010:3010"]
+
+networks:
+  cancer_default:
+    external: true

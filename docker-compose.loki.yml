@@ -1,0 +1,68 @@
+# Loki — centralised log store.
+#
+# Services push JSON-structured log lines to Loki via HTTP (/loki/api/v1/push).
+# Each line carries service, trace_id, span_id, level as labels so Grafana
+# can filter + correlate with traces in Jaeger.
+#
+# Start:
+#   docker compose -f docker-compose.loki.yml up -d
+#
+# Services pick up via env var:
+#   export LOKI_URL=http://localhost:3100
+#   python scripts/start_all_services.py
+#
+# Access: http://127.0.0.1:3001 → Explore → Loki datasource
+#   Sample queries:
+#     {service="bed_management"}
+#     {service="hospital_ops"} | json | level="WARNING"
+#     {service=~".+"} |~ "trace_id=3cccf431"        # pivot from a trace
+#
+# Stop + wipe:   docker compose -f docker-compose.loki.yml down -v
+
+services:
+  loki:
+    image: grafana/loki:3.2.1
+    container_name: medai-loki
+    command: -config.file=/etc/loki/config.yml
+    volumes:
+      - ./deploy/loki/loki-config.yaml:/etc/loki/config.yml:ro
+      - loki_data:/loki
+    ports:
+      - "3100:3100"
+    networks:
+      - cancer_default
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3100/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+
+  # Promtail — tails any per-service log files we happen to write to disk
+  # (optional — services also push directly via LokiHandler). Useful when
+  # debugging a crashed service that didn't live long enough to push.
+  promtail:
+    image: grafana/promtail:3.2.1
+    container_name: medai-promtail
+    command: -config.file=/etc/promtail/config.yml
+    volumes:
+      - ./deploy/loki/promtail-config.yaml:/etc/promtail/config.yml:ro
+      - /var/log:/host/var/log:ro        # generic system log mount (Linux)
+      # Belt-and-braces tailer for the per-service stdout files written by
+      # start_all.py / nohup. Maps `cancer/.tmp/svc_logs` (host) to
+      # `/var/log/medai` (inside the container) so logs survive a service
+      # crash that happened before LokiQueueHandler flushed.
+      - ./.tmp/svc_logs:/var/log/medai:ro
+    networks:
+      - cancer_default
+    depends_on:
+      loki:
+        condition: service_healthy
+
+volumes:
+  loki_data:
+    name: medai-loki-data
+
+networks:
+  cancer_default:
+    external: true

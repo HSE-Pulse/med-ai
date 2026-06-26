@@ -1,0 +1,87 @@
+apiVersion: v2
+name: medai-platform
+description: |
+  Umbrella chart that deploys the entire MedAI platform (17 services +
+  infra) in one release. Depends on the medai-service chart for each
+  microservice, plus the operators for MongoDB, Redpanda, Redis, and
+  Linkerd.
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+
+# Each service is a dependency pinned to the same medai-service chart
+# with a distinct values file. See charts/ below — the umbrella chart
+# keeps the helm file hierarchy clean.
+dependencies:
+  - name: medai-service
+    alias: ed-triage
+    version: 0.1.0
+    repository: "file://../medai-service"
+  - name: medai-service
+    alias: sepsis-icu
+    version: 0.1.0
+    repository: "file://../medai-service"
+  - name: medai-service
+    alias: hospital-ops
+    version: 0.1.0
+    repository: "file://../medai-service"
+  - name: medai-service
+    alias: oncology-ai
+    version: 0.1.0
+    repository: "file://../medai-service"
+  - name: medai-service
+    alias: patient-journey
+    version: 0.1.0
+    repository: "file://../medai-service"
+  - name: medai-service
+    alias: clinical-chat
+    version: 0.1.0
+    repository: "file://../medai-service"
+  - name: medai-service
+    alias: data-ingestion
+    version: 0.1.0
+    repository: "file://../medai-service"
+  - name: medai-service
+    alias: bed-management
+    version: 0.1.0
+    repository: "file://../medai-service"
+  - name: medai-service
+    alias: waiting-list
+    version: 0.1.0
+    repository: "file://../medai-service"
+  - name: medai-service
+    alias: clinical-scribe
+    version: 0.1.0
+    repository: "file://../medai-service"
+  - name: medai-service
+    alias: ed-flow
+    version: 0.1.0
+    repository: "file://../medai-service"
+  - name: medai-service
+    alias: erp
+    version: 0.1.0
+    repository: "file://../medai-service"
+  - name: medai-service
+    alias: trolley-watch
+    version: 0.1.0
+    repository: "file://../medai-service"
+  - name: medai-service
+    alias: gdpr
+    version: 0.1.0
+    repository: "file://../medai-service"
+  - name: medai-service
+    alias: xai
+    version: 0.1.0
+    repository: "file://../medai-service"
+  - name: medai-service
+    alias: fhir
+    version: 0.1.0
+    repository: "file://../medai-service"
+  - name: medai-service
+    alias: deterioration
+    version: 0.1.0
+    repository: "file://../medai-service"
+  - name: medai-service
+    alias: discharge-lounge
+    version: 0.1.0
+    repository: "file://../medai-service"

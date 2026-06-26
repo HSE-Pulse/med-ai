@@ -1,0 +1,19 @@
+# Dashboard image: vite-built SPA served by nginx, with /api/* reverse-proxied
+# to backend services on cancer_default. Replaced the prior `vite dev` image
+# on 2026-05-25 — `vite preview`'s HTTP+WS proxy was hanging /api/sim/* requests
+# 5-15s ~7% of the time. nginx eliminates the spike.
+
+# ── stage 1: build the bundle ────────────────────────────────────────────
+FROM node:22-bookworm-slim AS builder
+WORKDIR /app
+COPY dashboard/package.json dashboard/package-lock.json* ./
+RUN npm install --no-audit --no-fund
+COPY dashboard/ ./
+RUN npx vite build
+
+# ── stage 2: nginx serves dist + reverse-proxies /api/* ──────────────────
+FROM nginx:1.27-alpine
+COPY --from=builder /app/dist /usr/share/nginx/html
+COPY dashboard/nginx.conf /etc/nginx/nginx.conf
+EXPOSE 3010
+# default CMD from nginx image: ["nginx", "-g", "daemon off;"]

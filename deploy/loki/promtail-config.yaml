@@ -1,0 +1,58 @@
+# Promtail — file-scraper fallback when services can't push directly.
+# Services push structured logs to Loki via LokiQueueHandler (in
+# shared/integration/logging_config.py). This is a belt-and-braces
+# tailer for when a service dies before flushing its queue.
+#
+# IMPORTANT — severity label casing
+# ---------------------------------
+# `python-logging-loki` lowercases the level before pushing, so log
+# records show up in Loki as severity="info" | "warning" | "error",
+# NOT uppercase. Grafana queries / LogQL filters MUST use lowercase:
+#
+#   {service="data_ingestion", severity="warning"}    ✅
+#   {service="data_ingestion", severity="WARNING"}    ✗ (zero rows)
+#
+# When promtail file-tails (the medai-service-stdout job below), the
+# `severity` label isn't extracted automatically — we'd need a JSON
+# pipeline stage to read `level` from the body. Until that's wired,
+# file-tailed lines arrive without a severity label at all, so case
+# matching is moot for those streams.
+
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+  log_level: info
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+    tenant_id: ""                   # single-tenant dev
+
+scrape_configs:
+  # Platform syslog (Linux). On Windows host, this is a no-op stub.
+  - job_name: host-logs
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: host
+          __path__: /host/var/log/*.log
+
+  # Per-service stdout files written by start_all.py / nohup runs.
+  # Belt-and-braces fallback: if a service dies before LokiQueueHandler
+  # flushes its in-memory queue, the file tailer still ships the last
+  # lines. Promtail extracts the port from the filename so each file
+  # gets a `service_port` label. Mounted via docker-compose.loki.yml.
+  - job_name: medai-service-stdout
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: medai-stdout
+          __path__: /var/log/medai/*.log
+    pipeline_stages:
+      - regex:
+          source: filename
+          expression: '/var/log/medai/(?P<service_port>\d+)\.log'
+      - labels:
+          service_port:

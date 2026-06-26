@@ -1,0 +1,142 @@
+{
+  "uid": "medai-logs",
+  "title": "MedAI — Logs",
+  "tags": ["medai", "logs", "loki"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "15s",
+  "time": { "from": "now-30m", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "service",
+        "label": "Service",
+        "type": "query",
+        "datasource": { "type": "loki", "uid": "loki" },
+        "query": "label_values({source=\"medai\"}, service)",
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" },
+        "refresh": 2
+      },
+      {
+        "name": "level",
+        "label": "Level",
+        "type": "custom",
+        "query": "DEBUG,INFO,WARNING,ERROR,CRITICAL",
+        "current": { "text": "All", "value": ["INFO","WARNING","ERROR","CRITICAL"] },
+        "multi": true,
+        "includeAll": true
+      },
+      {
+        "name": "trace",
+        "label": "Trace ID (paste from Jaeger)",
+        "type": "textbox",
+        "current": { "text": "", "value": "" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Log volume by service (last 30m)",
+      "type": "timeseries",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 6 },
+      "targets": [
+        {
+          "expr": "sum by (service) (count_over_time({source=\"medai\", service=~\"$service\"} [1m]))",
+          "legendFormat": "{{service}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "bars", "fillOpacity": 60 }
+        }
+      }
+    },
+    {
+      "id": 2,
+      "title": "ERROR + CRITICAL — every service",
+      "type": "logs",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "x": 0, "y": 6, "w": 24, "h": 8 },
+      "targets": [
+        {
+          "expr": "{source=\"medai\", service=~\"$service\"} | json | level=~\"ERROR|CRITICAL\""
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "showLabels": true,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending"
+      }
+    },
+    {
+      "id": 3,
+      "title": "All logs (filtered)",
+      "type": "logs",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "x": 0, "y": 14, "w": 24, "h": 14 },
+      "targets": [
+        {
+          "expr": "{source=\"medai\", service=~\"$service\"} | json | level=~\"$level\" |~ \"$trace\""
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "showLabels": true,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": true,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending"
+      }
+    },
+    {
+      "id": 4,
+      "title": "Top log patterns",
+      "description": "Aggregates similar messages so you can spot 'this WARNING fired 4,000 times' at a glance.",
+      "type": "table",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "x": 0, "y": 28, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "topk(10, sum by (service, level) (count_over_time({source=\"medai\", service=~\"$service\"} | json | level=~\"$level\" [5m])))"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Error rate by service (per minute)",
+      "type": "timeseries",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "x": 12, "y": 28, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum by (service) (rate({source=\"medai\", service=~\"$service\"} | json | level=~\"ERROR|CRITICAL\" [1m]))",
+          "legendFormat": "{{service}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 0.1 },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}
