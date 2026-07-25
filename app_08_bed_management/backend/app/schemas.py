@@ -12,9 +12,27 @@ from pydantic import BaseModel, Field
 # Department & Bed Configuration (Irish Hospital)
 # ---------------------------------------------------------------------------
 
-from shared.constants.hospital import CAPACITIES, DEPARTMENT_TYPES, BED_STATUSES, ALERT_LEVELS
+from shared.constants.hospital import (
+    REPLAY_CAPACITIES,
+    DEPARTMENT_TYPES,
+    BED_STATUSES,
+    ALERT_LEVELS,
+)
 
-IRISH_DEPARTMENTS = {name: {"capacity": cap, "type": DEPARTMENT_TYPES[name]} for name, cap in CAPACITIES.items()}
+# Sized from REPLAY_CAPACITIES, not the Irish CAPACITIES.
+#
+# This service beds the MIMIC *replay* patients — its bed records carry
+# SIM-* hadm_ids — so it inherits that dataset's case-mix, not Irish service
+# planning. On the Irish sizing, ICU/AMAU/SAU sat pinned at 100% "black"
+# indefinitely: MIMIC's six critical-care units alone put ~42 patients
+# against 12 ICU beds, so 30 of them could never be allocated a bed at all.
+#
+# hospital_ops still uses CAPACITIES — its DES enforces them as hard resource
+# limits over synthetic arrivals, which is a different hospital entirely.
+IRISH_DEPARTMENTS = {
+    name: {"capacity": cap, "type": DEPARTMENT_TYPES[name]}
+    for name, cap in REPLAY_CAPACITIES.items()
+}
 
 
 # ---------------------------------------------------------------------------

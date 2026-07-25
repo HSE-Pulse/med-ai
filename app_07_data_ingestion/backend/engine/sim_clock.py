@@ -14,7 +14,30 @@ from datetime import datetime, timedelta
 class SimClock:
     """Thread-safe simulation clock with configurable speed multiplier."""
 
-    def __init__(self, speed: float = 1.0, start_offset_hours: float = 0) -> None:
+    def __init__(
+        self,
+        speed: float = 1.0,
+        start_offset_hours: float = 0,
+        start_at: "datetime | None" = None,
+    ) -> None:
+        """Create the clock.
+
+        ``start_at`` resumes simulated time from a previously persisted
+        anchor. Without it the clock anchors to ``utcnow()``, which is only
+        correct for a genuinely fresh simulation.
+
+        Why resuming matters
+        --------------------
+        At 5-10x, an uninterrupted run advances sim time far beyond wall
+        time — we measured patient records reaching 2026-10-04 while the
+        wall clock read 2026-07-25. Re-anchoring to ``utcnow()`` on every
+        process start therefore threw that away and resumed writing events
+        with timestamps EARLIER than rows already in the collection, so a
+        patient open across the restart got a backward jump in their own
+        chart. Measured after a day of restarts: 231 of 246 active patients
+        had at least one backward jump, and "latest reading by charttime"
+        returned a stale row for all of them.
+        """
         if speed <= 0:
             raise ValueError("speed must be positive")
         self._lock = threading.Lock()
@@ -22,7 +45,11 @@ class SimClock:
         # Anchor points: the real-world timestamp and the sim-world timestamp
         # at the moment we last (re)set speed.
         self._anchor_real = time.time()
-        self._anchor_sim = datetime.utcnow() + timedelta(hours=start_offset_hours)
+        wall = datetime.utcnow() + timedelta(hours=start_offset_hours)
+        # Never move simulated time backwards. If a persisted anchor is
+        # behind wall time (a long outage), wall time wins; if it is ahead
+        # (the normal case at >1x), the persisted anchor wins.
+        self._anchor_sim = max(start_at, wall) if start_at is not None else wall
 
     # ------------------------------------------------------------------
     # Public API

@@ -27,6 +27,101 @@ CAPACITIES = {
     "HDU": 8, "Day_Ward": 20, "Discharge_Lounge": 10,
 }
 
+# ---------------------------------------------------------------------------
+# Replay capacities — denominators for MIMIC-sourced views
+# ---------------------------------------------------------------------------
+#
+# Two different hospitals share this module, and they mean different things
+# by "capacity":
+#
+#   * hospital_ops runs a DES over synthetic arrivals. For it, CAPACITIES is
+#     a HARD RESOURCE LIMIT — departments report is_full, queue patients, and
+#     cap their queues at 2x capacity. Occupancy there can never exceed 100%.
+#
+#   * data_ingestion replays real MIMIC admissions and transfers. It has no
+#     concept of capacity at all: a patient goes wherever the source record
+#     says they went. CAPACITIES is only ever a DISPLAY DENOMINATOR there.
+#
+# Dividing replay occupancy by the DES's Irish bed model is a category error,
+# and it showed: MIMIC (BIDMC, a US tertiary centre) runs six distinct ICUs
+# — SICU, CVICU, TSICU, MICU/SICU, MICU, Neuro SICU — which map onto the one
+# Irish "ICU". Measured on this deployment that is 42 patients against 12
+# beds, rendered as 350% occupancy. An Irish Model 4 hospital runs ICU at
+# roughly 5% of beds; this dataset runs it at ~20%.
+#
+# So replay-sourced views divide by these instead. They describe the DATASET,
+# not a hospital — sized from observed steady-state demand with roughly 1.25x
+# headroom so normal fluctuation doesn't re-breach 100%. Departments absent
+# here fall back to CAPACITIES, correct wherever the mapping is 1:1.
+#
+# Sized against the CORRECTED mapping below, not the one it replaced: moving
+# the Med/Surg* and Neurology wards out of the SAU/AMAU assessment units
+# empties those two and lands the volume on Medicine and Surgery instead
+# (measured 58 and 57 against Irish 40 and 36), so those are what need room.
+# Sizing rule: ~1.5x observed steady-state demand, measured 2026-07-25 with
+# 233 active patients. 1.25x was tried first and proved too tight — the census
+# is still climbing toward steady state (arrival rate x mean LOS, and MIMIC
+# LOS runs to days), so Cardiology reached exactly 20/20 and went "black"
+# within minutes of the previous sizing. Headroom here costs nothing but a
+# few bed records; a pinned ward blocks allocation entirely.
+REPLAY_CAPACITIES = {
+    **CAPACITIES,
+    "ICU": 64,         # 6 MIMIC critical-care units collapse to one Irish ICU
+    "Medicine": 96,    # + Neurology, Psychiatry, Med/Surg, Haem/Onc, Transplant
+    "Surgery": 96,     # + Med/Surg/Trauma, Med/Surg/GYN, Cardiac Surgery
+    "Cardiology": 32,  # + Medicine/Cardiology, CCU, Cardiology Surgery Interm.
+}
+
+# The careunit vocabulary this dataset actually contains — every distinct
+# non-null `careunit` in MIMIC_SIM.transfers (38 values, captured from the
+# live deployment). Recorded here so that "which wards can this dataset
+# populate?" is answerable statically instead of by querying Mongo.
+MIMIC_CAREUNITS = frozenset({
+    "Cardiac Surgery",
+    "Cardiac Vascular Intensive Care Unit (CVICU)",
+    "Cardiology",
+    "Cardiology Surgery Intermediate",
+    "Coronary Care Unit (CCU)",
+    "Discharge Lounge",
+    "Emergency Department",
+    "Emergency Department Observation",
+    "Hematology/Oncology",
+    "Hematology/Oncology Intermediate",
+    "Labor & Delivery",
+    "Med/Surg",
+    "Med/Surg/GYN",
+    "Med/Surg/Trauma",
+    "Medical Intensive Care Unit (MICU)",
+    "Medical/Surgical (Gynecology)",
+    "Medical/Surgical Intensive Care Unit (MICU/SICU)",
+    "Medicine",
+    "Medicine/Cardiology",
+    "Medicine/Cardiology Intermediate",
+    "Neuro Intermediate",
+    "Neuro Stepdown",
+    "Neuro Surgical Intensive Care Unit (Neuro SICU)",
+    "Neurology",
+    "Observation",
+    "Obstetrics (Postpartum & Antepartum)",
+    "Obstetrics Antepartum",
+    "Obstetrics Postpartum",
+    "PACU",
+    "Psychiatry",
+    "Surgery",
+    "Surgery/Pancreatic/Biliary/Bariatric",
+    "Surgery/Trauma",
+    "Surgical Intensive Care Unit (SICU)",
+    "Thoracic Surgery",
+    "Transplant",
+    "Trauma SICU (TSICU)",
+    "Vascular",
+})
+
+
+def replay_capacity(department: str) -> int:
+    """Bed denominator to display for a MIMIC-replay-sourced department."""
+    return REPLAY_CAPACITIES.get(department, CAPACITIES.get(department, 0))
+
 # Aggregated staff defaults (day shift doctors+nurses for DES compatibility)
 STAFF_DEFAULTS = {
     "ED": {"doctors": 11, "nurses": 12, "hca": 4},
@@ -154,6 +249,13 @@ def resolve_bed_category_for(
     Beds are assigned categories in the order declared in BED_CATEGORY_MIX
     (e.g. the first 22 ED beds are "general", the next 4 are "isolation",
     the next 2 are "paediatric", the last 2 are "bariatric").
+
+    ``BED_CATEGORY_MIX`` is declared against the Irish ``CAPACITIES``. Wards
+    sized to ``REPLAY_CAPACITIES`` run past the end of their mix, so beds
+    beyond it inherit the department's dominant declared category rather than
+    a blanket "general" — ICU beds 13-48 categorised "general" would fail
+    ``MONITORING_COMPATIBLE`` and the allocator would refuse to place a
+    critical-care patient in what is, by construction, an ICU bed.
     """
     mix = BED_CATEGORY_MIX.get(department, {"general": CAPACITIES.get(department, 0)})
     running = 0
@@ -161,7 +263,8 @@ def resolve_bed_category_for(
         running += count
         if index <= running:
             return category
-    # Safety net — any residual bed is "general"
+    if mix:
+        return max(mix.items(), key=lambda kv: kv[1])[0]
     return "general"
 
 
@@ -247,9 +350,20 @@ _MIMIC_TO_IRISH_DEPT = {
     "emergency department": "ED", "emergency department observation": "CDU",
     "obstetrics (postpartum & antepartum)": "MAU", "obstetrics postpartum": "MAU",
     "labor & delivery": "MAU",
-    "neurology": "AMAU", "psychiatry": "AMAU",
-    "med/surg": "SAU", "med/surg/trauma": "SAU", "med/surg/gyn": "SAU",
-    "medical/surgical (gynecology)": "SAU",
+    # Neurology / Psychiatry are inpatient specialties, not front-door
+    # assessment. AMAU is Ireland's Acute Medical Assessment Unit — a
+    # short-stay triage ward — so parking 21 neurology inpatients there
+    # both misdescribes them and pushes AMAU to 138% while Medicine sits
+    # at 78%. Mapped to Medicine, the closest inpatient equivalent the
+    # Irish model has.
+    "neurology": "Medicine", "psychiatry": "Medicine",
+    # Same misclassification on the surgical side: SAU is the Surgical
+    # Assessment Unit (short-stay), while MIMIC's Med/Surg* wards are
+    # general inpatient wards. Trauma/GYN variants are surgical; the plain
+    # "med/surg" ward is mixed and goes to Medicine.
+    "med/surg": "Medicine", "med/surg/trauma": "Surgery",
+    "med/surg/gyn": "Surgery",
+    "medical/surgical (gynecology)": "Surgery",
     "pacu": "CDU",
     "medicine": "Medicine", "general medicine": "Medicine",
     "hematology/oncology": "Medicine", "transplant": "Medicine",
@@ -306,3 +420,18 @@ def map_department(mimic_dept: str) -> str:
     if "discharge" in lower:
         return "Discharge_Lounge"
     return "Medicine"
+
+
+# Departments this dataset can never populate. Derived rather than
+# hand-listed, because "unrepresented" is a property of the DATA, not of the
+# mapping table: `respiratory`, `day surgery` and `endoscopy` all have
+# mapping entries, they simply never appear in MIMIC's careunit vocabulary.
+# Hand-maintaining the list got that exactly backwards on the first attempt.
+#
+# Deriving it means adding a careunit or a mapping entry updates this
+# automatically, and a ward can never be labelled "not modelled" while
+# actually holding patients.
+UNREPRESENTED_IN_REPLAY = frozenset(
+    dept for dept in DEPARTMENTS
+    if not any(map_department(unit) == dept for unit in MIMIC_CAREUNITS)
+)

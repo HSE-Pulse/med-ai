@@ -271,12 +271,19 @@ export default function SepsisIcu() {
     const sp = livePatient ?? selectedSimPatient;
     const sofaTotal = sp.sofa_total;
     const color = simSofaColor(sofaTotal);
+    // shared/clinical/risk.py::compute_sofa emits the long component names
+    // (respiration / coagulation / cardiovascular); the short aliases are
+    // only produced by older payloads. Reading the short form alone left
+    // three of the five bars permanently empty while `sofa_total` beside
+    // them still counted all five — read long-first, alias second, and
+    // treat a genuinely absent component as 0 (its clinical meaning).
+    const c = sp.sofa_components;
     const simSofaData = [
-      { name: "Respiration", value: sp.sofa_components.resp, fill: sofaColors[0] },
-      { name: "Coagulation", value: sp.sofa_components.coag, fill: sofaColors[1] },
-      { name: "Liver", value: sp.sofa_components.liver, fill: sofaColors[2] },
-      { name: "Cardiovascular", value: sp.sofa_components.cardio, fill: sofaColors[3] },
-      { name: "Renal", value: sp.sofa_components.renal, fill: sofaColors[4] },
+      { name: "Respiration", value: c.respiration ?? c.resp ?? 0, fill: sofaColors[0] },
+      { name: "Coagulation", value: c.coagulation ?? c.coag ?? 0, fill: sofaColors[1] },
+      { name: "Liver", value: c.liver ?? 0, fill: sofaColors[2] },
+      { name: "Cardiovascular", value: c.cardiovascular ?? c.cardio ?? 0, fill: sofaColors[3] },
+      { name: "Renal", value: c.renal ?? 0, fill: sofaColors[4] },
     ];
     // Rolling history: each board poll appends to a per-vital buffer
     // (capped at MAX_POINTS). The buffer represents real observed snapshots

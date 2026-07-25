@@ -49,6 +49,9 @@ export default function HospitalMap({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const aborter = useRef<AbortController | null>(null);
+  // Once the board ships its own denominators, stop falling back to
+  // bed_management's Irish bed model.
+  const capacityFromBoard = useRef(false);
 
   // Dept → most-recent transfer.at — pulse the dept group when a new
   // transfer dropped a patient there within the last ~1.5s.
@@ -83,8 +86,32 @@ export default function HospitalMap({
           status: p.status as string | undefined,
         }));
         setPatients(ps);
+        // Denominators come from the board itself. These patients are MIMIC
+        // replay data, and dividing them by bed_management's Irish bed model
+        // is a category error — it rendered ICU (6 MIMIC critical-care units
+        // collapsed into one 12-bed Irish ICU) at 350%.
+        const replayCap = boardRes.value.department_capacity as
+          | Record<string, number>
+          | undefined;
+        if (replayCap) {
+          capacityFromBoard.current = true;
+          setCapacity(
+            Object.fromEntries(
+              Object.entries(replayCap).map(([dept, capacity]) => [
+                dept,
+                { department: dept, capacity, occupied: 0 } as DeptCapacity,
+              ]),
+            ),
+          );
+        }
+        // NB: the board also ships `unrepresented_departments`. This map only
+        // renders departments that currently hold patients, so an unpopulated
+        // ward never appears here and there is nothing to label — the field is
+        // for views that chart all 14 departments.
       }
-      if (bedsRes.status === "fulfilled" && bedsRes.value?.data) {
+      if (bedsRes.status === "fulfilled" && bedsRes.value?.data && !capacityFromBoard.current) {
+        // Fallback only — used if an older backend doesn't ship
+        // department_capacity with the board.
         const cap: Record<string, DeptCapacity> = {};
         for (const d of bedsRes.value.data as DeptCapacity[]) {
           cap[d.department] = d;

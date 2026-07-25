@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading as _threading
 import os
 import sys
 from pathlib import Path
@@ -38,7 +39,13 @@ from shared.constants.mimic import (  # noqa: E402
 )
 from shared.clinical.risk import compute_sofa as _shared_compute_sofa  # noqa: E402
 from shared.clinical.risk import rule_based_acuity  # noqa: E402
-from shared.constants.hospital import map_department as _map_dept, CAPACITIES as _DEPT_CAPACITIES  # noqa: E402
+from shared.constants.hospital import (  # noqa: E402
+    map_department as _map_dept,
+    CAPACITIES as _DEPT_CAPACITIES,
+    REPLAY_CAPACITIES as _REPLAY_CAPACITIES,
+    UNREPRESENTED_IN_REPLAY as _UNREPRESENTED,
+    replay_capacity as _replay_capacity,
+)
 
 from ..engine.sim_clock import SimClock  # noqa: E402
 from ..engine.patient_generator import PatientGenerator  # noqa: E402
@@ -71,6 +78,92 @@ app = create_app(
     version="0.1.0",
 )
 
+# ── blocking-query guard ─────────────────────────────────────────────
+#
+# SimEngine is the authoritative clock and census for all 14 services:
+# every one of them re-anchors its SimClock off ``/sim/clock`` once a
+# second, and the digital twin pushes admissions/vitals/transfers out
+# from here. So *any* endpoint that stalls this process's event loop
+# doesn't just slow one page down — it desynchronises the whole estate.
+#
+# That is exactly what happened: ``/stats-dashboard`` was an ``async def``
+# running four synchronous PyMongo aggregations inline, one of which
+# sorts ~11k matched chartevents rows on an unindexed ``charttime``
+# (measured: 8.1 s). The dashboard polls it every 5 s per open tab, so
+# calls arrived faster than they drained, the loop never yielded,
+# ``/sim/clock`` stopped answering, and all 14 SimClocks silently
+# free-ran apart (observed spread: 2026-07-29 → 08-03 → wall clock).
+#
+# Two rules keep it from recurring:
+#   1. Anything touching Mongo is declared ``def``, not ``async def`` —
+#      FastAPI then runs it in its threadpool instead of on the loop.
+#   2. Read-only dashboard endpoints are TTL-cached with single-flight,
+#      so N tabs × 5 s polls collapse into one query per TTL.
+
+
+def _ttl_cached(ttl_seconds: float, ready=None):
+    """Cache a *synchronous* endpoint's return value for ``ttl_seconds``.
+
+    ``ready`` is an optional predicate; when it returns False the result is
+    still served but NOT stored. That matters during the boot window while
+    the latest-value caches are still seeding: /stats-dashboard computed
+    with empty vitals reports every patient as ESI-4 and critical_count=0,
+    which looks like a real reading rather than missing data. Without this
+    guard the TTL would pin that answer for a full interval after the data
+    became available.
+
+    Single-flight: concurrent callers that miss the cache block on one
+    lock and the winner's result is shared, so a slow query is never run
+    N times in parallel. Expiry is anchored to the *end* of the build —
+    a query that takes longer than its own TTL must not immediately
+    re-fire (the same end-anchoring ``/ed-board`` already relies on).
+
+    Deliberately threading-based, not asyncio-based: these functions run
+    in FastAPI's threadpool, so an ``asyncio.Lock`` would be the wrong
+    primitive here.
+    """
+    import functools
+    import threading as _threading
+    import time as _time
+
+    def decorate(fn):
+        cache: Dict[Any, Any] = {}
+        lock = _threading.Lock()
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            key = (args, tuple(sorted(kwargs.items())))
+            hit = cache.get(key)
+            if hit is not None and _time.monotonic() < hit[1]:
+                return hit[0]
+            with lock:
+                hit = cache.get(key)
+                if hit is not None and _time.monotonic() < hit[1]:
+                    return hit[0]
+                # Readiness must hold BOTH before and after the call. Checking
+                # only afterwards leaves a race: a request that starts while
+                # the caches are cold but finishes just after they seed sees
+                # ready()==True and pins its cold result for a full TTL —
+                # observed as /stats-dashboard reporting all 2820 patients at
+                # ESI-4 for 30 s after the data was already available.
+                was_ready = ready is None or ready()
+                value = fn(*args, **kwargs)
+                if not (was_ready and (ready is None or ready())):
+                    return value          # serve, but don't pin a cold answer
+                cache[key] = (value, _time.monotonic() + ttl_seconds)
+                # Unbounded growth guard for the parameterised endpoints.
+                if len(cache) > 256:
+                    now = _time.monotonic()
+                    for k, (_, exp) in list(cache.items()):
+                        if exp <= now:
+                            cache.pop(k, None)
+                return value
+
+        return wrapper
+
+    return decorate
+
+
 # ── singleton components ─────────────────────────────────────────────
 
 mongo: Optional[MongoManager] = None
@@ -92,6 +185,93 @@ _arrival_total_events: int = 0
 # MongoDB collection names for durable metrics history
 _METRICS_COLL = "metrics_history"
 _METRICS_META_COLL = "metrics_history_meta"   # stores _sim_start_hours + last discharge count
+
+
+# ── sim-clock persistence ────────────────────────────────────────────
+#
+# The engine clock anchors to utcnow() when constructed. That is right for a
+# fresh simulation and wrong for a restart: at 5-10x an uninterrupted run
+# advances sim time well past wall time (measured: patient charts reaching
+# 2026-10-04 while the wall clock read 2026-07-25), so re-anchoring to "now"
+# resumes writing events with timestamps EARLIER than rows already stored.
+# Any patient open across the restart then has a backward jump in their own
+# chart, and "latest reading by charttime" returns a stale row. After a day
+# of restarts, 231 of 246 active patients were affected.
+#
+# So the anchor is persisted and restored, floored by the newest timestamp
+# actually present in the data — belt and braces, so even a lost/blank
+# state doc can't rewind the clock behind existing records.
+#
+# ``/reset`` is unaffected: it calls ehr_writer.reset() to clear the sim DB
+# first, so anchoring back to wall time there is correct.
+_SIM_CLOCK_COLL = "sim_clock_state"
+
+
+def _load_resume_sim_time(mongo_mgr) -> "Optional[Any]":
+    """Sim time to resume from, or None for a genuinely fresh simulation."""
+    from datetime import datetime as _dt
+
+    def _parse(value):
+        if isinstance(value, _dt):
+            return value.replace(tzinfo=None)
+        if isinstance(value, str) and value:
+            try:
+                return _dt.fromisoformat(value.replace("Z", "")).replace(tzinfo=None)
+            except ValueError:
+                return None
+        return None
+
+    candidates = []
+    try:
+        db = mongo_mgr.client["MIMIC_SIM"]
+        doc = db[_SIM_CLOCK_COLL].find_one({"_id": "engine"})
+        if doc:
+            candidates.append(_parse(doc.get("sim_time")))
+        # Floor by the newest event actually written. `sim_time` is indexed on
+        # chartevents, so this is a single index seek.
+        newest = list(
+            db["chartevents"].find({}, {"_id": 0, "sim_time": 1})
+            .sort([("sim_time", -1)]).limit(1)
+        )
+        if newest:
+            candidates.append(_parse(newest[0].get("sim_time")))
+    except Exception as exc:  # noqa: BLE001 — never block startup
+        logger.warning("sim_clock_resume_lookup_failed: %s", exc)
+
+    usable = [c for c in candidates if c is not None]
+    return max(usable) if usable else None
+
+
+def _persist_sim_clock() -> None:
+    """Write the current engine anchor. Blocking — call in a thread."""
+    if mongo is None or engine is None:
+        return
+    try:
+        mongo.client["MIMIC_SIM"][_SIM_CLOCK_COLL].update_one(
+            {"_id": "engine"},
+            {"$set": {
+                "sim_time": engine.clock.now().isoformat(),
+                "speed": engine.clock.speed,
+                "running": bool(engine.running),
+                "persisted_at_wall": __import__("datetime").datetime.utcnow().isoformat(),
+            }},
+            upsert=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("sim_clock_persist_failed: %s", exc)
+
+
+async def _sim_clock_persist_loop(interval: float = 30.0) -> None:
+    """Keep the persisted anchor fresh so a restart resumes near where it left off."""
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            await asyncio.to_thread(_persist_sim_clock)
+        except asyncio.CancelledError:
+            await asyncio.to_thread(_persist_sim_clock)   # final flush
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("sim_clock_persist_loop_error: %s", exc)
 
 
 def _metrics_coll():
@@ -251,7 +431,16 @@ async def startup() -> None:
         logger.warning("prometheus_metrics_install_failed: %s", exc)
 
     mongo = MongoManager()
-    clock = SimClock(speed=5.0)  # default 5x acceleration — 10x saturated data_ingestion CPU + caused dt-propagation timeouts
+    # Resume simulated time rather than snapping back to wall clock —
+    # see the _load_resume_sim_time note above.
+    _resume_at = _load_resume_sim_time(mongo)
+    clock = SimClock(speed=5.0, start_at=_resume_at)  # default 5x acceleration — 10x saturated data_ingestion CPU + caused dt-propagation timeouts
+    if _resume_at is not None:
+        logger.info(
+            "sim_clock_resumed at=%s (wall=%s)",
+            clock.now().isoformat(),
+            __import__("datetime").datetime.utcnow().isoformat(),
+        )
     generator = PatientGenerator(mongo)
 
     # Attach MongoDB to the event bus so every publication lands in
@@ -301,6 +490,228 @@ async def startup() -> None:
     # 15-20s cold-cache stall (otherwise users perceive the page as hung).
     asyncio.create_task(_prewarm_mongo_cache())
 
+    # Seed the latest-value caches once, then keep them current by tailing
+    # new rows. Runs in a thread off the event loop so the seed never
+    # blocks /health or /sim/clock — the whole point of the threadpool
+    # rules above. chartevents feeds /ed-board, labevents feeds /icu-board.
+    asyncio.create_task(_sim_clock_persist_loop())
+    asyncio.create_task(_VITALS_CACHE.run(_CACHE_TAIL_SECONDS))
+    asyncio.create_task(_LABS_CACHE.run(_CACHE_TAIL_SECONDS))
+
+
+# ── latest-vitals cache ──────────────────────────────────────────────
+#
+# /ed-board needs the most recent value per (hadm_id, itemid). Deriving
+# that with an aggregation costs ~28 s because $group/$first must stream
+# every matching chartevent — 8.2M docs — even though only ~16.7k values
+# survive. MongoDB 7.0 has no DISTINCT_SCAN optimisation for this shape.
+#
+# Narrowing by charttime does NOT help, and the reason is worth recording:
+# the simulator's EHR rows run months ahead of the sim clock (measured:
+# data to 2026-10-04 against a clock at 2026-07-25), so a `now - 24h`
+# cutoff sits *below* almost the whole collection and filters nothing. A
+# data-relative window filters properly but only ~282 of 16.7k pairs have
+# a reading near the head, so it would blank vitals for ~98% of patients
+# and silently degrade the acuity heuristic. Both are worse than slow.
+#
+# So: compute it once, then keep it current incrementally. chartevents is
+# append-only and ObjectIds rise monotonically with insertion, so tailing
+# `_id > cursor` yields exactly the rows written since the last pass —
+# a few hundred per tick instead of 8.2M.
+#
+# Why "latest" means newest-INSERTED, not highest-charttime
+# --------------------------------------------------------
+# chartevents is bimodal. A previous simulation era wrote rows stamped as
+# far ahead as 2026-10-04; the clock was later re-anchored back to July
+# and writing resumed from there. Measured on this deployment: 13.4M rows
+# sit AHEAD of the current sim clock, 12.7M at or behind it. Insertion
+# order is monotonic, charttime is emphatically not — one patient's last
+# eight readings run 08:02 → 08:43 (current era) and then jump back to
+# 13:15 → 12:57 (legacy era).
+#
+# `$sort {charttime: -1}` therefore selected a *legacy* row: the board
+# was rendering vitals from a defunct era, months ahead of the sim clock
+# displayed beside them. Keying on _id returns the reading the simulator
+# most recently emitted, which is both what a live board means by
+# "current vitals" and immune to any future clock reset. Verified against
+# the raw collection: the cached value equals the newest-by-_id row.
+
+class _LatestValueCache:
+    """Newest value per (hadm_id, itemid) for one append-only collection.
+
+    Seeded with a single full pass, then kept current by tailing
+    ``_id > cursor``. Reads are pure dict lookups, so an endpoint that
+    needs "current vitals" or "current labs" never touches Mongo.
+
+    Thread-safe: the seed and tail run in FastAPI's threadpool (the
+    endpoints are sync ``def`` by design — see the note above), so this
+    guards state with a ``threading.Lock`` rather than an asyncio one.
+    """
+
+    def __init__(self, name: str, collection: str, item_ids, ndigits: int) -> None:
+        self.name = name
+        self.collection = collection
+        self.item_ids = sorted(set(item_ids))
+        self.ndigits = ndigits
+        self._values: Dict[str, Dict[int, float]] = {}
+        self._cursor: Any = None
+        self._ready = False
+        self._lock = _threading.Lock()
+
+    # ---------------------------------------------------------------- internals
+    def _coll(self):
+        return mongo.client["MIMIC_SIM"][self.collection]
+
+    def _fold(self, hadm_id, itemid, raw) -> None:
+        """Record one reading as the latest for its pair. Caller holds the lock."""
+        if raw is None or hadm_id is None:
+            return
+        try:
+            val = round(float(raw), self.ndigits)
+        except (TypeError, ValueError):
+            # CSV-imported MIMIC rows store valuenum as "" / "___" / flags.
+            return
+        self._values.setdefault(hadm_id, {})[itemid] = val
+
+    # ---------------------------------------------------------------- lifecycle
+    def seed(self) -> None:
+        """One full pass to populate the cache. Blocking — run in a thread."""
+        coll = self._coll()
+        # High-water mark taken BEFORE the scan, so rows inserted mid-seed
+        # are replayed by the tail rather than lost between the two passes.
+        newest = list(coll.find({}, {"_id": 1}).sort([("_id", -1)]).limit(1))
+        cursor = newest[0]["_id"] if newest else None
+
+        # Ordered by _id, not charttime — the seed must agree with the tail,
+        # and _id is the only ordering that is correct for both collections:
+        #
+        #   * chartevents has charttime, but it is bimodal (see above), so
+        #     sorting by it selects rows from a defunct simulation era.
+        #   * labevents has NO charttime field at all — it stores sim_time.
+        #     Sorting labevents by charttime therefore sorted every document
+        #     on a missing key, which compares equal, degenerating the sort
+        #     to (hadm_id, itemid) and making $first return an ARBITRARY
+        #     historical lab. SOFA is computed from platelets/bilirubin/
+        #     creatinine, so ICU risk scores were derived from whichever row
+        #     the scan happened to reach first.
+        #
+        # $last with ascending _id = the most recently inserted row, which is
+        # what both collections mean by "latest". Index-ordered, so no
+        # blocking sort stage.
+        pipeline = [
+            {"$match": {"itemid": {"$in": self.item_ids}}},
+            {"$sort": {"_id": 1}},
+            {"$group": {
+                "_id": {"hadm_id": "$hadm_id", "itemid": "$itemid"},
+                "val": {"$last": "$valuenum"},
+            }},
+        ]
+        seeded = 0
+        for doc in coll.aggregate(pipeline, allowDiskUse=True):
+            key = doc["_id"]
+            with self._lock:
+                self._fold(key.get("hadm_id"), key.get("itemid"), doc.get("val"))
+            seeded += 1
+
+        with self._lock:
+            self._cursor = cursor
+            self._ready = True
+        logger.info("%s seeded: %d pairs, cursor=%s", self.name, seeded, cursor)
+
+    def tail(self) -> int:
+        """Fold rows written since the cursor. Blocking — run in a thread."""
+        with self._lock:
+            cursor, ready = self._cursor, self._ready
+        if not ready:
+            return 0
+
+        query: Dict[str, Any] = {"itemid": {"$in": self.item_ids}}
+        if cursor is not None:
+            query["_id"] = {"$gt": cursor}
+
+        n = 0
+        newest = cursor
+        # Ascending _id so later rows overwrite earlier ones — last write
+        # wins, which is what "latest" means for an append-only feed.
+        for doc in self._coll().find(
+            query, {"_id": 1, "hadm_id": 1, "itemid": 1, "valuenum": 1}
+        ).sort([("_id", 1)]):
+            with self._lock:
+                self._fold(doc.get("hadm_id"), doc.get("itemid"), doc.get("valuenum"))
+            newest = doc["_id"]
+            n += 1
+
+        if n:
+            with self._lock:
+                self._cursor = newest
+        return n
+
+    async def run(self, interval: float) -> None:
+        """Seed once, then tail forever. Never touches the request path."""
+        try:
+            await asyncio.to_thread(self.seed)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("%s_seed_failed: %s", self.name, exc)
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                n = await asyncio.to_thread(self.tail)
+                if n:
+                    logger.debug("%s tailed %d new readings", self.name, n)
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("%s_tail_failed: %s", self.name, exc)
+
+    # ---------------------------------------------------------------- read path
+    @property
+    def ready(self) -> bool:
+        with self._lock:
+            return self._ready
+
+    def lookup(self, hadm_ids, name_map: Dict[int, str]) -> Dict[str, Dict[str, float]]:
+        """Latest values for these admissions, keyed by the map's short names."""
+        out: Dict[str, Dict[str, float]] = {}
+        with self._lock:
+            for hid in hadm_ids:
+                by_item = self._values.get(hid)
+                if not by_item:
+                    continue
+                named = {
+                    name_map[i]: v for i, v in by_item.items() if i in name_map
+                }
+                if named:
+                    out[hid] = named
+        return out
+
+
+# Seeded on the *superset* of itemids each consumer might name, so widening
+# a name map later can't silently start returning blanks. _VITAL_IDS carries
+# Mean BP (220181), which no short-name map exposes — SOFA derives MBP from
+# SBP/DBP instead — but caching it costs nothing and removes a footgun.
+_VITALS_CACHE = _LatestValueCache(
+    "latest_vitals", "chartevents", set(_VITAL_IDS) | set(_VITAL_SHORT), 1
+)
+_LABS_CACHE = _LatestValueCache(
+    "latest_labs", "labevents", set(_LAB_IDS) | set(_SOFA_LAB_IDS), 2
+)
+_CACHE_TAIL_SECONDS = 10.0
+
+
+def _value_caches_ready() -> bool:
+    """True once both latest-value caches have completed their initial seed."""
+    return _VITALS_CACHE.ready and _LABS_CACHE.ready
+
+
+def _vitals_for(hadm_ids: list) -> Dict[str, Dict[str, float]]:
+    """Latest vitals for the given admissions, keyed by short name."""
+    return _VITALS_CACHE.lookup(hadm_ids, _VITAL_SHORT)
+
+
+def _labs_for(hadm_ids: list) -> Dict[str, Dict[str, float]]:
+    """Latest labs for the given admissions, keyed by short name."""
+    return _LABS_CACHE.lookup(hadm_ids, _LAB_NAMES)
+
 
 async def _prewarm_mongo_cache() -> None:
     """Touch the collections + indexes the dashboard hits so WiredTiger
@@ -312,19 +723,17 @@ async def _prewarm_mongo_cache() -> None:
         # Transfers latest-per-patient — same aggregation /icu-board uses.
         list(sim_db["transfers"].aggregate([
             {"$match": {}},
-            {"$sort": {"intime": -1}},
+            {"$sort": {"hadm_id": 1, "intime": -1}},
             {"$group": {"_id": "$hadm_id", "careunit": {"$first": "$careunit"}}},
             {"$limit": 500},
         ]))
-        # Chartevents latest-vital-per-patient — biggest cold-hit cost.
-        list(sim_db["chartevents"].aggregate([
-            {"$sort": {"charttime": -1}},
-            {"$group": {"_id": {"hadm_id": "$hadm_id", "itemid": "$itemid"}, "v": {"$first": "$valuenum"}}},
-            {"$limit": 1000},
-        ]))
+        # Chartevents is deliberately NOT prewarmed here any more: the
+        # latest-vitals seed (_VITALS_CACHE.run) already walks that
+        # index, and running both meant paying the same ~28 s scan twice
+        # on every boot.
         # Labevents latest-lab-per-patient.
         list(sim_db["labevents"].aggregate([
-            {"$sort": {"charttime": -1}},
+            {"$sort": {"hadm_id": 1, "itemid": 1, "charttime": -1}},
             {"$group": {"_id": {"hadm_id": "$hadm_id", "itemid": "$itemid"}, "v": {"$first": "$valuenum"}}},
             {"$limit": 1000},
         ]))
@@ -940,9 +1349,16 @@ async def ed_board(lite: int = 0):
         # just populated the cache while we waited.
         if cache["value"] is not None and _time.monotonic() < cache["expires"]:
             return cache["value"]
+        # Same reasoning as _ttl_cached's `ready` guard, including checking
+        # readiness on both sides of the build: a full board built before the
+        # vitals cache has seeded carries no vitals, and pinning that for a
+        # full TTL would show every patient at default acuity well after the
+        # real data arrived. lite=1 never reads vitals, so it caches freely.
+        was_ready = _value_caches_ready()
         response = await _aio.to_thread(_build_ed_board, bool(lite))
-        cache["value"] = response
-        cache["expires"] = _time.monotonic() + ttl  # anchored to end-of-build
+        if lite or (was_ready and _value_caches_ready()):
+            cache["value"] = response
+            cache["expires"] = _time.monotonic() + ttl  # anchored to end-of-build
         return response
 
 
@@ -975,7 +1391,7 @@ def _build_ed_board(lite: bool = False) -> Dict[str, Any]:
     dept_map: dict = {}
     xfer_pipeline = [
         {"$match": {"hadm_id": {"$in": hadm_ids}}},
-        {"$sort": {"intime": -1}},
+        {"$sort": {"hadm_id": 1, "intime": -1}},
         {"$group": {"_id": "$hadm_id", "careunit": {"$first": "$careunit"}, "eventtype": {"$first": "$eventtype"}}},
     ]
     for doc in sim_db["transfers"].aggregate(xfer_pipeline):
@@ -985,32 +1401,14 @@ def _build_ed_board(lite: bool = False) -> Dict[str, Any]:
     diag_map: dict = {}
 
     if not lite:
-        # 3. Batch: latest vital per patient per itemid (heavy — only in
-        #    full mode). Constrain by charttime window so the engine
-        #    doesn't have to scan the full 1M+ chartevents history.
-        item_names = _VITAL_SHORT
-        charttime_cutoff = (now - timedelta(hours=24)).isoformat()
-        vital_pipeline = [
-            {"$match": {
-                "hadm_id": {"$in": hadm_ids},
-                "itemid": {"$in": list(item_names.keys())},
-                "charttime": {"$gte": charttime_cutoff},
-            }},
-            {"$sort": {"charttime": -1}},
-            {"$group": {"_id": {"hadm_id": "$hadm_id", "itemid": "$itemid"}, "val": {"$first": "$valuenum"}}},
-        ]
-        for doc in sim_db["chartevents"].aggregate(vital_pipeline):
-            hid = doc["_id"]["hadm_id"]
-            iid = doc["_id"]["itemid"]
-            if hid not in vitals_map:
-                vitals_map[hid] = {}
-            name = item_names.get(iid)
-            raw = doc.get("val")
-            if name and raw is not None:
-                try:
-                    vitals_map[hid][name] = round(float(raw), 1)
-                except (TypeError, ValueError):
-                    continue
+        # 3. Latest vitals — served from the incrementally-maintained cache
+        #    rather than re-derived per request. This was the whole cold
+        #    cost of /ed-board (~28 s of the ~28.1 s total); the remaining
+        #    three stages come to ~100 ms between them. Before the cache is
+        #    seeded this returns nothing and the board renders without
+        #    vitals for a few seconds after boot, which the acuity
+        #    heuristic already handles via its has_vitals flag.
+        vitals_map = _vitals_for(hadm_ids)
 
         # 4. Batch: primary diagnosis per patient (cheap but skipped in lite)
         diag_pipeline = [
@@ -1025,7 +1423,14 @@ def _build_ed_board(lite: bool = False) -> Dict[str, Any]:
     for adm in active_adms:
         hadm = adm.get("hadm_id", "")
         sid = adm.get("subject_id")
-        dept = _map_dept(dept_map.get(hadm, "Admitting"))
+        # A patient with no transfer row has no known location. Previously
+        # this defaulted to the literal "Admitting", which map_department()
+        # doesn't recognise and so funnelled into its catch-all "Medicine" —
+        # rendering thousands of location-less patients as a single ward at
+        # ~6600% occupancy (observed: Medicine 2649/40). Missing data must
+        # read as missing, not as a real department.
+        raw_dept = dept_map.get(hadm)
+        dept = _map_dept(raw_dept) if raw_dept else "Unassigned"
         vitals = vitals_map.get(hadm, {})
         primary_icd = diag_map.get(hadm, "")
 
@@ -1054,7 +1459,16 @@ def _build_ed_board(lite: bool = False) -> Dict[str, Any]:
         })
 
     patients.sort(key=lambda p: (p["acuity"], -p["wait_minutes"]))
-    return {"count": len(patients), "sim_time": now.isoformat(), "patients": patients}
+    # Denominators travel WITH the payload. HospitalMap previously divided
+    # these replay patients by bed_management's Irish bed counts, which is
+    # how ICU rendered at 350% — two different hospitals, one ratio.
+    return {
+        "count": len(patients),
+        "sim_time": now.isoformat(),
+        "patients": patients,
+        "department_capacity": dict(_REPLAY_CAPACITIES),
+        "unrepresented_departments": sorted(_UNREPRESENTED),
+    }
 
 
 # ── ICU Board: live ICU patient board with SOFA scores ───────────────
@@ -1079,7 +1493,8 @@ def _compute_sofa(vitals: dict, labs: dict) -> tuple[int, dict]:
 
 
 @app.get("/icu-board")
-async def icu_board():
+@_ttl_cached(15.0, ready=_value_caches_ready)
+def icu_board():
     """Return ICU patients with SOFA scores computed from latest vitals/labs."""
     from app_07_data_ingestion.backend.engine.event_engine import _parse_time
 
@@ -1099,7 +1514,7 @@ async def icu_board():
     dept_map: dict = {}
     xfer_pipeline = [
         {"$match": {"hadm_id": {"$in": hadm_ids}}},
-        {"$sort": {"intime": -1}},
+        {"$sort": {"hadm_id": 1, "intime": -1}},
         {"$group": {"_id": "$hadm_id", "careunit": {"$first": "$careunit"}}},
     ]
     for doc in sim_db["transfers"].aggregate(xfer_pipeline):
@@ -1116,52 +1531,13 @@ async def icu_board():
 
     adm_lookup = {a["hadm_id"]: a for a in active_adms}
 
-    # 3. Batch latest vitals for ICU patients
-    vital_itemids = _VITAL_IDS
-    item_names = _VITAL_SHORT
-    vitals_map: dict = {}
-    vital_pipeline = [
-        {"$match": {"hadm_id": {"$in": icu_hadm_ids}, "itemid": {"$in": vital_itemids}}},
-        {"$sort": {"charttime": -1}},
-        {"$group": {"_id": {"hadm_id": "$hadm_id", "itemid": "$itemid"}, "val": {"$first": "$valuenum"}}},
-    ]
-    for doc in sim_db["chartevents"].aggregate(vital_pipeline):
-        hid = doc["_id"]["hadm_id"]
-        iid = doc["_id"]["itemid"]
-        if hid not in vitals_map:
-            vitals_map[hid] = {}
-        name = item_names.get(iid)
-        raw = doc.get("val")
-        if name and raw is not None:
-            try:
-                vitals_map[hid][name] = round(float(raw), 1)
-            except (TypeError, ValueError):
-                continue
-
-    # 4. Batch latest labs for SOFA (platelets, bilirubin, creatinine) + extras
-    sofa_lab_ids = _SOFA_LAB_IDS
-    all_lab_ids = _LAB_IDS
-    lab_names = _LAB_NAMES
-    labs_map: dict = {}
-    lab_pipeline = [
-        {"$match": {"hadm_id": {"$in": icu_hadm_ids}, "itemid": {"$in": all_lab_ids}}},
-        {"$sort": {"charttime": -1}},
-        {"$group": {"_id": {"hadm_id": "$hadm_id", "itemid": "$itemid"}, "val": {"$first": "$valuenum"}}},
-    ]
-    for doc in sim_db["labevents"].aggregate(lab_pipeline):
-        hid = doc["_id"]["hadm_id"]
-        iid = doc["_id"]["itemid"]
-        if hid not in labs_map:
-            labs_map[hid] = {}
-        name = lab_names.get(iid)
-        raw = doc.get("val")
-        if name and raw is not None:
-            try:
-                labs_map[hid][name] = round(float(raw), 2)
-            except (TypeError, ValueError):
-                # CSV-imported MIMIC.labevents stores valuenum as strings
-                # like "" / "___" / non-numeric flags; skip those.
-                continue
+    # 3./4. Latest vitals and labs — served from the incrementally-maintained
+    # caches instead of two more sort-then-group aggregations. Same reasoning
+    # (and the same charttime-vs-insertion correctness point) as /ed-board:
+    # see the _LatestValueCache note above. The labevents aggregation alone
+    # was ~3.4 s of this endpoint's cold path.
+    vitals_map = _vitals_for(icu_hadm_ids)
+    labs_map = _labs_for(icu_hadm_ids)
 
     # 5. Build patient list with SOFA
     patients = []
@@ -1199,7 +1575,7 @@ async def icu_board():
             "hadm_id": hadm,
             "subject_id": adm.get("subject_id"),
             "department": mapped_dept,
-            "capacity": _DEPT_CAPACITIES.get(mapped_dept, 12),
+            "capacity": _replay_capacity(mapped_dept),
             "sofa_total": sofa_total,
             "sofa_components": sofa_components,
             "vitals": vitals,
@@ -1210,13 +1586,13 @@ async def icu_board():
 
     patients.sort(key=lambda p: -p["sofa_total"])
     # Cap to ERP critical care capacity (ICU + HDU beds)
-    max_beds = _DEPT_CAPACITIES.get("ICU", 12) + _DEPT_CAPACITIES.get("HDU", 8)
+    max_beds = _replay_capacity("ICU") + _replay_capacity("HDU")
     capped = patients[:max_beds]
     return {
         "count": len(capped),
         "total_in_sim": len(patients),
-        "icu_capacity": _DEPT_CAPACITIES.get("ICU", 12),
-        "hdu_capacity": _DEPT_CAPACITIES.get("HDU", 8),
+        "icu_capacity": _replay_capacity("ICU"),
+        "hdu_capacity": _replay_capacity("HDU"),
         "sim_time": now.isoformat(),
         "patients": capped,
     }
@@ -1226,7 +1602,8 @@ async def icu_board():
 
 
 @app.get("/oncology-board")
-async def oncology_board():
+@_ttl_cached(60.0)
+def oncology_board():
     """Return cancer patients (ICD C-codes) from simulation data."""
     sim_db = engine.mongo.client["MIMIC_SIM"]
     now = engine.clock.now()
@@ -1255,7 +1632,7 @@ async def oncology_board():
     dept_map: dict = {}
     xfer_pipeline = [
         {"$match": {"hadm_id": {"$in": cancer_hadm_ids}}},
-        {"$sort": {"intime": -1}},
+        {"$sort": {"hadm_id": 1, "intime": -1}},
         {"$group": {"_id": "$hadm_id", "careunit": {"$first": "$careunit"}}},
     ]
     for doc in sim_db["transfers"].aggregate(xfer_pipeline):
@@ -1294,7 +1671,8 @@ async def oncology_board():
 
 
 @app.get("/patient/{hadm_id}/journey")
-async def patient_journey(hadm_id: str):
+@_ttl_cached(30.0)
+def patient_journey(hadm_id: str):
     """Return the full timeline for a simulation patient."""
     from app_07_data_ingestion.backend.engine.event_engine import _parse_time
 
@@ -1572,8 +1950,14 @@ async def patient_journey(hadm_id: str):
 
 
 @app.get("/stats-dashboard")
-async def stats_dashboard():
-    """Aggregate overview stats from simulation data."""
+@_ttl_cached(30.0, ready=_value_caches_ready)
+def stats_dashboard():
+    """Aggregate overview stats from simulation data.
+
+    Sync + cached on purpose — see the ``_ttl_cached`` note above. This is
+    the heaviest endpoint in the service (four aggregations, one of them
+    an 8 s unindexed sort) and the Overview page polls it every 5 s.
+    """
     from app_07_data_ingestion.backend.engine.event_engine import _parse_time
 
     sim_db = engine.mongo.client["MIMIC_SIM"]
@@ -1603,7 +1987,7 @@ async def stats_dashboard():
     if active_hadm_ids:
         xfer_pipeline = [
             {"$match": {"hadm_id": {"$in": active_hadm_ids}}},
-            {"$sort": {"intime": -1}},
+            {"$sort": {"hadm_id": 1, "intime": -1}},
             {"$group": {"_id": "$hadm_id", "careunit": {"$first": "$careunit"}}},
         ]
         for doc in sim_db["transfers"].aggregate(xfer_pipeline):
@@ -1617,25 +2001,19 @@ async def stats_dashboard():
     # Critical count: SOFA >= 10 for ICU patients (batch vitals/labs)
     critical_count = 0
     if active_hadm_ids:
-        # Use acuity-based critical (HR, SpO2, SBP) for all active patients
-        vital_pipeline = [
-            {"$match": {"hadm_id": {"$in": active_hadm_ids}, "itemid": {"$in": [220045, 220277, 220179, 220180]}}},
-            {"$sort": {"charttime": -1}},
-            {"$group": {"_id": {"hadm_id": "$hadm_id", "itemid": "$itemid"}, "val": {"$first": "$valuenum"}}},
-        ]
-        v_map: dict = {}
-        for doc in sim_db["chartevents"].aggregate(vital_pipeline):
-            hid = doc["_id"]["hadm_id"]
-            if hid not in v_map:
-                v_map[hid] = {}
-            v_map[hid][doc["_id"]["itemid"]] = doc.get("val")
+        # Latest vitals + labs from the shared caches — same source /ed-board
+        # and /icu-board read, so "critical" here can't disagree with the
+        # numbers those boards show for the same patient. Re-deriving them
+        # per request was ~8 s (chartevents) plus a full labevents scan.
+        vitals_by_hadm = _vitals_for(active_hadm_ids)
+        labs_by_hadm = _labs_for(active_hadm_ids)
 
         # Count critical based on acuity (ESI 1-2 thresholds)
         critical_hadms = set()
-        for hid, vals in v_map.items():
-            spo2 = vals.get(220277)
-            hr = vals.get(220045)
-            sbp = vals.get(220179)
+        for hid, vals in vitals_by_hadm.items():
+            spo2 = vals.get("spo2")
+            hr = vals.get("hr")
+            sbp = vals.get("sbp")
             if spo2 and spo2 < 90:
                 critical_hadms.add(hid)
             elif sbp and sbp < 80:
@@ -1644,31 +2022,10 @@ async def stats_dashboard():
                 critical_hadms.add(hid)
 
         # Also check SOFA >= 10 for ICU patients
-        sofa_lab_pipeline = [
-            {"$match": {"hadm_id": {"$in": active_hadm_ids}, "itemid": {"$in": [51265, 50885, 50912]}}},
-            {"$sort": {"charttime": -1}},
-            {"$group": {"_id": {"hadm_id": "$hadm_id", "itemid": "$itemid"}, "val": {"$first": "$valuenum"}}},
-        ]
-        l_map: dict = {}
-        for doc in sim_db["labevents"].aggregate(sofa_lab_pipeline):
-            hid = doc["_id"]["hadm_id"]
-            if hid not in l_map:
-                l_map[hid] = {}
-            lab_name_map = {51265: "platelets", 50885: "bilirubin", 50912: "creatinine"}
-            name = lab_name_map.get(doc["_id"]["itemid"])
-            if name:
-                l_map[hid][name] = doc.get("val")
-
-        vital_name_map = {220277: "spo2", 220179: "sbp", 220180: "dbp", 220045: "hr"}
         for hid in active_hadm_ids:
-            raw_v = v_map.get(hid, {})
-            vitals_named = {}
-            for iid, val in raw_v.items():
-                n = vital_name_map.get(iid)
-                if n and val is not None:
-                    vitals_named[n] = val
-            labs_named = l_map.get(hid, {})
-            sofa, _ = _compute_sofa(vitals_named, labs_named)
+            sofa, _ = _compute_sofa(
+                vitals_by_hadm.get(hid, {}), labs_by_hadm.get(hid, {})
+            )
             if sofa >= 10:
                 critical_hadms.add(hid)
 
@@ -1708,10 +2065,10 @@ async def stats_dashboard():
     acuity_dist = {"esi1": 0, "esi2": 0, "esi3": 0, "esi4": 0, "esi5": 0}
     if active_hadm_ids:
         for hid in active_hadm_ids:
-            raw_v = v_map.get(hid, {})
-            hr = raw_v.get(220045)
-            spo2 = raw_v.get(220277)
-            sbp = raw_v.get(220179)
+            raw_v = vitals_by_hadm.get(hid, {})
+            hr = raw_v.get("hr")
+            spo2 = raw_v.get("spo2")
+            sbp = raw_v.get("sbp")
             acuity = rule_based_acuity(spo2=spo2, sbp=sbp, hr=hr, has_vitals=bool(raw_v))
             acuity_dist[f"esi{acuity}"] += 1
 
@@ -1747,7 +2104,8 @@ async def stats_dashboard():
 
 
 @app.get("/alerts")
-async def alerts():
+@_ttl_cached(10.0, ready=_value_caches_ready)
+def alerts():
     """Return active clinical alerts from simulation patients."""
     sim_db = engine.mongo.client["MIMIC_SIM"]
     now = engine.clock.now()
@@ -1766,7 +2124,7 @@ async def alerts():
     dept_map: dict = {}
     xfer_pipeline = [
         {"$match": {"hadm_id": {"$in": hadm_ids}}},
-        {"$sort": {"intime": -1}},
+        {"$sort": {"hadm_id": 1, "intime": -1}},
         {"$group": {"_id": "$hadm_id", "careunit": {"$first": "$careunit"}}},
     ]
     for doc in sim_db["transfers"].aggregate(xfer_pipeline):
@@ -1774,21 +2132,10 @@ async def alerts():
 
     # 3. Batch latest vitals for ALL active patients
     vital_check_ids = _VITAL_IDS
-    item_names = _VITAL_SHORT
-    vitals_map: dict = {}
-    vital_pipeline = [
-        {"$match": {"hadm_id": {"$in": hadm_ids}, "itemid": {"$in": vital_check_ids}}},
-        {"$sort": {"charttime": -1}},
-        {"$group": {"_id": {"hadm_id": "$hadm_id", "itemid": "$itemid"}, "val": {"$first": "$valuenum"}}},
-    ]
-    for doc in sim_db["chartevents"].aggregate(vital_pipeline):
-        hid = doc["_id"]["hadm_id"]
-        iid = doc["_id"]["itemid"]
-        if hid not in vitals_map:
-            vitals_map[hid] = {}
-        name = item_names.get(iid)
-        if name and doc.get("val") is not None:
-            vitals_map[hid][name] = doc["val"]
+    # Latest vitals from the shared cache — the alert thresholds below must
+    # fire on the same readings /ed-board and /icu-board display, otherwise
+    # an alert can reference a value no board is showing.
+    vitals_map = _vitals_for(hadm_ids)
 
     # 4. Batch SOFA labs for ICU patients
     icu_keywords = ["ICU", "MICU", "SICU", "CCU", "CVICU", "TSICU"]
@@ -1796,23 +2143,7 @@ async def alerts():
         hid for hid, dept in dept_map.items()
         if any(kw in dept.upper() for kw in icu_keywords)
     ]
-    labs_map: dict = {}
-    if icu_hadm_ids:
-        sofa_lab_ids = _SOFA_LAB_IDS
-        lab_name_map = {51265: "platelets", 50885: "bilirubin", 50912: "creatinine"}
-        lab_pipeline = [
-            {"$match": {"hadm_id": {"$in": icu_hadm_ids}, "itemid": {"$in": sofa_lab_ids}}},
-            {"$sort": {"charttime": -1}},
-            {"$group": {"_id": {"hadm_id": "$hadm_id", "itemid": "$itemid"}, "val": {"$first": "$valuenum"}}},
-        ]
-        for doc in sim_db["labevents"].aggregate(lab_pipeline):
-            hid = doc["_id"]["hadm_id"]
-            iid = doc["_id"]["itemid"]
-            if hid not in labs_map:
-                labs_map[hid] = {}
-            name = lab_name_map.get(iid)
-            if name and doc.get("val") is not None:
-                labs_map[hid][name] = doc["val"]
+    labs_map: dict = _labs_for(icu_hadm_ids) if icu_hadm_ids else {}
 
     # 5. Generate alerts
     alert_list = []
@@ -2003,7 +2334,7 @@ from pymongo.errors import PyMongoError  # noqa: E402
 
 
 @app.post("/models/registry")
-async def register_model(payload: dict):
+def register_model(payload: dict):
     """Accept a registration from an ML service at startup.
 
     Expected payload::

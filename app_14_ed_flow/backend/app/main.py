@@ -137,14 +137,52 @@ async def lifespan(application: FastAPI):
             return (payload.get("hadm_id") or payload.get("subject_id")
                     or payload.get("patient_id"))
 
+        def _matching_keys(payload):
+            """Every ed_patients key a payload could refer to.
+
+            ``ed_patients`` is keyed by ``patient_id`` (the MIMIC subject,
+            an int), but discharge payloads lead with ``hadm_id`` (a
+            "SIM-..." string). Looking up the single ``_resolve_id`` value
+            therefore missed on exactly the events that carry an hadm_id —
+            the patient stayed on the board forever. Try every identifier
+            the payload offers, in both int and str form, and also match
+            on the entry's own ``hadm_id_raw``.
+            """
+            ed_pts = state.get("ed_patients") or {}
+            candidates = [
+                payload.get("hadm_id"),
+                payload.get("subject_id"),
+                payload.get("patient_id"),
+            ]
+            keys = []
+            for c in candidates:
+                if c is None:
+                    continue
+                for form in (c, str(c)):
+                    if form in ed_pts and form not in keys:
+                        keys.append(form)
+                try:
+                    as_int = int(c)
+                except (TypeError, ValueError):
+                    as_int = None
+                if as_int is not None and as_int in ed_pts and as_int not in keys:
+                    keys.append(as_int)
+            hadm = payload.get("hadm_id")
+            if hadm is not None:
+                for k, p in ed_pts.items():
+                    if str(p.get("hadm_id_raw") or p.get("hadm_id") or "") == str(hadm):
+                        if k not in keys:
+                            keys.append(k)
+            return keys
+
         async def _on_discharge(topic, payload):
             pid = _resolve_id(payload)
             if pid is None:
                 return
             ed_pts = state.get("ed_patients") or {}
-            if pid in ed_pts:
-                ed_pts[pid]["current_status"] = "discharged"
-                logger.info("ED patient %s discharged via Kafka", pid)
+            for key in _matching_keys(payload):
+                ed_pts[key]["current_status"] = "discharged"
+                logger.info("ED patient %s discharged via Kafka", key)
             patients = state.get("patients") or {}
             patients.pop(pid, None)
 
@@ -159,11 +197,12 @@ async def lifespan(application: FastAPI):
             if _ed_like(dest):
                 return  # still in ED-like dept (e.g. ED → CDU); keep tracking
             ed_pts = state.get("ed_patients") or {}
-            if pid in ed_pts and ed_pts[pid].get("current_status") != "discharged":
-                ed_pts[pid]["current_status"] = "discharged"
-                logger.info(
-                    "ED patient %s tagged discharged (transferred to %s)", pid, dest
-                )
+            for key in _matching_keys(payload):
+                if ed_pts[key].get("current_status") != "discharged":
+                    ed_pts[key]["current_status"] = "discharged"
+                    logger.info(
+                        "ED patient %s tagged discharged (transferred to %s)", key, dest
+                    )
 
         await attach_with_ring_buffer(
             service_id="ed_flow",
@@ -190,6 +229,58 @@ async def lifespan(application: FastAPI):
         state["last_sim_time"] = s.get("last_sim_time")
         logger.info("ED Flow restored %d patients from snapshot v%d",
                     len(state["ed_patients"]), snap.get("version", 0))
+
+    # Reconcile the restored board against the simulator's admissions.
+    #
+    # ED episodes are closed by Kafka discharge/transfer events. Any window
+    # where those events don't arrive — SimEngine down, broker backlog,
+    # this service restarting — strands patients on the board permanently,
+    # because nothing else ever revisits them. We measured 394 patients
+    # "in treatment" in a 30-bed ED with zero trolleys after one such
+    # outage: the board disagreed with every other service in the estate.
+    #
+    # deterioration already solves this with a startup purge; do the same
+    # here. Cheap (one indexed scan), and it makes the board self-healing
+    # across restarts rather than only as accurate as the event stream's
+    # worst outage.
+    try:
+        db_client = state["mongo"].client
+        mimic_sim = db_client["MIMIC_SIM"]
+        active_hadms: set = set()
+        active_subjects: set = set()
+        for a in mimic_sim["admissions"].find(
+            {"status": {"$ne": "discharged"}},
+            {"_id": 0, "hadm_id": 1, "subject_id": 1},
+        ):
+            if a.get("hadm_id") is not None:
+                active_hadms.add(str(a["hadm_id"]))
+            if a.get("subject_id") is not None:
+                active_subjects.add(str(a["subject_id"]))
+
+        # Only trust the reconcile if the sim actually reported a census —
+        # an empty read (Mongo hiccup, sim mid-reset) must not wipe the board.
+        if active_hadms or active_subjects:
+            stale = 0
+            for pid, p in (state.get("ed_patients") or {}).items():
+                if p.get("current_status") == "discharged":
+                    continue
+                # Entries carry the SIM admission id in hadm_id_raw and the
+                # MIMIC subject in patient_id; hadm_id is often null.
+                hadm = p.get("hadm_id_raw") or p.get("hadm_id")
+                if hadm is not None:
+                    still_active = str(hadm) in active_hadms
+                else:
+                    still_active = str(p.get("patient_id") or pid) in active_subjects
+                if not still_active:
+                    p["current_status"] = "discharged"
+                    stale += 1
+            logger.info(
+                "ed_flow startup_reconcile closed %d stale ED episodes "
+                "(%d active admissions in sim)",
+                stale, len(active_hadms),
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ed_flow_startup_reconcile_failed: %s", exc)
 
     # Subscribe to relevant events from other modules
     bus = state["event_bus"]

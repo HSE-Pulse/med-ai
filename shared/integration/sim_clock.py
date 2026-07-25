@@ -20,6 +20,13 @@ clock to SimEngine's ``/sim/clock`` snapshot AND mirrors the speed
 multiplier from ``/state``. Without ``attach_remote``, the local clock
 ticks at wall-clock rate (1×) which silently drifts whenever the sim is
 running at any other speed.
+
+Staleness
+---------
+An attached clock that loses contact with SimEngine stops advancing after
+``STALE_AFTER_SECONDS`` and reports ``stale=True`` in its snapshot, rather
+than free-running indefinitely at the last-known speed. Check ``is_stale()``
+before treating a sim timestamp as authoritative.
 """
 
 from __future__ import annotations
@@ -39,6 +46,18 @@ def _wall_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# How long a remote-attached clock may extrapolate past its last successful
+# anchor refresh before it is considered stale and stops advancing.
+#
+# The refresher polls once a second, so 30 s tolerates ~30 consecutive
+# failures before freezing. Bounding it matters: an unbounded free-run is
+# what let this estate's 14 clocks drift into four different days
+# (2026-07-29 / 08-02 / 08-03 / wall) while every service still reported
+# itself healthy. A frozen clock that says "stale" is recoverable; a
+# confidently-wrong one is not.
+STALE_AFTER_SECONDS = 30.0
+
+
 @dataclass
 class SimClockState:
     """Serialisable snapshot of clock state — shipped between services."""
@@ -47,6 +66,11 @@ class SimClockState:
     anchor_wall_iso: str
     offset_seconds: float
     running: bool
+    # Staleness telemetry. Defaulted so older callers constructing this
+    # positionally keep working.
+    attached_remote: bool = False
+    sync_age_seconds: Optional[float] = None
+    stale: bool = False
 
 
 class SimClock:
@@ -75,6 +99,13 @@ class SimClock:
         self._remote_url: Optional[str] = None
         self._remote_task: Optional[asyncio.Task] = None
         self._state_lock = threading.Lock()
+        # Wall time of the last *successful* anchor refresh from SimEngine.
+        # None until attach_remote lands its first fetch. Only meaningful
+        # when _attached_remote is True — SimEngine itself is the source of
+        # truth and never goes stale relative to anything.
+        self._last_remote_sync: Optional[datetime] = None
+        self._attached_remote: bool = False
+        self._stale_logged: bool = False
 
     # ------------------------------------------------------------------ singleton
     @classmethod
@@ -104,10 +135,55 @@ class SimClock:
         unchanged for processes that don't attach (e.g. tests, scripts).
         """
         with self._state_lock:
-            if not self._running:
-                return self._anchor_sim
-            elapsed = (_wall_now() - self._anchor_wall).total_seconds()
-            return self._anchor_sim + timedelta(seconds=elapsed * self._speed)
+            return self._sim_time_locked()
+
+    # ---- internal: all of these assume ``_state_lock`` is already held ----
+    #
+    # ``threading.Lock`` is non-reentrant, so anything that needs the current
+    # sim time *while holding the lock* must call these, never the public
+    # accessors. (Re-entering the lock is the deadlock that used to hang
+    # /sim/clock — see ``snapshot`` below.)
+
+    def _sync_age_locked(self) -> Optional[float]:
+        """Seconds since the last successful remote anchor, or None."""
+        if not self._attached_remote:
+            return None
+        if self._last_remote_sync is None:
+            return float("inf")
+        return (_wall_now() - self._last_remote_sync).total_seconds()
+
+    def _is_stale_locked(self) -> bool:
+        age = self._sync_age_locked()
+        return age is not None and age > STALE_AFTER_SECONDS
+
+    def _sim_time_locked(self) -> datetime:
+        if not self._running:
+            return self._anchor_sim
+        elapsed = (_wall_now() - self._anchor_wall).total_seconds()
+        # A remote-attached clock that has lost contact with SimEngine stops
+        # extrapolating once it goes stale, rather than free-running forever
+        # at the last-known speed. Divergence is then bounded by
+        # STALE_AFTER_SECONDS × speed instead of growing without limit.
+        age = self._sync_age_locked()
+        if age is not None and age > STALE_AFTER_SECONDS:
+            elapsed = max(0.0, elapsed - (age - STALE_AFTER_SECONDS))
+        return self._anchor_sim + timedelta(seconds=elapsed * self._speed)
+
+    # ---------------------------------------------------------- staleness API
+    def sync_age_seconds(self) -> Optional[float]:
+        """Seconds since this process last re-anchored off SimEngine.
+
+        ``None`` for a clock that was never attached to a remote (SimEngine
+        itself, tests, scripts); ``inf`` if attach was requested but the
+        first fetch never succeeded.
+        """
+        with self._state_lock:
+            return self._sync_age_locked()
+
+    def is_stale(self) -> bool:
+        """True when this clock can no longer be trusted to match SimEngine."""
+        with self._state_lock:
+            return self._is_stale_locked()
 
     def is_sim_running(self) -> bool:
         with self._state_lock:
@@ -129,13 +205,22 @@ class SimClock:
                 self._anchor_wall = _wall_now()
                 self._running = False
 
-    def set_anchor(self, sim_time: datetime, running: bool = True, speed: Optional[float] = None) -> None:
+    def set_anchor(
+        self,
+        sim_time: datetime,
+        running: bool = True,
+        speed: Optional[float] = None,
+        from_remote: bool = False,
+    ) -> None:
         """Seed the clock to ``sim_time`` and optionally start running.
 
         Called by SimEngine ``/reset`` / start, and by the remote
         refresher in non-source processes (which also passes ``speed``
         so ``get_sim_time`` extrapolates at the same cadence as the
         simulator).
+
+        ``from_remote`` marks this as a successful re-anchor off SimEngine
+        and clears the staleness timer.
         """
         if sim_time.tzinfo is None:
             sim_time = sim_time.replace(tzinfo=timezone.utc)
@@ -145,6 +230,16 @@ class SimClock:
             self._running = running
             if speed is not None and speed > 0:
                 self._speed = float(speed)
+            if from_remote:
+                was_stale = self._is_stale_locked()
+                self._last_remote_sync = self._anchor_wall
+                if was_stale and self._stale_logged:
+                    logger.warning(
+                        "sim_clock_resynced anchor=%s speed=%s — clock was stale "
+                        "and has been re-anchored to SimEngine",
+                        sim_time.isoformat(), self._speed,
+                    )
+                self._stale_logged = False
 
     def set_speed(self, speed: float) -> None:
         """Update the speed multiplier without jumping sim time."""
@@ -214,6 +309,9 @@ class SimClock:
             if self._remote_task is not None and not self._remote_task.done():
                 return  # already attached
             self._remote_url = clock_url
+            # From here on this process is a *follower* of SimEngine's clock,
+            # so failing to reach it is a correctness problem, not a nicety.
+            self._attached_remote = True
 
         async def _loop() -> None:
             try:
@@ -243,9 +341,30 @@ class SimClock:
                                 speed = None
                         if iso:
                             sim_time = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-                            self.set_anchor(sim_time, running=running, speed=speed)
+                            self.set_anchor(
+                                sim_time, running=running, speed=speed, from_remote=True,
+                            )
                 except Exception as exc:  # noqa: BLE001 — never break the loop
                     logger.debug("sim_clock_remote_refresh_failed: %s", exc)
+
+                # Losing the anchor used to be a debug-level non-event, which
+                # is how 14 services drifted onto four different days without
+                # anyone noticing. Once past the staleness threshold, say so
+                # loudly — and once only, so a long outage doesn't spam.
+                with self._state_lock:
+                    stale = self._is_stale_locked()
+                    age = self._sync_age_locked()
+                    first = stale and not self._stale_logged
+                    if first:
+                        self._stale_logged = True
+                if first:
+                    logger.warning(
+                        "sim_clock_stale age=%.0fs url=%s — clock frozen at last "
+                        "known anchor; sim timestamps from this service are no "
+                        "longer authoritative until SimEngine is reachable",
+                        age if age not in (None, float("inf")) else -1.0,
+                        clock_url,
+                    )
                 try:
                     await asyncio.sleep(refresh_seconds)
                 except asyncio.CancelledError:
@@ -277,7 +396,9 @@ class SimClock:
                         speed = None
                 if iso:
                     sim_time = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-                    self.set_anchor(sim_time, running=running, speed=speed)
+                    self.set_anchor(
+                        sim_time, running=running, speed=speed, from_remote=True,
+                    )
                     logger.info(
                         "sim_clock_attached_remote anchor=%s speed=%s",
                         iso, speed,
@@ -291,6 +412,11 @@ class SimClock:
             t = self._remote_task
             self._remote_task = None
             self._remote_url = None
+            # No longer a follower — staleness stops applying, otherwise a
+            # detached clock would freeze itself 30 s later.
+            self._attached_remote = False
+            self._last_remote_sync = None
+            self._stale_logged = False
         if t is not None and not t.done():
             t.cancel()
 
@@ -309,17 +435,17 @@ class SimClock:
         """
         with self._state_lock:
             wall_now = _wall_now()
-            if self._running:
-                elapsed = (wall_now - self._anchor_wall).total_seconds()
-                sim_time = self._anchor_sim + timedelta(seconds=elapsed * self._speed)
-            else:
-                sim_time = self._anchor_sim
+            sim_time = self._sim_time_locked()
             offset = (sim_time - wall_now).total_seconds()
+            age = self._sync_age_locked()
             return SimClockState(
                 sim_time_iso=sim_time.isoformat(),
                 anchor_wall_iso=self._anchor_wall.isoformat(),
                 offset_seconds=offset,
                 running=self._running,
+                attached_remote=self._attached_remote,
+                sync_age_seconds=None if age in (None, float("inf")) else age,
+                stale=self._is_stale_locked(),
             )
 
 
@@ -354,10 +480,17 @@ async def attach_remote_clock(
     )
 
 
+def is_clock_stale() -> bool:
+    """Module-level accessor — True when this process's clock can't be trusted."""
+    return SimClock.get_instance().is_stale()
+
+
 __all__ = [
+    "STALE_AFTER_SECONDS",
     "SimClock",
     "SimClockState",
     "attach_remote_clock",
     "get_sim_time",
+    "is_clock_stale",
     "is_sim_running",
 ]
