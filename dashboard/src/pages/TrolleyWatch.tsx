@@ -102,6 +102,9 @@ export default function TrolleyWatch() {
         <div className="flex items-center justify-between mb-3">
           <h3 className="font-semibold text-white flex items-center gap-2">
             <Download className="w-4 h-4 text-emerald-400" /> INMO Daily Snapshot
+            <span className="text-[11px] font-normal text-slate-500 ml-2">
+              HSE TrolleyGAR &middot; 08:00 count
+            </span>
           </h3>
           <input
             type="date"
@@ -123,6 +126,8 @@ export default function TrolleyWatch() {
                 <th className="text-right py-1.5">ED</th>
                 <th className="text-right py-1.5">Wards</th>
                 <th className="text-right py-1.5">Total</th>
+                <th className="text-right py-1.5" title="Surge beds in use (full report @14:00)">Surge</th>
+                <th className="text-right py-1.5" title="Delayed transfers of care, as of midnight">Delayed</th>
               </tr>
             </thead>
             <tbody>
@@ -135,6 +140,15 @@ export default function TrolleyWatch() {
                   <td className="py-1.5 text-right">{r.trolleys_ed}</td>
                   <td className="py-1.5 text-right">{r.trolleys_wards}</td>
                   <td className="py-1.5 text-right text-white font-semibold">{r.total}</td>
+                  {/* HSE publishes no surge/delayed figure for some sites —
+                      render an em dash rather than 0, so "not reported" is
+                      never mistaken for "none". */}
+                  <td className="py-1.5 text-right text-amber-300/90">
+                    {r.surge_capacity ?? "—"}
+                  </td>
+                  <td className="py-1.5 text-right text-sky-300/90">
+                    {r.delayed_transfers ?? "—"}
+                  </td>
                 </tr>
               ))}
             </tbody>
