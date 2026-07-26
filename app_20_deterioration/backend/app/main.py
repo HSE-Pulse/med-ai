@@ -253,49 +253,76 @@ async def lifespan(application: FastAPI):
         logger.warning("deterioration_mongo_init_failed: %s", exc)
         _state["mongo"] = None
 
-    # One-shot purge of stale entries — when the service starts, drop any
-    # alerts/escalations whose hadm_id is no longer in MIMIC_SIM.admissions
-    # with status != "discharged". This catches the historical accumulation
-    # from prior runs without a discharge handler (we measured 891 entries
-    # against 153 currently-active sim patients, ~5.8× over-count).
-    try:
+    # Reconcile stale entries against the simulator: drop alerts/escalations
+    # whose hadm_id is no longer an active admission.
+    #
+    # This used to run once at startup, which is not enough. Anything that
+    # discharges a batch of patients — a backlog of overdue journeys catching
+    # up, for instance — strands their alerts on the board until the next
+    # restart. Measured after one such burst: 135 of 161 active alerts were
+    # for patients the simulator had already discharged, and the gap held
+    # steady instead of draining. So it now runs on a timer as well.
+    def _purge_stale_alerts() -> tuple:
         db = _mongo_db()
-        if db is not None:
-            mimic_sim = db.client["MIMIC_SIM"]
-            active_hadms = {
-                str(a.get("hadm_id") or "")
-                for a in mimic_sim["admissions"].find(
-                    {"status": {"$ne": "discharged"}},
-                    {"_id": 0, "hadm_id": 1},
-                )
-                if a.get("hadm_id")
-            }
-            stale_alerts = [
-                hid for hid in list(_state["active_alerts"].keys())
-                if hid not in active_hadms
-            ]
-            for hid in stale_alerts:
-                _state["active_alerts"].pop(hid, None)
-            stale_esc = [
-                eid for eid, rec in list(_state["escalations"].items())
-                if str(rec.get("hadm_id") or "") not in active_hadms
-            ]
-            for eid in stale_esc:
-                _state["escalations"].pop(eid, None)
-            try:
-                db[COLL_ACTIVE].delete_many({"hadm_id": {"$nin": list(active_hadms)}})
-                db[COLL_ESC].update_many(
-                    {"hadm_id": {"$nin": list(active_hadms)}, "acknowledged": {"$ne": True}},
-                    {"$set": {"acknowledged": True, "acknowledged_via": "auto:startup_purge"}},
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("startup_purge_mongo_failed: %s", exc)
-            logger.info(
-                "startup_purge dropped %d stale alerts + %d escalations (%d active hadms in sim)",
-                len(stale_alerts), len(stale_esc), len(active_hadms),
+        if db is None:
+            return (0, 0, 0)
+        mimic_sim = db.client["MIMIC_SIM"]
+        active_hadms = {
+            str(a.get("hadm_id") or "")
+            for a in mimic_sim["admissions"].find(
+                {"status": {"$ne": "discharged"}}, {"_id": 0, "hadm_id": 1},
             )
+            if a.get("hadm_id")
+        }
+        # An empty read (Mongo blip, sim mid-reset) must not wipe the board.
+        if not active_hadms:
+            return (0, 0, 0)
+        stale_alerts = [
+            hid for hid in list(_state["active_alerts"].keys())
+            if hid not in active_hadms
+        ]
+        for hid in stale_alerts:
+            _state["active_alerts"].pop(hid, None)
+        stale_esc = [
+            eid for eid, rec in list(_state["escalations"].items())
+            if str(rec.get("hadm_id") or "") not in active_hadms
+        ]
+        for eid in stale_esc:
+            _state["escalations"].pop(eid, None)
+        try:
+            db[COLL_ACTIVE].delete_many({"hadm_id": {"$nin": list(active_hadms)}})
+            db[COLL_ESC].update_many(
+                {"hadm_id": {"$nin": list(active_hadms)}, "acknowledged": {"$ne": True}},
+                {"$set": {"acknowledged": True, "acknowledged_via": "auto:reconcile"}},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("purge_stale_mongo_failed: %s", exc)
+        return (len(stale_alerts), len(stale_esc), len(active_hadms))
+
+    try:
+        a, e, n = await asyncio.to_thread(_purge_stale_alerts)
+        logger.info(
+            "startup_purge dropped %d stale alerts + %d escalations (%d active hadms in sim)",
+            a, e, n,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.warning("startup_purge_failed: %s", exc)
+
+    async def _reconcile_loop(interval: float = 60.0) -> None:
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                a, e, _n = await asyncio.to_thread(_purge_stale_alerts)
+                if a or e:
+                    logger.info(
+                        "reconcile dropped %d stale alerts + %d escalations", a, e,
+                    )
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("reconcile_loop_error: %s", exc)
+
+    _state["reconcile_task"] = asyncio.create_task(_reconcile_loop())
 
     # Subscribe to Kafka — admissions begin tracking, discharges stop.
     # Without a discharge handler, ``_state["active_alerts"]`` would

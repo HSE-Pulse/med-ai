@@ -174,6 +174,7 @@ class HospitalEventEngine:
         # sim_admittime is ahead of the current clock (clock was reset), we
         # re-anchor it to now so the dashboard elapsed-time stays sensible.
         self._rehydrate_active_patients()
+        await self._reschedule_dropped_journeys()
 
         self.running = True
         self._tasks = [
@@ -194,6 +195,170 @@ class HospitalEventEngine:
             t.cancel()
         self._tasks.clear()
         logger.info("Simulation stopped.")
+
+    # How far apart to space events that are already overdue. A patient
+    # parked across a long outage has their whole remaining journey in the
+    # past; firing it all at once would stampede the digital twin, so the
+    # catch-up is spread and the patient visibly walks their remaining path.
+    CATCHUP_SPACING_S: float = 2.0
+    CATCHUP_MAX_S: float = 900.0
+
+    async def _reschedule_dropped_journeys(self) -> None:
+        """Re-arm the transfer + discharge events a restart dropped.
+
+        ``event_queue`` is in-memory and nothing ever restored it.
+        ``_rehydrate_active_patients`` brings back ``active_patients`` so the
+        vital drift loop keeps charting, which is why a stranded patient
+        still looks alive — but with no queued events they never transfer
+        and never discharge. Measured on this deployment: patients parked in
+        ED for 2.5 sim-months still writing vitals, and 2,619 admissions that
+        never received a single transfer record.
+
+        Rebuilt rather than persisted: the journey is deterministic MIMIC
+        data, so what remains is recoverable from the patient's
+        ``sim_admittime`` plus the source admission's ``admittime`` /
+        ``dischtime`` / transfers. Only transfers and discharge are restored —
+        vitals have their own loop, and labs/meds/notes are cosmetic here.
+
+        Two bulk queries total, not two per patient.
+        """
+        if not self.active_patients:
+            return
+
+        def _load():
+            origs = [
+                p.get("original_hadm_id")
+                for p in self.active_patients.values()
+                if p.get("original_hadm_id") is not None
+            ]
+            if not origs:
+                return {}, {}
+            adm_by_id = {
+                a["hadm_id"]: a
+                for a in self.mongo.mimic["admissions"].find(
+                    {"hadm_id": {"$in": origs}},
+                    {"_id": 0, "hadm_id": 1, "admittime": 1, "dischtime": 1,
+                     "discharge_location": 1, "hospital_expire_flag": 1},
+                )
+            }
+            xfer_by_id: Dict[Any, list] = {}
+            for t in self.mongo.mimic["transfers"].find(
+                {"hadm_id": {"$in": origs}},
+                {"_id": 0, "hadm_id": 1, "careunit": 1, "intime": 1, "eventtype": 1},
+            ):
+                xfer_by_id.setdefault(t["hadm_id"], []).append(t)
+            return adm_by_id, xfer_by_id
+
+        try:
+            adm_by_id, xfer_by_id = await asyncio.to_thread(_load)
+        except Exception as exc:  # noqa: BLE001 — never block startup
+            logger.warning("reschedule_dropped_journeys_failed: %s", exc)
+            return
+
+        now = self.clock.now()
+
+        # Count the overdue events first so they can be spread across the
+        # catch-up window with a spacing that GUARANTEES distinct timestamps.
+        #
+        # A naive `min(slot * spacing, CATCHUP_MAX_S)` collapses every event
+        # past the cap onto one instant: with 1530 overdue events, 2 s
+        # spacing and a 900 s cap, 1080 of them landed on the same
+        # microsecond. `intime` ties make "latest transfer" non-deterministic,
+        # so a patient's current department becomes whichever row Mongo
+        # happens to return — measured 910 transfers on one timestamp and 4
+        # active patients with an ambiguous location.
+        overdue_total = 0
+        for _sh, _p in self.active_patients.items():
+            _o = _p.get("original_hadm_id")
+            _src = adm_by_id.get(_o)
+            if not _src:
+                continue
+            _at = _parse_time(_src.get("admittime"))
+            _b = _parse_time(_p.get("sim_admittime"))
+            if _at is None or _b is None:
+                continue
+            for _t in xfer_by_id.get(_o, []):
+                _off = self._time_offset(_at, _t.get("intime"))
+                if _off is not None and _b + timedelta(seconds=_off) <= now:
+                    overdue_total += 1
+            _dt = _parse_time(_src.get("dischtime"))
+            if _dt is not None:
+                _raw = max(0.0, (_dt - _at).total_seconds())
+                if _b + timedelta(seconds=_raw * DEMO_LOS_SCALE) <= now:
+                    overdue_total += 1
+        # Never coarser than the nominal spacing, never so fine that the tail
+        # spills past the window.
+        catchup_spacing = (
+            min(self.CATCHUP_SPACING_S, self.CATCHUP_MAX_S / overdue_total)
+            if overdue_total > 0 else self.CATCHUP_SPACING_S
+        )
+
+        overdue_slot = 0
+        restored_x = restored_d = touched = 0
+
+        for sim_hadm, p in list(self.active_patients.items()):
+            orig = p.get("original_hadm_id")
+            src = adm_by_id.get(orig)
+            if not src:
+                continue
+            admit_time = _parse_time(src.get("admittime"))
+            base = _parse_time(p.get("sim_admittime"))
+            if admit_time is None or base is None:
+                continue
+            sid = p.get("subject_id")
+            before = restored_x + restored_d
+
+            def _due(offset_s: float) -> datetime:
+                """When an event should fire, catching up anything overdue."""
+                nonlocal overdue_slot
+                t = base + timedelta(seconds=offset_s)
+                if t > now:
+                    return t
+                overdue_slot += 1
+                # Strictly increasing — no cap, because the spacing was sized
+                # against the overdue count so the tail already lands inside
+                # the window. Distinct timestamps are what keep "latest
+                # transfer" deterministic downstream.
+                return now + timedelta(seconds=overdue_slot * catchup_spacing)
+
+            for t in sorted(
+                xfer_by_id.get(orig, []),
+                key=lambda r: str(r.get("intime") or ""),
+            ):
+                off = self._time_offset(admit_time, t.get("intime"))
+                if off is None:
+                    continue
+                self._schedule_event(_due(off), "transfer", {
+                    "hadm_id": sim_hadm,
+                    "subject_id": sid,
+                    "careunit": t.get("careunit"),
+                    "eventtype": t.get("eventtype"),
+                })
+                restored_x += 1
+
+            disch_time = _parse_time(src.get("dischtime"))
+            if disch_time is not None:
+                is_expired = str(src.get("hospital_expire_flag", 0)) in ("1", "True", "true")
+                raw = max(0.0, (disch_time - admit_time).total_seconds())
+                off = 0.0 if (is_expired and raw < 300) else raw * DEMO_LOS_SCALE
+                self._schedule_event(_due(off), "discharge", {
+                    "hadm_id": sim_hadm,
+                    "subject_id": sid,
+                    "discharge_location": src.get("discharge_location"),
+                    "hospital_expire_flag": src.get("hospital_expire_flag"),
+                    "discharge_reason": "expired" if is_expired else "routine",
+                })
+                restored_d += 1
+
+            if (restored_x + restored_d) > before:
+                touched += 1
+
+        if touched:
+            logger.info(
+                "Re-armed %d transfer + %d discharge events for %d rehydrated "
+                "patients (%d were overdue and will catch up)",
+                restored_x, restored_d, touched, overdue_slot,
+            )
 
     def _rehydrate_active_patients(self) -> None:
         """Re-populate ``active_patients`` from MongoDB after a restart.

@@ -29,6 +29,9 @@ import numpy as np
 from gymnasium import spaces
 
 from .des_engine import DESConfig, DESEngine
+# Single definition of the observation, kept gymnasium-free so the live
+# service can import it too (see observation.py).
+from .observation import build_dept_observation
 
 logger = logging.getLogger(__name__)
 
@@ -39,8 +42,7 @@ logger = logging.getLogger(__name__)
 
 from shared.constants.hospital import DEPARTMENTS
 
-STATE_DIM = 12
-ACTION_DIM = 4
+from .observation import STATE_DIM, ACTION_DIM  # noqa: F401  (re-export)
 N_DEPARTMENTS = len(DEPARTMENTS)
 
 
@@ -136,66 +138,10 @@ class HospitalEnv(gym.Env):
             )
 
     def _get_dept_observation(self, dept_name: str) -> np.ndarray:
-        """Compute the 12-dimensional observation for a single department."""
-        dept = self.engine.departments.get(dept_name)
-        if dept is None:
-            return np.zeros(STATE_DIM, dtype=np.float32)
-
-        # Basic counts
-        patient_count = float(dept.patient_count)
-        capacity_ratio = dept.occupancy_ratio
-        avg_wait = dept.avg_wait_time
-        avg_los = dept.avg_service_time
-
-        # Admission rates (from recent arrival tracking)
-        recent = self._recent_arrivals.get(dept_name, [])
-        current_time = self.engine.current_time
-        arrivals_1h = sum(1 for t in recent if current_time - t <= 1.0)
-        arrivals_4h = sum(1 for t in recent if current_time - t <= 4.0)
-
-        # Staffing ratio — use actual department defaults, not flat 8
-        from shared.constants.hospital import STAFF_DEFAULTS
-        defaults = STAFF_DEFAULTS.get(dept_name, {"doctors": 2, "nurses": 6})
-        baseline_staff = max(1, defaults["doctors"] + defaults["nurses"])
-        staffing_ratio = dept.staff.total / baseline_staff
-
-        # Pending transfers
-        pending_in = 0
-        pending_out = 0
-        for evt in self.engine.event_queue:
-            if evt.event_type.name == "TRANSFER":
-                if evt.department == dept_name:
-                    pending_in += 1
-            elif evt.event_type.name == "SERVICE_COMPLETE":
-                if evt.department == dept_name:
-                    pending_out += 1
-
-        # Mean acuity
-        all_patients = dept.patients_in_service + dept.queue
-        acuity_mean = (
-            float(np.mean([p.acuity for p in all_patients]))
-            if all_patients else 3.0
+        """Delegate to the shared builder so train and serve cannot drift."""
+        return build_dept_observation(
+            self.engine, dept_name, self._recent_arrivals.get(dept_name, []),
         )
-
-        # Time of day encoding
-        hour = self.engine.current_time % 24.0
-        tod_sin = math.sin(2 * math.pi * hour / 24.0)
-        tod_cos = math.cos(2 * math.pi * hour / 24.0)
-
-        return np.array([
-            patient_count,
-            capacity_ratio,
-            avg_wait,
-            avg_los,
-            float(arrivals_1h),
-            float(arrivals_4h),
-            staffing_ratio,
-            float(pending_in),
-            float(pending_out),
-            acuity_mean,
-            tod_sin,
-            tod_cos,
-        ], dtype=np.float32)
 
     def _get_observation(self) -> Any:
         """Get the full observation."""

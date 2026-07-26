@@ -31,6 +31,7 @@ from shared.db.mongo import MongoManager
 from shared.ml.registry import ModelRegistry
 from shared.integration.event_bus import get_event_bus
 from shared.integration.service_client import ServiceClient
+from shared.clinical.risk import rule_based_acuity
 
 MODEL_DIR = Path(os.getenv("MODEL_DIR", "./models/ed_flow"))
 
@@ -194,6 +195,14 @@ async def lifespan(application: FastAPI):
                 return
             dest = (payload.get("to_department") or payload.get("careunit")
                     or payload.get("department") or "")
+            # An unknown destination is NOT a departure. 82 of 300 sampled
+            # transfer events carry an empty to_department, and treating
+            # those as "left the ED" silently emptied the board — every
+            # patient the simulator still placed in ED was marked discharged
+            # here. Absent information means leave the record alone; a real
+            # discharge arrives on patient_discharged.
+            if not str(dest).strip():
+                return
             if _ed_like(dest):
                 return  # still in ED-like dept (e.g. ED → CDU); keep tracking
             ed_pts = state.get("ed_patients") or {}
@@ -322,10 +331,222 @@ async def lifespan(application: FastAPI):
             "last_sim_time": state.get("last_sim_time"),
         }
 
+    # Discharged patients were never evicted, so ed_patients grew without
+    # bound — 2394 entries / 15.2 MB measured, past PersistentState's 14 MB
+    # ceiling. The failure is silent and total: 199 consecutive
+    # `snapshot_oversize ... skipped` with zero successful saves, a snapshot
+    # frozen two hours stale, and every restart restoring that stale board —
+    # which is how patients currently sitting in ED went missing from it.
+    #
+    # Capping events per patient (above) wasn't enough because the patient
+    # COUNT is what grows. Keep every active patient plus a recent window of
+    # discharged ones — /metrics/pet-compliance reads discharged records, so
+    # they can't all go.
+    MAX_DISCHARGED_RETAINED = 300
+
+    def _prune_discharged() -> int:
+        patients = state.get("ed_patients") or {}
+        discharged = [
+            (k, p) for k, p in patients.items()
+            if isinstance(p, dict) and p.get("current_status") == "discharged"
+        ]
+        if len(discharged) <= MAX_DISCHARGED_RETAINED:
+            return 0
+        discharged.sort(key=lambda kv: str(kv[1].get("arrival_time") or ""))
+        drop = discharged[: len(discharged) - MAX_DISCHARGED_RETAINED]
+        for k, _ in drop:
+            patients.pop(k, None)
+        return len(drop)
+
+    state["_prune_discharged"] = _prune_discharged
+
+    # ── backfill: adopt ED patients the board never learned about ────────
+    #
+    # ed_flow only ever gains a patient from a triage event at admission. Any
+    # patient admitted while the board was down — or while its snapshots were
+    # being dropped for oversize — is invisible to it forever, because the
+    # simulator emits only vitals for a patient already sitting in a ward.
+    #
+    # Measured: the board showed 0-1 patients against a simulator reporting
+    # 10, with the missing ones parked in ED since 2026-07-23 (2.5 sim-months)
+    # and still charting vitals. The existing startup_reconcile only CLOSES
+    # episodes the board wrongly held open; nothing ever opened the ones it
+    # wrongly missed. This is the other half of that reconciliation.
+    #
+    # Runs at boot and on every snapshot tick, so the board self-heals rather
+    # than waiting for the whole ED population to turn over.
+    _VITAL_HR, _VITAL_SPO2, _VITAL_SBP = 220045, 220277, 220179
+
+    def _is_ed_unit(careunit: str) -> bool:
+        """ED-like careunit test.
+
+        Deliberately not reusing the `_ed_like` defined in the Kafka setup
+        block above: that one only exists if the broker import succeeded, so
+        depending on it would make the backfill raise NameError precisely
+        when the event stream is already broken — the case it exists for.
+        """
+        if not careunit:
+            return False
+        c = str(careunit).lower()
+        return "emergency" in c or c == "ed" or c == "cdu" or "observation" in c
+
+    def _backfill_ed_patients() -> int:
+        db_client = state["mongo"].client
+        mimic = db_client["MIMIC_SIM"]
+        active = mimic["admissions"].distinct("hadm_id", {"status": {"$ne": "discharged"}})
+        if not active:
+            return 0
+
+        # Latest location per active patient; keep the ED-like ones.
+        in_ed = {}
+        for row in mimic["transfers"].aggregate([
+            {"$match": {"hadm_id": {"$in": active}}},
+            {"$sort": {"hadm_id": 1, "intime": -1}},
+            {"$group": {
+                "_id": "$hadm_id",
+                "careunit": {"$first": "$careunit"},
+                "intime": {"$first": "$intime"},
+                "subject_id": {"$first": "$subject_id"},
+            }},
+        ], allowDiskUse=True):
+            if _is_ed_unit(row.get("careunit") or ""):
+                in_ed[row["_id"]] = row
+        if not in_ed:
+            return 0
+
+        patients = state.setdefault("ed_patients", {})
+        # "Known" means CURRENTLY TRACKED, so discharged records don't count.
+        # Including them meant a patient sitting in ED with a stale discharged
+        # record was skipped forever: measured 6 in ED, all 6 on the board as
+        # discharged, board reporting 0. Excluding them lets the adopt step
+        # below overwrite the stale record and revive the patient.
+        known = set()
+        for k, p in patients.items():
+            if isinstance(p, dict) and p.get("current_status") == "discharged":
+                continue
+            known.add(str(k))
+            if isinstance(p, dict):
+                for f in ("hadm_id_raw", "hadm_id"):
+                    if p.get(f) is not None:
+                        known.add(str(p[f]))
+
+        # Close first, in the other direction: any record the board still
+        # holds open for a patient the simulator has discharged. The original
+        # startup_reconcile did this once at boot, which is not enough — a
+        # burst of discharges (e.g. a backlog of overdue journeys catching up)
+        # leaves the board holding stale patients until the next restart.
+        # Measured after one such burst: all 6 "active" records were for
+        # patients already discharged.
+        active_set = {str(h) for h in active}
+        closed = 0
+        for k, p in patients.items():
+            if not isinstance(p, dict) or p.get("current_status") == "discharged":
+                continue
+            ident = str(p.get("hadm_id_raw") or p.get("hadm_id") or k)
+            if ident not in active_set:
+                p["current_status"] = "discharged"
+                closed += 1
+        if closed:
+            logger.info("ed_flow reconcile closed %d stale ED episodes", closed)
+
+        missing = [h for h in in_ed if str(h) not in known]
+        if not missing:
+            return 0
+
+        # Latest vitals so backfilled patients get a real MTS category rather
+        # than everything landing in "Urgent" and flattening the board.
+        vitals = {}
+        for doc in mimic["chartevents"].aggregate([
+            {"$match": {"hadm_id": {"$in": missing},
+                        "itemid": {"$in": [_VITAL_HR, _VITAL_SPO2, _VITAL_SBP]}}},
+            {"$sort": {"_id": 1}},
+            {"$group": {"_id": {"h": "$hadm_id", "i": "$itemid"},
+                        "v": {"$last": "$valuenum"}}},
+        ], allowDiskUse=True):
+            vitals.setdefault(doc["_id"]["h"], {})[doc["_id"]["i"]] = doc.get("v")
+
+        added = 0
+        for hadm in missing:
+            row = in_ed[hadm]
+            v = vitals.get(hadm, {})
+
+            def _f(x):
+                try:
+                    return float(x)
+                except (TypeError, ValueError):
+                    return None
+
+            try:
+                acuity = int(rule_based_acuity(
+                    spo2=_f(v.get(_VITAL_SPO2)), sbp=_f(v.get(_VITAL_SBP)),
+                    hr=_f(v.get(_VITAL_HR)), has_vitals=bool(v),
+                ))
+            except Exception:  # noqa: BLE001
+                acuity = 3
+            acuity = max(1, min(5, acuity))
+            mts = MTS_CATEGORIES.get(acuity, MTS_CATEGORIES[3])
+
+            arrival = row.get("intime")
+            try:
+                arrival_dt = datetime.fromisoformat(str(arrival).replace("Z", ""))
+            except (TypeError, ValueError):
+                arrival_dt = None
+
+            rec = EDPatientFlow(
+                patient_id=int(row.get("subject_id") or 0),
+                arrival_time=arrival_dt,
+                mts_category=acuity,
+                mts_name=mts["name"],
+                mts_color=mts["color"],
+                current_status="in_treatment",
+                current_location="ED_Treatment",
+            ).model_dump()
+            # Carry the SIM id so discharge/transfer matching finds them, and
+            # mark the provenance so a reader can tell an adopted record from
+            # one that came through triage.
+            rec["hadm_id_raw"] = str(hadm)
+            rec["backfilled"] = True
+            patients[str(hadm)] = rec
+            added += 1
+        return added
+
+    state["_backfill_ed_patients"] = _backfill_ed_patients
+
+    try:
+        _n = await _a.to_thread(_backfill_ed_patients)
+        if _n:
+            logger.info("ed_flow startup backfill adopted %d ED patients the board had lost", _n)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ed_flow_backfill_failed: %s", exc)
+
+    # Prune once at boot too. The restored board carries every discharged
+    # patient the previous process ever saw, so waiting for the first loop
+    # tick means 30 s of carrying a board we already know is oversized —
+    # and if the process dies inside that window the snapshot stays stale.
+    _pruned_at_boot = _prune_discharged()
+    logger.info(
+        "ed_flow startup prune dropped %d discharged patients (board now %d)",
+        _pruned_at_boot, len(state.get("ed_patients") or {}),
+    )
+
     async def _snapshot_loop():
         while True:
             try:
                 await _a.sleep(30)
+                # Adopt any ED patient the board is missing before pruning or
+                # snapshotting, so the census stays true between restarts.
+                try:
+                    b = await _a.to_thread(_backfill_ed_patients)
+                    if b:
+                        logger.info("ed_flow backfill adopted %d ED patients", b)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("ed_flow_backfill_failed: %s", exc)
+                n = _prune_discharged()
+                if n:
+                    logger.info(
+                        "ed_flow pruned %d discharged patients (retaining %d + all active)",
+                        n, MAX_DISCHARGED_RETAINED,
+                    )
                 persistent.save_snapshot(_build_snapshot_state())
             except _a.CancelledError:
                 break

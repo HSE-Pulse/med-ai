@@ -845,6 +845,49 @@ def _already_injected(hadm_id: Optional[Any]) -> bool:
     return True
 
 
+# ── MARL observation ────────────────────────────────────────────────────
+#
+# Both inference paths used to hand-roll a 12-vector and fill only indices
+# 0/1/2/6, leaving eight features at zero. Two of those zeros cannot occur in
+# training (acuity_mean floors at 1.0 and defaults to 3.0; tod_sin/tod_cos
+# satisfy sin^2+cos^2=1), so the policy was evaluated outside its training
+# distribution — which is the likely source of the "not well-calibrated"
+# behaviour the clamps below were added to suppress.
+#
+# Now both call the same builder training used.
+from app_03_hospital_ops.backend.simulation.observation import (  # noqa: E402
+    ArrivalWindow as _ArrivalWindow,
+    build_dept_observation as _build_dept_obs,
+)
+
+# Windowed arrival timestamps per department, reconstructed from the engine's
+# cumulative `total_arrivals` counter. The training env tracked these directly;
+# without them arrivals_1h/4h would be the only features still stuck at zero.
+_marl_arrival_window = _ArrivalWindow()
+
+
+def _build_marl_obs(engine, use_real_census: bool = True) -> Dict[str, Any]:
+    """Full 12-feature observation per department, matching training.
+
+    `use_real_census` feeds the live hospital census (from bed_management via
+    notify-census) rather than the DES engine's own patient_count. The DES
+    stopped being census-driven when phantom-admission injection was removed,
+    so without this the policy optimises a near-empty simulation while the
+    real wards are full. Pass False for the shadow baseline engine, whose
+    whole purpose is to remain an untouched no-MARL counterfactual.
+    """
+    _marl_arrival_window.update(engine)
+    return {
+        name: _build_dept_obs(
+            engine, name, _marl_arrival_window.get(name),
+            patient_count_override=(
+                _real_census.get(name) if use_real_census else None
+            ),
+        )
+        for name in engine.departments
+    }
+
+
 def _apply_global_marl_sweep(engine: DESEngine) -> Dict[str, Dict[str, int]]:
     """Run the MARL agent across every department and apply its staffing actions.
 
@@ -866,15 +909,7 @@ def _apply_global_marl_sweep(engine: DESEngine) -> Dict[str, Dict[str, int]]:
     obs: Dict[str, Any] = {}
     if use_marl:
         try:
-            for name, dept in engine.departments.items():
-                vec = np.zeros(STATE_DIM, dtype=np.float32)
-                vec[0] = float(dept.patient_count)
-                vec[1] = float(dept.occupancy_ratio)
-                vec[2] = float(dept.avg_wait_time)
-                baseline = _SD.get(name, {"doctors": 2, "nurses": 6})
-                baseline_total = max(1, baseline["doctors"] + baseline["nurses"])
-                vec[6] = float(dept.staff.total) / baseline_total
-                obs[name] = vec
+            obs = _build_marl_obs(engine)
             actions = _marl_agent.select_actions(obs, explore=False)
         except Exception as exc:  # noqa: BLE001
             logger.warning("global_marl_sweep_inference_failed: %s — falling back to rule", exc)
@@ -1298,12 +1333,8 @@ async def notify_capacity_alert(data: dict) -> BaseResponse:
                 try:
                     import numpy as np
                     # Build observation for the alerted department
-                    obs = {sim_dept: np.zeros(STATE_DIM, dtype=np.float32)}
-                    obs[sim_dept][0] = float(dept_obj.patient_count)
-                    obs[sim_dept][1] = dept_obj.occupancy_ratio
-                    obs[sim_dept][2] = dept_obj.avg_wait_time
-                    baseline_total = max(1, baseline["doctors"] + baseline["nurses"])
-                    obs[sim_dept][6] = dept_obj.staff.total / baseline_total
+                    # Same builder as training and as the global sweep.
+                    obs = {sim_dept: _build_marl_obs(engine)[sim_dept]}
 
                     marl_actions = agent.select_actions(obs, explore=False)
                     if sim_dept in marl_actions:
