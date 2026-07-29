@@ -708,7 +708,12 @@ export interface WaitlistSpecialtyRow {
   specialty: string;
   target_wait_weeks: number;
   inpatient_pct: number;
+  /** Patients still on the list: waiting + scheduled + deteriorated. */
   total: number;
+  /** Subset of `total` with no date yet — the figure /metrics/wait-times reports. */
+  waiting?: number;
+  /** Completed + cancelled. Excluded from `total` and every statistic. */
+  closed?: number;
   by_priority: { urgent: number; soon: number; routine: number; planned: number };
   by_wait_bucket: { le_6w: number; "6_12w": number; "3_6m": number; "6_12m": number; gt_12m: number };
   by_status: Record<string, number>;
@@ -726,7 +731,11 @@ export interface WaitlistSpecialtyRow {
 export interface WaitlistSummary {
   specialties: WaitlistSpecialtyRow[];
   totals: {
+    /** Active only — patients still on the list. */
     grand_total: number;
+    waiting_total?: number;
+    closed_total?: number;
+    roster_total?: number;
     total_breaches: number;
     specialties_with_breaches: number;
     total_high_risk: number;

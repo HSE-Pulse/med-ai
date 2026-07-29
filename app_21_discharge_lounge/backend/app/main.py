@@ -70,6 +70,9 @@ _state: Dict[str, Any] = {
     # via process_vital — would re-trigger _perform_transfer → auto-expiry →
     # re-publish patient_discharged, creating a feedback loop that emitted
     # 100+ duplicate discharges per real admission.
+    # hadm_id -> careunit the simulator moved them to. Prevents immediate
+    # re-admission of a patient who is not actually in the lounge.
+    "moved_elsewhere": {},
     "completed_hadms": set(),
     # FIFO bound — keep the last N completed hadm_ids so the set doesn't
     # grow without bound during long-running simulations.
@@ -193,6 +196,11 @@ async def lifespan(application: FastAPI):
                 # patient_discharged events per admission before this fix).
                 if hadm_id in _state.get("completed_hadms", set()):
                     return
+                # Simulator holds this patient elsewhere. Return quietly —
+                # discharge_predicted fires once per vital, so raising here
+                # would emit a warning several times a second per patient.
+                if _elsewhere_active(hadm_id):
+                    return
                 if len(_state["occupants"]) >= CAPACITY:
                     logger.info(
                         "auto-transfer deferred: lounge_full hadm=%s readiness=%.2f",
@@ -242,6 +250,13 @@ async def lifespan(application: FastAPI):
                 if hadm_id in _state.get("completed_hadms", set()):
                     return
                 if hadm_id in _state["occupants"]:
+                    return
+                # Already evicted as being elsewhere. The event log is
+                # replayed on restart, so an old transfer-to-lounge event
+                # would otherwise re-admit a patient the simulator has since
+                # moved on. The reconciler clears this marker within one poll
+                # if the transfer record really does show the lounge again.
+                if _elsewhere_active(hadm_id):
                     return
                 if len(_state["occupants"]) >= CAPACITY:
                     logger.info(
@@ -296,6 +311,14 @@ async def lifespan(application: FastAPI):
         _expire_occupants(_state["expiry_stop"])
     )
 
+    # Occupant reconciler — drops occupants the simulator has already moved
+    # elsewhere. Needs Mongo (it reads the transfer record), and no-ops
+    # harmlessly when Mongo is unavailable.
+    _state["reconcile_stop"] = asyncio.Event()
+    _state["reconcile_task"] = asyncio.create_task(
+        _reconcile_occupants(_state["reconcile_stop"])
+    )
+
     # Bed-management hydration loop. Source-of-truth for who is *actually*
     # occupying a Discharge_Lounge bed lives in bed_management's bed
     # registry — bed_mgmt's sim_reconciler allocates lounge beds based on
@@ -346,7 +369,8 @@ async def lifespan(application: FastAPI):
 
     try:
         for stop_key, task_key in (("tail_stop", "tail_task"),
-                                    ("expiry_stop", "expiry_task")):
+                                    ("expiry_stop", "expiry_task"),
+                                    ("reconcile_stop", "reconcile_task")):
             stop = _state.get(stop_key)
             if stop is not None:
                 stop.set()
@@ -434,6 +458,13 @@ async def _perform_transfer(
     existing = _state["occupants"].get(hadm_id)
     if existing is not None:
         return {**existing, "duplicate": True}
+
+    # The simulator has this patient somewhere else — admitting them would
+    # recreate the ghost occupancy the reconciler exists to remove. Cleared
+    # by the reconciler if their latest transfer becomes the lounge again.
+    if _elsewhere_active(hadm_id):
+        raise RuntimeError(
+            f"patient_elsewhere:{_state['moved_elsewhere'][hadm_id]['unit']}")
 
     if len(_state["occupants"]) >= CAPACITY:
         raise RuntimeError("lounge_full")
@@ -814,6 +845,104 @@ async def _tail_event_log(mongo_client: Any, stop: asyncio.Event) -> None:
             logger.warning("tail cycle error: %s", exc, exc_info=False)
         try:
             await asyncio.wait_for(stop.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass
+
+
+RECONCILE_POLL_SECONDS = float(os.getenv("DISCHARGE_LOUNGE_RECONCILE_SECONDS", "15"))
+# How long an eviction suppresses re-admission. This must expire: the marker
+# is cleared when the patient's latest transfer is the lounge again, but a
+# blocked admission never writes a lounge transfer, so without a TTL an
+# evicted patient could never be admitted again even once genuinely ready.
+# On expiry they may be re-admitted, and the reconciler evicts them again if
+# the simulator still holds them elsewhere — bounding churn to once per TTL.
+MOVED_ELSEWHERE_TTL_S = float(os.getenv("DISCHARGE_LOUNGE_ELSEWHERE_TTL_SECONDS", "900"))
+LOUNGE_CAREUNIT = "Discharge Lounge"
+
+
+def _elsewhere_active(hadm_id: str) -> bool:
+    """True while an eviction still suppresses re-admission."""
+    rec = _state.get("moved_elsewhere", {}).get(hadm_id)
+    if not rec:
+        return False
+    age = datetime.now(timezone.utc).timestamp() - float(rec.get("at", 0))
+    if age > MOVED_ELSEWHERE_TTL_S:
+        _state["moved_elsewhere"].pop(hadm_id, None)
+        return False
+    return True
+
+
+async def _reconcile_occupants(stop: asyncio.Event) -> None:
+    """Evict occupants the simulator has already moved somewhere else.
+
+    The lounge admits a patient and writes a "Discharge Lounge" transfer, but
+    the MIMIC replay is deterministic: the engine then moves that patient on
+    to their real next unit — often within minutes. Nothing told the lounge,
+    so it held them until the 2-hour expiry timer fired.
+
+    Measured before this existed: 300 of the last 300 lounge admissions were
+    followed by the engine moving the patient elsewhere (0.0-57 min later);
+    not one stayed until discharge. The lounge reported 2 occupants while the
+    bed register and the simulation census both reported 0, on every one of
+    12 samples taken over two minutes.
+
+    Evicted occupants are NOT run through _perform_complete: they did not
+    complete a lounge stay, so counting them would keep inflating throughput
+    and pin mean LOS to the expected-departure constant. They are dropped
+    quietly and logged.
+    """
+    logger.info("occupant reconciler started (poll=%.1fs)", RECONCILE_POLL_SECONDS)
+    while not stop.is_set():
+        try:
+            mongo = _state.get("mongo")
+            ids = list(_state["occupants"].keys())
+            if mongo is not None and ids:
+                def _latest_units():
+                    coll = mongo.client["MIMIC_SIM"]["transfers"]
+                    return list(coll.aggregate([
+                        {"$match": {"hadm_id": {"$in": ids}}},
+                        {"$sort": {"hadm_id": 1, "intime": -1}},
+                        {"$group": {"_id": "$hadm_id",
+                                    "careunit": {"$first": "$careunit"}}},
+                    ]))
+
+                # PyMongo is synchronous; running it inline would stall the
+                # event loop for every other handler in this service.
+                rows = await asyncio.to_thread(_latest_units)
+                latest = {r["_id"]: (r.get("careunit") or "") for r in rows}
+                for hadm_id in ids:
+                    unit = latest.get(hadm_id)
+                    if unit is None:
+                        continue          # no transfer record yet — leave alone
+                    if str(unit).strip() == LOUNGE_CAREUNIT:
+                        # Genuinely in the lounge — clear any past eviction so
+                        # a patient who really does come back can be admitted.
+                        _state.setdefault("moved_elsewhere", {}).pop(hadm_id, None)
+                        continue
+                    rec = _state["occupants"].pop(hadm_id, None)
+                    # Remember the eviction. Without this the event tail
+                    # re-admits the patient on the next discharge_predicted
+                    # tick and the reconciler evicts them again 15s later,
+                    # producing a churn loop instead of a fix.
+                    elsewhere = _state.setdefault("moved_elsewhere", {})
+                    elsewhere[hadm_id] = {
+                        "unit": str(unit),
+                        "at": datetime.now(timezone.utc).timestamp(),
+                    }
+                    # Bounded — long simulations would otherwise grow this
+                    # without limit. Oldest insertions drop first.
+                    while len(elsewhere) > 5000:
+                        elsewhere.pop(next(iter(elsewhere)), None)
+                    if rec is not None:
+                        logger.info(
+                            "lounge occupant evicted hadm=%s — simulator moved them "
+                            "to %r; not counted as a lounge completion",
+                            hadm_id, unit,
+                        )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("reconcile cycle error: %s", exc)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=RECONCILE_POLL_SECONDS)
         except asyncio.TimeoutError:
             pass
 

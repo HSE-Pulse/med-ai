@@ -113,7 +113,14 @@ def _poll_hse_once(on=None):
         return None
     _store_hse_report(rep)
     if rep.reconciled:
-        _state["hse_latest"] = rep.to_doc()
+        # Only promote to the "latest" cache if this really IS the newest
+        # report. _poll_hse_once also serves on-demand backfill for the date
+        # picker, and an unconditional assignment let a request for an old
+        # date overwrite today's figures — /trolley/hse/latest then served a
+        # three-week-old national total until the service restarted.
+        cached = _state.get("hse_latest") or {}
+        if str(rep.report_date) >= str(cached.get("report_date") or ""):
+            _state["hse_latest"] = rep.to_doc()
         logger.info(
             "hse_trolleygar_polled date=%s national_total=%s zones=%d hospitals=%d",
             rep.report_date, rep.national.get("total_trolleys"),

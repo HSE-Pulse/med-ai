@@ -206,9 +206,9 @@ async def lifespan(application: FastAPI):
             except Exception as exc:  # noqa: BLE001
                 logger.warning("bed_snapshot_parse_failed %s: %s", bed_id, exc)
         if beds_dict:
-            state["beds"] = beds_dict
+            state["beds"] = _reconcile_bed_inventory(beds_dict)
             logger.info("Restored %d beds from snapshot (v=%d, at=%s)",
-                        len(beds_dict), snap.get("version", 0), snap.get("snapshot_at"))
+                        len(state["beds"]), snap.get("version", 0), snap.get("snapshot_at"))
         else:
             state["beds"] = _initialize_beds()
     else:
@@ -494,6 +494,67 @@ async def lifespan(application: FastAPI):
     if state["mongo"]:
         state["mongo"].close()
     logger.info("Bed Management service shut down.")
+
+
+def _reconcile_bed_inventory(beds: Dict[str, BedState]) -> Dict[str, BedState]:
+    """Make the restored inventory agree with IRISH_DEPARTMENTS.
+
+    The snapshot is a verbatim copy of whatever inventory existed when it was
+    written, but ``capacity`` in /beds/summary is read live from
+    IRISH_DEPARTMENTS. When departmental capacities changed, the two silently
+    diverged: Medicine reported "10 of 96 occupied, 30 available" because the
+    snapshot still held 40 Medicine beds while the constant said 96. Every
+    consumer of that endpoint then had occupied + available != capacity.
+
+    Missing beds are created as available. Surplus beds are dropped ONLY when
+    not in use — an occupied, reserved, blocked or cleaning bed is kept even
+    if it is now above the configured capacity, because discarding it would
+    strand the patient recorded in it. That leaves a department temporarily
+    over-provisioned, which drains as those beds are released.
+    """
+    from shared.constants.hospital import resolve_bed_category_for
+
+    added, removed, kept_over = 0, 0, 0
+    for dept_name, dept_config in IRISH_DEPARTMENTS.items():
+        capacity = dept_config["capacity"]
+        for i in range(1, capacity + 1):
+            bed_id = f"{dept_name}-{i:03d}"
+            if bed_id not in beds:
+                beds[bed_id] = BedState(
+                    bed_id=bed_id,
+                    department=dept_name,
+                    bed_type=dept_config["type"],
+                    category=resolve_bed_category_for(dept_name, i),
+                    status="available",
+                )
+                added += 1
+        surplus = [
+            b for b in list(beds.values())
+            if b.department == dept_name
+            and _bed_index(b.bed_id) is not None
+            and _bed_index(b.bed_id) > capacity
+        ]
+        for bed in surplus:
+            if bed.status == "available":
+                del beds[bed.bed_id]
+                removed += 1
+            else:
+                kept_over += 1
+
+    if added or removed or kept_over:
+        logger.info(
+            "bed_inventory_reconciled added=%d removed=%d kept_in_use_over_capacity=%d "
+            "total=%d", added, removed, kept_over, len(beds),
+        )
+    return beds
+
+
+def _bed_index(bed_id: str) -> int | None:
+    """Trailing numeric index of a bed id ("Medicine-041" -> 41)."""
+    try:
+        return int(str(bed_id).rsplit("-", 1)[1])
+    except (IndexError, ValueError):
+        return None
 
 
 def _initialize_beds() -> Dict[str, BedState]:

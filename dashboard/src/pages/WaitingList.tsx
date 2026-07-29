@@ -255,7 +255,19 @@ function DepartmentsTab() {
       {/* Totals strip */}
       {totals && (
         <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-          <Stat label="Total waiting" value={totals.grand_total} icon={<Users className="w-4 h-4 text-text-secondary" />} />
+          {/* "Total waiting" previously showed every entry ever created —
+              426 when 9 were waiting — because the summary endpoint never
+              filtered on status. It now counts only patients still on the
+              list, and names the subset with no date yet, which is the
+              figure /metrics/wait-times reports. */}
+          <Stat
+            label="On waiting list"
+            value={totals.grand_total}
+            sub={totals.waiting_total !== undefined
+              ? `${totals.waiting_total} awaiting a date`
+              : undefined}
+            icon={<Users className="w-4 h-4 text-text-secondary" />}
+          />
           <Stat
             label="Breaches"
             value={totals.total_breaches}

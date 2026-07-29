@@ -193,8 +193,21 @@ async def waiting_list_by_department(
 ) -> BaseResponse:
     """Per-specialty summary roster with NTPF-style metrics.
 
+    Counts ACTIVE entries only — those still on the list. Completed and
+    cancelled entries are excluded from ``total`` and from every derived
+    metric, and remain visible under ``by_status`` plus the new ``closed``
+    count. Previously nothing filtered on status, so this endpoint counted
+    every entry ever created: 426 across the estate when 9 were waiting, with
+    Medicine reporting 298 against 7 actually waiting. The dashboard labels
+    this figure "Total waiting", and the sibling /metrics/wait-times has
+    always filtered to status == "waiting", so the two disagreed by 46x.
+
+    "deteriorated" counts as active: such a patient is still on the list and
+    is the most urgent case on it, so excluding them would hide the cohort
+    that matters most.
+
     Returns one row per specialty with:
-      - ``total`` patients waiting
+      - ``total`` active patients (waiting + scheduled + deteriorated)
       - ``by_priority``: counts by urgency band (urgent/soon/routine/planned)
       - ``by_wait_bucket``: Irish SDU buckets (<=6w / 6-12w / 3-6m / 6-12m / >12m)
       - ``mean_wait_days`` / ``median_wait_days`` / ``p90_wait_days``
@@ -207,14 +220,22 @@ async def waiting_list_by_department(
     from shared.integration.sim_clock import get_sim_time as _sim_now
     now = _sim_now()
 
+    ACTIVE_STATUSES = {"waiting", "scheduled", "deteriorated"}
+
     all_entries_raw = state.get("waiting_list", [])
     if live_only:
-        all_entries = [e for e in all_entries_raw if e.get("source", "live") != "demo_seed"]
+        scoped = [e for e in all_entries_raw if e.get("source", "live") != "demo_seed"]
     else:
-        all_entries = all_entries_raw
+        scoped = list(all_entries_raw)
+
+    # Every count and statistic below is over active entries. `scoped` is kept
+    # so closed entries can still be reported per specialty without inflating
+    # the queue.
+    all_entries = [e for e in scoped if e.get("status", "waiting") in ACTIVE_STATUSES]
+    closed_entries = [e for e in scoped if e.get("status", "waiting") not in ACTIVE_STATUSES]
 
     # Recompute wait_days against the current sim clock so stale seeds age.
-    for e in all_entries:
+    for e in scoped:
         ref = e.get("referral_date")
         if isinstance(ref, str):
             try:
@@ -254,6 +275,12 @@ async def waiting_list_by_department(
             "by_priority": {"urgent": 0, "soon": 0, "routine": 0, "planned": 0},
             "by_wait_bucket": {"le_6w": 0, "6_12w": 0, "3_6m": 0, "6_12m": 0, "gt_12m": 0},
             "by_status": {"waiting": 0, "scheduled": 0, "deteriorated": 0, "cancelled": 0, "completed": 0},
+            "closed": 0,
+            # `total` is everyone still on the list; `waiting` is the subset
+            # with no date yet, which is what /metrics/wait-times reports.
+            # Both are published so the two endpoints can be reconciled
+            # instead of appearing to contradict each other.
+            "waiting": 0,
             "mean_wait_days": 0.0,
             "median_wait_days": 0.0,
             "p90_wait_days": 0.0,
@@ -275,6 +302,7 @@ async def waiting_list_by_department(
                 "by_priority": {"urgent": 0, "soon": 0, "routine": 0, "planned": 0},
                 "by_wait_bucket": {"le_6w": 0, "6_12w": 0, "3_6m": 0, "6_12m": 0, "gt_12m": 0},
                 "by_status": {"waiting": 0, "scheduled": 0, "deteriorated": 0, "cancelled": 0, "completed": 0},
+                "closed": 0, "waiting": 0,
                 "mean_wait_days": 0.0, "median_wait_days": 0.0, "p90_wait_days": 0.0,
                 "breach_count": 0, "breach_rate": 0.0,
                 "oldest_wait_days": 0, "oldest_patient_id": None,
@@ -289,12 +317,26 @@ async def waiting_list_by_department(
         status = e.get("status", "waiting")
         if status in row["by_status"]:
             row["by_status"][status] += 1
+        if status == "waiting":
+            row["waiting"] += 1
         wait = int(e.get("wait_days") or 0)
         row["by_wait_bucket"][_wait_bucket(wait)] += 1
 
+    # Closed entries are reported but never counted into `total`, the priority
+    # split, the wait bands or any statistic.
+    for e in closed_entries:
+        spec = e.get("specialty")
+        row = by_spec.get(spec)
+        if not row:
+            continue
+        status = e.get("status", "completed")
+        if status in row["by_status"]:
+            row["by_status"][status] += 1
+        row["closed"] += 1
+
     # Compute aggregate stats
     for spec, row in by_spec.items():
-        spec_entries = [e for e in all_entries if e.get("specialty") == spec]
+        spec_entries = [e for e in all_entries if e.get("specialty") == spec]  # active only
         if not spec_entries:
             continue
         waits = [int(e.get("wait_days") or 0) for e in spec_entries]
@@ -344,7 +386,11 @@ async def waiting_list_by_department(
     rows = sorted(by_spec.values(), key=lambda r: (r["breach_count"], r["total"]), reverse=True)
 
     totals = {
+        # Active only — this is what the dashboard renders as "Total waiting".
         "grand_total": sum(r["total"] for r in rows),
+        "waiting_total": sum(r["waiting"] for r in rows),
+        "closed_total": sum(r["closed"] for r in rows),
+        "roster_total": sum(r["total"] + r["closed"] for r in rows),
         "total_breaches": sum(r["breach_count"] for r in rows),
         "specialties_with_breaches": sum(1 for r in rows if r["breach_count"] > 0),
         "total_high_risk": sum(r["high_risk_count"] for r in rows),
