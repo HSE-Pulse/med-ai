@@ -559,7 +559,13 @@ function RiskUnavailable({ label }: { label: string }) {
 
 function VitalsTab({ patient }: { patient: ResolvedPatient }) {
   const vitals = usePoll<{ data?: { vitals?: Record<string, Array<{ ts?: string; time?: string; value: number }>> } }>(
-    `/api/journey/patient/${encodeURIComponent(patient.subject_id)}/admission/${encodeURIComponent(patient.hadm_id)}/vitals`,
+    // Pass the simulated id too. MIMIC only charts observations for ICU
+    // stays, so a ward admission has none and this tab rendered empty even
+    // when the simulator had charted the patient throughout their stay.
+    `/api/journey/patient/${encodeURIComponent(patient.subject_id)}/admission/${encodeURIComponent(patient.journey_hadm_id)}/vitals` +
+      (patient.hadm_id !== patient.journey_hadm_id
+        ? `?sim_hadm_id=${encodeURIComponent(patient.hadm_id)}`
+        : ""),
     5000,
   );
   const data = vitals.data?.data?.vitals ?? null;
@@ -620,7 +626,7 @@ type LabPanel = Record<string, LabValue[]>;
 
 function LabsTab({ patient }: { patient: ResolvedPatient }) {
   const labs = usePoll<{ data?: { panels?: Record<string, LabPanel> } }>(
-    `/api/journey/patient/${encodeURIComponent(patient.subject_id)}/admission/${encodeURIComponent(patient.hadm_id)}/labs`,
+    `/api/journey/patient/${encodeURIComponent(patient.subject_id)}/admission/${encodeURIComponent(patient.journey_hadm_id)}/labs`,
     60000,
   );
   const panelsObj = labs.data?.data?.panels ?? null;
@@ -697,7 +703,7 @@ function LabsTab({ patient }: { patient: ResolvedPatient }) {
 
 function MedsTab({ patient }: { patient: ResolvedPatient }) {
   const meds = usePoll<{ data?: { medications?: Array<Record<string, unknown>> } }>(
-    `/api/journey/patient/${encodeURIComponent(patient.subject_id)}/admission/${encodeURIComponent(patient.hadm_id)}/medications`,
+    `/api/journey/patient/${encodeURIComponent(patient.subject_id)}/admission/${encodeURIComponent(patient.journey_hadm_id)}/medications`,
     60000,
   );
   const data = meds.data?.data?.medications ?? null;
@@ -780,7 +786,7 @@ function summariseDetails(details?: Record<string, unknown>): string {
 
 function TimelineTab({ patient }: { patient: ResolvedPatient }) {
   const tl = usePoll<{ data?: { events?: JourneyEvent[] } }>(
-    `/api/journey/patient/${encodeURIComponent(patient.subject_id)}/admission/${encodeURIComponent(patient.hadm_id)}/timeline`,
+    `/api/journey/patient/${encodeURIComponent(patient.subject_id)}/admission/${encodeURIComponent(patient.journey_hadm_id)}/timeline`,
     10000,
   );
   const events = tl.data?.data?.events ?? null;

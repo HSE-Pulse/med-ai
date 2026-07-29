@@ -9,9 +9,13 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import logging
+
 import pandas as pd
 
 from shared.db.mongo import MongoManager
+
+logger = logging.getLogger(__name__)
 from app_05_patient_journey.backend.engine.timeline import TimelineEngine
 
 # ---------------------------------------------------------------------------
@@ -50,6 +54,7 @@ class VitalsEngine:
         subject_id: int,
         hadm_id: int,
         resample: str = "1h",
+        sim_hadm_id: Optional[str] = None,
     ) -> Dict[str, List[Dict[str, Any]]]:
         """Return resampled vital-sign series keyed by vital name.
 
@@ -74,11 +79,20 @@ class VitalsEngine:
             )
         )
         stay_ids = [r["stay_id"] for r in icu_rows if r.get("stay_id") is not None]
-        if not stay_ids:
-            return {}
 
         # 2. Fetch raw vitals
-        raw = self._fetch_raw_vitals(stay_ids, list(VITAL_ITEMIDS.values()))
+        raw = (self._fetch_raw_vitals(stay_ids, list(VITAL_ITEMIDS.values()))
+               if stay_ids else [])
+
+        # MIMIC only charts observations for ICU stays, so a ward admission
+        # legitimately has none and this returned an empty tab. The simulator
+        # charts every admission it replays, keyed by its own string id — this
+        # one carried 1,248 observations while the page showed nothing. When a
+        # simulated id is supplied and the historical record is empty, read
+        # those instead; the documents share MIMIC's shape (itemid, valuenum,
+        # charttime), so the same mapping and resampling apply.
+        if not raw and sim_hadm_id:
+            raw = self._fetch_sim_vitals(sim_hadm_id, list(VITAL_ITEMIDS.values()))
         if not raw:
             return {}
 
@@ -107,6 +121,28 @@ class VitalsEngine:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _fetch_sim_vitals(
+        self,
+        sim_hadm_id: str,
+        vital_itemids: List[int],
+    ) -> List[Dict[str, Any]]:
+        """Simulated observations for one replayed admission.
+
+        Served by the {hadm_id, itemid} index that already exists on the
+        collection, so this is a targeted lookup rather than a scan of its
+        37 million documents.
+        """
+        try:
+            cursor = self.mongo.client["MIMIC_SIM"]["chartevents"].find(
+                {"hadm_id": sim_hadm_id, "itemid": {"$in": vital_itemids}},
+                {"_id": 0, "itemid": 1, "charttime": 1, "valuenum": 1,
+                 "valueuom": 1},
+            )
+            return list(cursor)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("sim_vitals_fetch_failed hadm=%s: %s", sim_hadm_id, exc)
+            return []
 
     def _fetch_raw_vitals(
         self,

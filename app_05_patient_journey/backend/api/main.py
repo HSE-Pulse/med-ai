@@ -373,11 +373,18 @@ async def get_vitals(
     subject_id: int,
     hadm_id: int,
     resample: str = Query("1h", description="Pandas resample frequency (e.g. 1h, 30min)"),
+    sim_hadm_id: str | None = Query(
+        None,
+        description="Simulated admission id (\"SIM-<hadm>-<epoch>\"). Used when the "
+                    "historical record has no charted observations, which is the "
+                    "normal case for a ward admission — MIMIC only charts ICU stays.",
+    ),
 ):
     series = vitals_engine.get_vitals_timeseries(
         subject_id=subject_id,
         hadm_id=hadm_id,
         resample=resample,
+        sim_hadm_id=sim_hadm_id,
     )
     response = VitalsResponse(vitals=series)
     return _ok(response.model_dump())

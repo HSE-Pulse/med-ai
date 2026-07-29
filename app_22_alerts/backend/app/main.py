@@ -18,6 +18,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import re
 import sys
 import time
 import uuid
@@ -463,72 +465,141 @@ async def alerts_stream(ws: WebSocket) -> None:
 # ──────────────────────────────────────────────────────────────────────
 # Patient search (for command palette)
 # ──────────────────────────────────────────────────────────────────────
+# Fabricated search hits are a liability in a clinical tool: the patient page
+# resolves whatever this returns, so a stub becomes a patient record on screen.
+# It is kept only as an explicit dev affordance, off by default, and every
+# stub row is tagged so consumers can reject it.
+ALERTS_DEMO_FALLBACK = os.environ.get("ALERTS_DEMO_FALLBACK", "0").lower() in ("1", "true", "yes")
+
+_SEARCH_PROJECTION = {
+    "_id": 0, "hadm_id": 1, "subject_id": 1, "admittime": 1, "dischtime": 1,
+    "admission_type": 1, "admission_location": 1, "status": 1,
+    "original_hadm_id": 1, "sim_admittime": 1,
+}
+
+
+def _search_row(doc: Dict[str, Any], live: bool) -> Dict[str, Any]:
+    return {
+        "hadm_id": str(doc.get("hadm_id", "")),
+        "subject_id": str(doc.get("subject_id", "")),
+        "admission_type": doc.get("admission_type"),
+        "admission_location": doc.get("admission_location"),
+        "admittime": _iso(doc.get("admittime") or doc.get("sim_admittime"))
+                     if (doc.get("admittime") or doc.get("sim_admittime")) else None,
+        "dischtime": _iso(doc.get("dischtime")) if doc.get("dischtime") else None,
+        "status": doc.get("status"),
+        "original_hadm_id": doc.get("original_hadm_id"),
+        "live": live,
+        "is_demo": False,
+    }
+
+
 @app.get("/search/patients")
 async def search_patients(
-    q: str = Query(..., min_length=1, max_length=40),
+    q: str = Query(..., min_length=1, max_length=64),
     limit: int = Query(10, ge=1, le=50),
 ) -> Dict[str, Any]:
-    """Search MIMIC admissions by hadm_id / subject_id prefix.
+    """Search admissions by hadm_id / subject_id.
 
-    Falls back to a small stub list when MongoDB is unreachable so the
-    dashboard palette still works in dev/demo mode.
+    Searches the LIVE simulation first, then the historical MIMIC record.
+
+    Both halves were previously missing. The query only ever ran against
+    ``MIMIC.admissions``, so a simulated admission id — the kind the patient
+    page is actually linked with, e.g. ``SIM-22755188-1792857544`` — could
+    never match, because those live in ``MIMIC_SIM.admissions``. The
+    non-numeric branch additionally applied a string ``$regex`` to
+    ``hadm_id``, which is an integer in MIMIC, so it matched nothing there
+    either.
+
+    Every miss then fell into a stub generator whose condition was ``if not
+    results`` rather than "Mongo is down". A perfectly healthy lookup that
+    simply had no match therefore returned five invented patients whose ids
+    were the query with ``00``-``04`` appended, and the patient page resolved
+    the first of them. ``/patient/SIM-22755188-1792857544`` rendered
+    ``demo-1000``. Searching ``TOTAL-NONSENSE-XYZ`` did the same.
     """
     results: List[Dict[str, Any]] = []
+    mongo_ok = False
+    seen: Set[str] = set()
+
     if _HAS_MONGO:
         try:
             mm = MongoManager()
-            coll = mm.get_collection("MIMIC", "admissions")
-            projection = {
-                "_id": 0,
-                "hadm_id": 1,
-                "subject_id": 1,
-                "admittime": 1,
-                "dischtime": 1,
-                "admission_type": 1,
-                "admission_location": 1,
-            }
-            docs: List[Dict[str, Any]] = []
+            mongo_ok = True
+
+            # ── live simulation admissions ───────────────────────────
+            # Ids are strings here ("SIM-<orig>-<epoch>"), so exact and
+            # prefix matching both work directly.
+            sim = mm.get_collection("MIMIC_SIM", "admissions")
+            or_terms: List[Dict[str, Any]] = [
+                {"hadm_id": q},
+                {"hadm_id": {"$regex": f"^{re.escape(q)}", "$options": "i"}},
+            ]
             if q.isdigit():
                 val = int(q)
-                # First try exact match
-                docs = list(
-                    coll.find({"$or": [{"hadm_id": val}, {"subject_id": val}]}, projection).limit(limit)
-                )
-                if not docs:
-                    # Prefix match via $toString aggregation (MIMIC IDs are ints)
-                    pipeline = [
-                        {"$addFields": {
-                            "_hs": {"$toString": "$hadm_id"},
-                            "_ss": {"$toString": "$subject_id"},
-                        }},
-                        {"$match": {"$or": [
-                            {"_hs": {"$regex": f"^{q}"}},
-                            {"_ss": {"$regex": f"^{q}"}},
-                        ]}},
-                        {"$project": projection},
-                        {"$limit": limit},
-                    ]
-                    docs = list(coll.aggregate(pipeline, allowDiskUse=False, maxTimeMS=3000))
-            else:
-                docs = list(coll.find({"$or": [
-                    {"hadm_id": {"$regex": f"^{q}", "$options": "i"}},
-                    {"subject_id": {"$regex": f"^{q}", "$options": "i"}},
-                ]}, projection).limit(limit))
+                # A bare MIMIC id should also find the simulated admissions
+                # replaying it.
+                or_terms += [{"original_hadm_id": val}, {"subject_id": val}]
+            # Currently-admitted admissions are fetched in their own query
+            # rather than sorted out of a general one. A patient can carry
+            # dozens of completed replays — this one has 35 — so relying on
+            # the active record happening to fall inside the fetch window
+            # meant a bare id could still resolve to a closed admission.
+            base = {"$or": or_terms}
+            for match, is_open in (
+                ({**base, "status": {"$ne": "discharged"}}, True),
+                ({**base, "status": "discharged"}, False),
+            ):
+                if len(results) >= limit:
+                    break
+                cursor = sim.find(match, _SEARCH_PROJECTION)
+                if not is_open:
+                    # Most recent closed admission is the useful one.
+                    cursor = cursor.sort("sim_admittime", -1)
+                for doc in cursor.limit(limit * 2):
+                    row = _search_row(doc, live=True)
+                    if row["hadm_id"] and row["hadm_id"] not in seen:
+                        seen.add(row["hadm_id"])
+                        results.append(row)
 
-            for doc in docs:
-                results.append({
-                    "hadm_id": str(doc.get("hadm_id", "")),
-                    "subject_id": str(doc.get("subject_id", "")),
-                    "admission_type": doc.get("admission_type"),
-                    "admission_location": doc.get("admission_location"),
-                    "admittime": _iso(doc.get("admittime")) if doc.get("admittime") else None,
-                    "dischtime": _iso(doc.get("dischtime")) if doc.get("dischtime") else None,
-                })
-        except Exception as exc:
-            logger.debug("patient search mongo failed: %s", exc)
+            # ── historical MIMIC record ──────────────────────────────
+            if len(results) < limit:
+                coll = mm.get_collection("MIMIC", "admissions")
+                docs: List[Dict[str, Any]] = []
+                if q.isdigit():
+                    val = int(q)
+                    docs = list(coll.find(
+                        {"$or": [{"hadm_id": val}, {"subject_id": val}]},
+                        _SEARCH_PROJECTION).limit(limit))
+                    if not docs:
+                        docs = list(coll.aggregate([
+                            {"$addFields": {"_hs": {"$toString": "$hadm_id"},
+                                            "_ss": {"$toString": "$subject_id"}}},
+                            {"$match": {"$or": [{"_hs": {"$regex": f"^{q}"}},
+                                                {"_ss": {"$regex": f"^{q}"}}]}},
+                            {"$project": _SEARCH_PROJECTION},
+                            {"$limit": limit},
+                        ], allowDiskUse=False, maxTimeMS=3000))
+                else:
+                    # A SIM id carries the MIMIC admission it replays; use it
+                    # so the historical record is still reachable.
+                    inner = q.split("-")[1] if q.startswith("SIM-") and "-" in q[4:] else None
+                    if inner and inner.isdigit():
+                        docs = list(coll.find({"hadm_id": int(inner)},
+                                              _SEARCH_PROJECTION).limit(limit))
+                for doc in docs:
+                    row = _search_row(doc, live=False)
+                    if row["hadm_id"] and row["hadm_id"] not in seen:
+                        seen.add(row["hadm_id"])
+                        results.append(row)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("patient_search_failed q=%s: %s", q, exc)
 
-    # Demo fallback so the palette renders something even without Mongo
-    if not results:
+    # A genuine "no such patient" now returns an empty list. Only an actual
+    # storage failure can produce stubs, and only when explicitly enabled.
+    demo = False
+    if not results and not mongo_ok and ALERTS_DEMO_FALLBACK:
+        demo = True
         for i in range(min(limit, 5)):
             results.append({
                 "hadm_id": f"{q}{i:02d}",
@@ -537,9 +608,19 @@ async def search_patients(
                 "admission_location": "EMERGENCY ROOM",
                 "admittime": datetime.now(timezone.utc).isoformat(),
                 "dischtime": None,
+                "status": None,
+                "original_hadm_id": None,
+                "live": False,
+                "is_demo": True,
             })
 
-    return {"query": q, "count": len(results), "results": results}
+    return {
+        "query": q,
+        "count": len(results),
+        "results": results[:limit],
+        "storage_available": mongo_ok,
+        "demo_data": demo,
+    }
 
 
 if __name__ == "__main__":
