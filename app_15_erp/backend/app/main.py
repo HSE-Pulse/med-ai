@@ -14,9 +14,13 @@ Usage::
 from __future__ import annotations
 
 import logging
+import math
+import os
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
+
+import httpx
 
 # ---------------------------------------------------------------------------
 # Path setup — ensure project root is on sys.path so shared/ is importable
@@ -278,8 +282,44 @@ def _seed_erp_overrides_once() -> None:
         logger.warning("erp_seed_failed", extra={"error": str(exc)})
 
 
+def _check_capacity_drift() -> None:
+    """Warn if ERP's capacity table has drifted from the shared constants.
+
+    ERP keeps its own DEPARTMENTS table because it carries things the shared
+    constants do not — bed-type mix, LOS benchmarks, NEDOCS thresholds — and
+    beds are generated from that bed-type breakdown. The capacity figure is
+    therefore duplicated, and a duplicate is a future disagreement: raising a
+    capacity in shared/constants without touching this file is exactly how
+    the bed register came to report "10 of 96 occupied, 30 available".
+
+    The two agree today. This says so out loud at startup, and complains the
+    moment they stop.
+    """
+    try:
+        from shared.constants.hospital import CAPACITIES
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("capacity_drift_check_skipped: %s", exc)
+        return
+    drift = []
+    for name, cfg in DEPARTMENTS.items():
+        mine = int(cfg.get("capacity", 0))
+        shared_val = CAPACITIES.get(name)
+        if shared_val is not None and shared_val != mine:
+            drift.append(f"{name}: erp={mine} shared={shared_val}")
+        bed_types_sum = sum((cfg.get("bed_types") or {}).values())
+        if bed_types_sum != mine:
+            drift.append(f"{name}: bed_types sum to {bed_types_sum}, capacity {mine}")
+    if drift:
+        logger.warning("erp_capacity_drift %s", "; ".join(drift))
+    else:
+        logger.info("erp_capacity_check ok departments=%d total_beds=%d",
+                    len(DEPARTMENTS),
+                    sum(int(c.get("capacity", 0)) for c in DEPARTMENTS.values()))
+
+
 @app.on_event("startup")
 async def _erp_startup() -> None:
+    _check_capacity_drift()
     # Observability
     try:
         from shared.integration.logging_config import setup_logging
@@ -393,66 +433,208 @@ async def list_activity_log(limit: int = Query(100, ge=1, le=1000)) -> BaseRespo
     return BaseResponse(data=docs)
 
 
+# Roles the European Working Time Directive is applied to here. Consultants
+# sit outside the NCHD 48-hour averaging arrangement, so including them would
+# understate the per-post figure for the doctors the limit actually governs.
+NCHD_ROLES = ("registrar", "sho", "intern")
+
+
+def _shift_hours(start: str, end: str) -> float:
+    """Length of a shift in hours, handling the overnight wrap."""
+    try:
+        sh, sm = (int(x) for x in str(start).split(":")[:2])
+        eh, em = (int(x) for x in str(end).split(":")[:2])
+    except (ValueError, AttributeError):
+        return 0.0
+    minutes = (eh * 60 + em) - (sh * 60 + sm)
+    if minutes <= 0:                     # 19:00 -> 07:00
+        minutes += 24 * 60
+    return round(minutes / 60.0, 2)
+
+
 # Item 6.2 — EWTD / NCHD compliance endpoint
 @app.get("/erp/ewtd-compliance", response_model=BaseResponse, tags=["compliance"])
 async def ewtd_compliance() -> BaseResponse:
-    """Compute 7-day rolling hours-worked per NCHD and surface breaches.
+    """Rostered NCHD hours per week against the 48-hour EWTD limit.
 
-    Placeholder computation — backed by ``hospital_erp.schedule`` + staffing
-    templates. In simulation mode produces synthetic but plausible data so
-    dashboards have something to render.
+    Computed from the published roster: each entry in ``weekly_roster``
+    contributes its shift length multiplied by the NCHD headcount rostered
+    onto it. That is a real figure the schedule actually asserts.
+
+    What this deliberately does NOT do is claim per-individual hours. The
+    previous implementation iterated ``STAFF_REGISTRY[dept]`` as though it
+    were a list of staff records; it is a dict of shift -> role -> headcount,
+    so every request raised AttributeError: 'str' object has no attribute
+    'get' and the endpoint returned 500. Fixing the iteration alone would not
+    have made it correct, because the underlying data holds no individuals:
+    there are no NCHD ids, names or worked hours anywhere in this service.
+    The old code synthesised them — ``hours = 40 + hash(id) % 20`` — and then
+    published an ``ewtd_breach`` event for anyone the hash pushed over 48.
+    Fabricated breaches of a statutory working-time limit, broadcast to every
+    other service on the bus, from a GET request.
+
+    Both are gone. Event publication is removed outright: a GET must not have
+    side effects, and a breach signal has to come from real timesheets, not
+    from this. ``per_individual_tracking`` is reported as false with the
+    reason, so a caller can tell the difference between "compliant" and "not
+    measured".
+
+    What is returned is the demand side: hours the roster requires, and the
+    minimum number of NCHDs needed to cover them within the weekly limit.
+    Whether a department employs that many is a question for the
+    establishment record, which this service does not hold.
     """
     from shared.integration.sim_clock import get_sim_time as _sim_now
-    from datetime import timedelta as _td
     now = _sim_now()
+
     report: List[Dict] = []
-    # Aggregate by department using static STAFF_REGISTRY as a proxy.
-    for dept, roster in STAFF_REGISTRY.items():
-        for staff in roster:
-            if staff.get("role", "").lower() not in {"sho", "reg", "registrar", "nchd"}:
-                continue
-            # Synthetic hours: base 40h + offset by department index
-            hours = 40 + (hash(staff.get("id", staff.get("name", ""))) % 20)
-            breach = hours > 48
-            report.append({
-                "department": dept,
-                "nchd_id": staff.get("id"),
-                "nchd_name": staff.get("name"),
-                "hours_last_7d": hours,
-                "breach": breach,
-                "limit": 48,
-            })
-            if breach:
-                try:
-                    from shared.integration.event_bus import get_event_bus
-                    await get_event_bus().publish("ewtd_breach", {
-                        "nchd_id": staff.get("id"),
-                        "nchd_name": staff.get("name"),
-                        "department": dept,
-                        "hours": hours,
-                        "observed_at": now.isoformat(),
-                    }, source_module="erp")
-                except Exception:
-                    pass
-    return BaseResponse(data={"generated_at": now.isoformat(), "report": report})
+    for dept in DEPARTMENTS:
+        # Same builder the /schedule endpoint serves from, so the compliance
+        # figure is computed against exactly the roster the UI displays.
+        sched = _schedule_to_schema(dept).model_dump()
+        if not sched:
+            continue
+        limit = float(sched.get("ewtd_max_weekly_hours") or 48)
+        durations = {}
+        longest = 0.0
+        for sh in sched.get("shifts") or []:
+            hours = _shift_hours(sh.get("start"), sh.get("end"))
+            # A department may define the same shift name at different times
+            # (07:00 and 08:00 starts); keep the longest as the worst case.
+            durations[sh.get("name")] = max(durations.get(sh.get("name"), 0.0), hours)
+            longest = max(longest, hours)
+
+        rostered_hours = 0.0
+        peak_posts = 0
+        for slot in sched.get("weekly_roster") or []:
+            staff = slot.get("staff") or {}
+            heads = sum(int(staff.get(r, 0) or 0) for r in NCHD_ROLES)
+            rostered_hours += heads * durations.get(slot.get("shift"), 0.0)
+            peak_posts = max(peak_posts, heads)
+
+        if peak_posts == 0:
+            continue
+        # Minimum NCHDs needed to cover the rota inside the weekly limit.
+        # This is the honest direction to compute in. Dividing rostered hours
+        # by peak concurrent headcount instead gives "hours per post", which
+        # assumes one doctor works every slot their role appears in — that
+        # produced 127 h/week for ED and 168 for CDU (one person, 24/7) and
+        # flagged all 13 departments as breaching a statutory limit. The
+        # roster says how many hours must be covered; it does not say how many
+        # doctors exist to cover them, so a breach cannot be derived from it.
+        required = math.ceil(rostered_hours / limit) if limit else None
+        report.append({
+            "department": dept,
+            "nchd_posts_peak_concurrent": peak_posts,
+            "rostered_nchd_hours_per_week": round(rostered_hours, 1),
+            "min_nchds_for_compliance": required,
+            "longest_single_shift_hours": longest,
+            "weekly_limit_hours": limit,
+            # Not "breach": establishment headcount is unknown, so whether any
+            # individual exceeds the limit is unknown too.
+            "compliance_determinable": False,
+        })
+    return BaseResponse(data={
+        "generated_at": now.isoformat(),
+        "basis": "roster-derived, establishment level",
+        "per_individual_tracking": False,
+        "per_individual_reason": (
+            "This service holds role headcounts per shift, not individual "
+            "staff records, so hours cannot be attributed to a named NCHD. "
+            "Per-person EWTD monitoring needs a timesheet feed."
+        ),
+        "departments_reported": len(report),
+        "total_rostered_nchd_hours_per_week": round(
+            sum(r["rostered_nchd_hours_per_week"] for r in report), 1),
+        "min_nchds_for_compliance_total": sum(
+            r["min_nchds_for_compliance"] or 0 for r in report),
+        "report": report,
+    })
 
 
 # Item 6.4 — HSE region census
 @app.get("/erp/region-census", response_model=BaseResponse, tags=["compliance"])
 async def region_census() -> BaseResponse:
-    """Aggregate current occupancy by HSE region using department mapping."""
+    """Occupancy by HSE region, read from the live bed register.
+
+    This previously reported ``int(capacity * 0.75)`` for every department,
+    with a comment claiming it was a placeholder "unless ERP has a live
+    value" — no code path ever supplied one, so the endpoint always returned
+    exactly 75% occupancy everywhere. It is named region-census and it was
+    reporting a constant. Clinical chat can now reach every GET endpoint in
+    the estate, so that number was one question away from being quoted as
+    fact.
+
+    Occupancy now comes from bed_management, the service that owns bed state.
+    If it cannot be reached the counts are reported as null and
+    ``occupancy_available`` is false, because "unknown" is an answer and 75%
+    is not.
+    """
     from shared.constants.hospital import region_for_department, HSE_REGIONS
-    by_region: Dict[str, Dict[str, int]] = {r: {"capacity": 0, "occupied": 0} for r in HSE_REGIONS}
+
+    occupied_by_dept: Dict[str, int] = {}
+    operational_cap_by_dept: Dict[str, int] = {}
+    available = False
+    try:
+        base = os.environ.get("BED_MANAGEMENT_URL", "http://localhost:8208")
+        async with httpx.AsyncClient(timeout=10.0, verify=False, trust_env=False) as client:
+            body = (await client.get(f"{base}/beds/summary")).json()
+        rows = body.get("data", body)
+        if isinstance(rows, list):
+            for row in rows:
+                name = row.get("department")
+                if name is not None:
+                    occupied_by_dept[str(name)] = int(row.get("occupied") or 0)
+                    # Take the denominator from the same service as the
+                    # numerator. Occupancy is counted against the operational
+                    # bed inventory, so dividing it by ERP's physical
+                    # establishment mixes two different bed counts — it
+                    # reported 45% where the real figure was 27%.
+                    operational_cap_by_dept[str(name)] = int(row.get("capacity") or 0)
+            available = bool(occupied_by_dept)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("region_census_bed_lookup_failed: %s", exc)
+
+    def _blank() -> Dict[str, Any]:
+        return {"physical_capacity": 0, "operational_capacity": 0,
+                "occupied": 0 if available else None, "departments": []}
+
+    by_region: Dict[str, Dict[str, Any]] = {r: _blank() for r in HSE_REGIONS}
     for name, cfg in DEPARTMENTS.items():
         region = region_for_department(name)
         if region not in by_region:
-            by_region[region] = {"capacity": 0, "occupied": 0}
-        capacity = int(cfg.get("capacity", 0))
-        # Placeholder occupancy: 75% of capacity unless ERP has a live value.
-        occupancy = int(capacity * 0.75)
-        by_region[region]["capacity"] += capacity
-        by_region[region]["occupied"] += occupancy
-    return BaseResponse(data=by_region)
+            by_region[region] = _blank()
+        by_region[region]["physical_capacity"] += int(cfg.get("capacity", 0))
+        by_region[region]["operational_capacity"] += operational_cap_by_dept.get(
+            name, int(cfg.get("capacity", 0)))
+        by_region[region]["departments"].append(name)
+        if available:
+            by_region[region]["occupied"] += occupied_by_dept.get(name, 0)
+
+    for region, row in by_region.items():
+        denom = row["operational_capacity"]
+        row["occupancy_rate"] = (
+            round(row["occupied"] / denom, 3) if available and denom else None
+        )
+
+    return BaseResponse(data={
+        "regions": by_region,
+        "occupancy_available": available,
+        # Every department of this hospital sits in one region; the other five
+        # are structurally empty rather than merely unoccupied, and saying so
+        # stops a reader mistaking a zero for "no patients today".
+        "note": (
+            "This is a single hospital. Regions other than the one it belongs "
+            "to have no departments here, not zero occupancy."
+        ),
+        "capacity_note": (
+            "physical_capacity is this hospital's bed establishment. "
+            "operational_capacity is the denominator the bed register uses "
+            "for the MIMIC replay, where several source care units map onto "
+            "one Irish department — occupancy_rate uses that one, because it "
+            "is what the occupancy count is measured against."
+        ),
+    })
 
 
 @app.post("/reset", response_model=BaseResponse, tags=["system"])
