@@ -17,6 +17,7 @@ import {
   simResearchGovernanceLog,
   erpEWTDCompliance,
   erpRegionCensus,
+  type RegionCensus,
   erpActivityLog,
   erpPatchDepartment,
   journeyHighRisk,
@@ -338,7 +339,7 @@ export function EWTDPanel() {
 
 // --------------------------------------------------------------------------- HSE region census
 export function RegionCensusPanel() {
-  const [data, setData] = useState<Record<string, { capacity: number; occupied: number }> | null>(null);
+  const [data, setData] = useState<RegionCensus | null>(null);
   useEffect(() => {
     let cancelled = false;
     erpRegionCensus().then((r) => {
@@ -348,27 +349,60 @@ export function RegionCensusPanel() {
       cancelled = true;
     };
   }, []);
-  if (!data) return null;
+  if (!data?.regions) return null;
+
+  // Only regions this hospital actually has departments in. The other five
+  // are structurally empty rather than unoccupied, and rendering them as
+  // "0/0 beds (0%)" invited reading a zero as "no patients today".
+  const present = Object.entries(data.regions).filter(
+    ([, v]) => v.physical_capacity > 0,
+  );
+  if (present.length === 0) return null;
+
   return (
     <section className="bg-bg-card border border-border rounded-xl p-4">
-      <h3 className="font-semibold text-white mb-3 flex items-center gap-2">
-        <MapPin className="w-4 h-4 text-emerald-400" /> HSE Health Regions — 6-Region Census (2024)
+      <h3 className="font-semibold text-white mb-1 flex items-center gap-2">
+        <MapPin className="w-4 h-4 text-emerald-400" /> HSE Health Regions — bed census
       </h3>
+      {/* The year names the HSE's six-region restructure, not the data. The
+          heading previously read "6-Region Census (2024)" above live
+          occupancy figures, which reads as data from 2024. */}
+      <p className="text-[11px] text-text-secondary mb-3">
+        Regions per the HSE 2024 six-region structure. Occupancy is live
+        {data.occupancy_available ? "" : " — currently unavailable"}.
+      </p>
       <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
-        {Object.entries(data).map(([region, v]) => {
-          const util = v.capacity > 0 ? Math.round((v.occupied / v.capacity) * 100) : 0;
-          const bar = util > 90 ? "bg-rose-500" : util > 80 ? "bg-amber-500" : "bg-emerald-500";
+        {present.map(([region, v]) => {
+          const util =
+            v.occupancy_rate !== null && v.occupancy_rate !== undefined
+              ? Math.round(v.occupancy_rate * 100)
+              : null;
+          const bar =
+            util === null ? "bg-slate-600"
+              : util > 90 ? "bg-rose-500"
+              : util > 80 ? "bg-amber-500"
+              : "bg-emerald-500";
           return (
             <div key={region} className="bg-bg-primary border border-border rounded p-2">
               <div className="text-xs text-slate-200 font-semibold">{region}</div>
-              <div className="text-xs text-slate-400 mt-0.5">{v.occupied}/{v.capacity} beds ({util}%)</div>
+              <div className="text-xs text-slate-400 mt-0.5">
+                {util === null
+                  ? "occupancy unavailable"
+                  : `${v.occupied}/${v.operational_capacity} beds (${util}%)`}
+              </div>
+              <div className="text-[10px] text-text-muted mt-0.5">
+                {v.physical_capacity} bed establishment · {v.departments.length} departments
+              </div>
               <div className="h-1.5 bg-slate-700 rounded mt-1 overflow-hidden">
-                <div className={`h-full ${bar}`} style={{ width: `${Math.min(100, util)}%` }} />
+                <div className={`h-full ${bar}`} style={{ width: `${Math.min(100, util ?? 0)}%` }} />
               </div>
             </div>
           );
         })}
       </div>
+      {data.capacity_note && (
+        <p className="text-[10px] text-text-muted mt-2">{data.capacity_note}</p>
+      )}
     </section>
   );
 }

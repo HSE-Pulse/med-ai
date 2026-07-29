@@ -915,8 +915,24 @@ export interface EWTDRow {
 export async function erpEWTDCompliance(): Promise<{ generated_at: string; report: EWTDRow[] } | null> {
   return apiEnvelope(`/api/erp/erp/ewtd-compliance`);
 }
-export async function erpRegionCensus(): Promise<Record<string, { capacity: number; occupied: number }> | null> {
-  return apiEnvelope(`/api/erp/erp/region-census`);
+export interface RegionCensusRow {
+  /** This hospital's bed establishment for the region's departments. */
+  physical_capacity: number;
+  /** Denominator the bed register uses; occupancy is measured against this. */
+  operational_capacity: number;
+  /** Null when the bed register could not be reached. */
+  occupied: number | null;
+  occupancy_rate: number | null;
+  departments: string[];
+}
+export interface RegionCensus {
+  regions: Record<string, RegionCensusRow>;
+  occupancy_available: boolean;
+  note?: string;
+  capacity_note?: string;
+}
+export async function erpRegionCensus(): Promise<RegionCensus | null> {
+  return apiEnvelope<RegionCensus>(`/api/erp/erp/region-census`);
 }
 export async function erpActivityLog(limit = 100): Promise<any[] | null> {
   return apiEnvelope<any[]>(`/api/erp/erp/activity-log?limit=${limit}`);

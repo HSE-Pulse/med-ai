@@ -241,6 +241,7 @@ async def generate_note(req: GenerateNoteRequest) -> BaseResponse:
         full_text=f"S: {soap.subjective}\n\nO: {soap.objective}\n\nA: {soap.assessment}\n\nP: {soap.plan}",
         summary=soap.assessment[:200] if soap.assessment else "",
         specialty=req.specialty,
+        department=context.get("department"),
         clinician_role=req.clinician_role,
         entities=entities,
         icd_codes=icd_codes,
@@ -454,14 +455,23 @@ async def list_templates() -> BaseResponse:
 
 async def _fetch_patient_context(patient_id: Optional[int], hadm_id: Optional[int]) -> Dict:
     """Fetch patient context from other modules for note enrichment."""
-    if not patient_id:
-        return {}
-
     client = state.get("service_client")
     if not client:
         return {}
 
-    context = {}
+    context: Dict = {}
+
+    # Department is keyed on the admission, not the patient, so it is resolved
+    # even for a note that carries no subject_id — the early return on a
+    # missing patient_id would otherwise have left those entries unattributed
+    # in the audit log for the same reason as before.
+    dept = await _resolve_department(hadm_id)
+    if dept:
+        context["department"] = dept
+
+    if not patient_id:
+        return context
+
     try:
         summary = await client.patient_journey.get(f"/patient/{patient_id}/summary")
         if summary.get("status") == "ok":
@@ -470,6 +480,50 @@ async def _fetch_patient_context(patient_id: Optional[int], hadm_id: Optional[in
         pass
 
     return context
+
+
+async def _resolve_department(hadm_id) -> Optional[str]:
+    """Ward the admission is currently in, or None if it cannot be determined.
+
+    Notes carry either a simulated admission id ("SIM-<hadm>-<epoch>") or a
+    bare MIMIC integer, so both are handled: the simulated id addresses the
+    digital twin directly, and a numeric id is first mapped to the live
+    admission replaying it.
+
+    Returning None is a real answer — a discharged admission has no current
+    ward — and is preferable to guessing one into a compliance audit log.
+    """
+    if hadm_id in (None, ""):
+        return None
+    client = state.get("service_client")
+    if client is None:
+        return None
+
+    sim_hadm = str(hadm_id)
+    try:
+        if not sim_hadm.startswith("SIM-"):
+            # Numeric MIMIC id: find the admission currently replaying it.
+            body = await client.data_ingestion.get("/active-patients?limit=500")
+            rows = body.get("patients") or body.get("data") or body
+            if isinstance(rows, dict):
+                rows = rows.get("patients") or []
+            match = [
+                r for r in (rows or [])
+                if str(r.get("original_hadm_id")) == sim_hadm
+                or str(r.get("hadm_id")) == sim_hadm
+            ]
+            if not match:
+                return None
+            match.sort(key=lambda r: str(r.get("sim_admittime") or ""), reverse=True)
+            sim_hadm = str(match[0].get("hadm_id"))
+
+        twin = await client.data_ingestion.get(f"/digital-twin/patient/{sim_hadm}")
+        ctx = (twin.get("data") or {}).get("context") or {}
+        dept = ctx.get("current_department") or ctx.get("department")
+        return str(dept) if dept else None
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("department_resolve_failed hadm=%s: %s", hadm_id, exc)
+        return None
 
 
 def _generate_soap_from_text(text: str, note_type: str, context: Dict) -> SOAPNote:

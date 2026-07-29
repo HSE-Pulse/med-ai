@@ -129,6 +129,11 @@ class ClinicalNote(BaseModel):
     full_text: str = ""
     summary: str = ""
     specialty: Optional[str] = None
+    # Ward the patient was in when the note was written. The ERP audit
+    # forwarder has always read note["department"], but no such field existed
+    # on this model, so every entry in the clinical activity log was written
+    # with department: null.
+    department: Optional[str] = None
     clinician_role: str = "consultant"
     entities: Optional[Dict[str, Any]] = None
     icd_codes: Optional[List[Dict[str, Any]]] = None
