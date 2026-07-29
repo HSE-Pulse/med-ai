@@ -22,7 +22,7 @@ from typing import Any
 
 import httpx
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from shared.api.base import create_app
 from pydantic import BaseModel
@@ -56,6 +56,50 @@ engine = ClinicalChatEngine(
 # Live-hospital-state snapshot used to prepend context to every LLM call so
 # ED / bed / alert questions skip the per-request tool fetch.
 sim_context = SimContextBroker()
+
+# Lazily built so importing langgraph never delays service startup, and a
+# missing dependency degrades to "graph endpoint unavailable" rather than
+# taking the whole service down.
+_graph_runner = None
+
+# The graph is now the default path for /chat and /chat/stream. Set
+# CHAT_GRAPH_ENABLED=0 to fall back to the single-shot engine without a
+# rebuild — the legacy code paths are still present and still tested.
+GRAPH_ENABLED = os.environ.get("CHAT_GRAPH_ENABLED", "1").lower() not in ("0", "false", "no")
+
+
+def _graph():
+    """Lazily construct the graph runner; None if langgraph is unavailable."""
+    global _graph_runner
+    if _graph_runner is None:
+        try:
+            from app_06_clinical_chat.backend.graph import ClinicalGraph
+            _graph_runner = ClinicalGraph(engine)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("graph_unavailable, falling back to engine: %s", exc)
+            return None
+    return _graph_runner
+
+
+def _flatten(data: dict | None) -> dict:
+    """Merge the graph's per-tool payloads into the flat shape widgets and
+    prompts expect. Tool results are ``{tool: {report_key: text}}``."""
+    out: dict = {}
+    for payload in (data or {}).values():
+        if isinstance(payload, dict):
+            out.update(payload)
+    return out
+
+
+def _session_params(session_id: str) -> dict:
+    """Patient context the graph should inherit from the session."""
+    memory = engine._get_session(session_id)
+    params = {}
+    if memory.current_patient_id:
+        params["patient_id"] = str(memory.current_patient_id)
+    if memory.current_hadm_id:
+        params["hadm_id"] = str(memory.current_hadm_id)
+    return params
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +242,16 @@ async def _start_sim_context():
         logger.warning("prometheus_metrics_install_failed: %s", exc)
 
     await sim_context.start()
+
+    # Discover every GET endpoint in the estate and keep re-discovering on a
+    # timer, so a route added to any service becomes answerable from chat
+    # without a change here. Failure is non-fatal — the curated intents work
+    # regardless.
+    try:
+        await engine.catalog.start()
+        logger.info("service_catalog_ready %s", engine.catalog.snapshot())
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("service_catalog_start_failed: %s", exc)
     # Pre-warm the main model so the first real request doesn't pay the
     # from-disk load penalty. Issue a single-token generation.
     async def _warm():
@@ -241,6 +295,36 @@ async def list_kafka_events(limit: int = 100):
 @app.on_event("shutdown")
 async def _stop_sim_context():
     await sim_context.stop()
+    try:
+        await engine.catalog.stop()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("service_catalog_stop_failed: %s", exc)
+
+
+@app.get("/chat/capabilities", tags=["chat"])
+async def chat_capabilities(q: str | None = None):
+    """What chat can currently reach.
+
+    Without ``q`` this reports the catalogue summary — how many endpoints
+    were discovered, per service, and which services did not answer. With
+    ``q`` it shows which endpoints a given question would be matched
+    against, which is the quickest way to see why an answer came from where
+    it did.
+    """
+    snap = engine.catalog.snapshot()
+    if q:
+        snap["matches"] = [
+            {"score": score, "endpoint": ep.key, "summary": ep.summary}
+            for score, ep in engine.catalog.search_scored(q, limit=10)
+        ]
+    return {"status": "ok", "data": snap, "error": None}
+
+
+@app.post("/chat/capabilities/refresh", tags=["chat"])
+async def chat_capabilities_refresh():
+    """Re-discover endpoints immediately instead of waiting for the timer."""
+    count = await engine.catalog.refresh()
+    return {"status": "ok", "data": {"endpoint_count": count}, "error": None}
 
 # ── Request / Response schemas ───────────────────────────────────────────
 
@@ -265,6 +349,11 @@ class ChatResponse(BaseModel):
     alerts: list[dict] = []
     pending_action: dict | None = None
     session: SessionInfo | None = None
+    # Populated by the graph pipeline. `verified` is None when there was no
+    # retrieved data to check against (a clinical-knowledge answer).
+    verified: bool | None = None
+    unverified_figures: list[str] = []
+    sources: list[str] = []
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────
@@ -274,12 +363,53 @@ class ChatResponse(BaseModel):
 async def chat(req: ChatRequest):
     """Process a clinical chat message and return a structured response."""
     user_model = None if req.model == "auto" else req.model
-    result = await engine.chat(
-        req.message,
-        req.history,
-        user_model=user_model,
-        session_id=req.session_id,
-    )
+
+    runner = _graph() if GRAPH_ENABLED else None
+    if runner is not None:
+        final = await runner.run(
+            req.message, session_id=req.session_id,
+            history=req.history, params=_session_params(req.session_id),
+        )
+        verdict = final.get("verdict") or {}
+        answer = final.get("answer", "")
+        problems = verdict.get("problems") or []
+        if verdict.get("ok") is False and problems:
+            # Revision was exhausted and figures still are not in the source.
+            # Flag them inline rather than presenting them as established.
+            answer += (
+                "\n\n> **Unverified figures:** " + ", ".join(str(p) for p in problems[:8])
+                + " — these do not appear in the retrieved data and should not be "
+                  "relied on."
+            )
+        flat = _flatten(final.get("data"))
+        try:
+            widgets = engine._build_widgets(final.get("intent"), flat) or []
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("graph_widgets_failed: %s", exc)
+            widgets = []
+        try:
+            alerts = engine._check_alerts(flat, final.get("intent")) or []
+        except Exception:  # noqa: BLE001
+            alerts = []
+        result = {
+            "thinking": [f"Step {i}: {n}" for i, n
+                         in enumerate(final.get("reasoning", []), 1)],
+            "response": answer,
+            "widgets": widgets,
+            "alerts": alerts,
+            "pending_action": None,
+            "session": engine._session_info(engine._get_session(req.session_id)),
+            "verified": verdict.get("ok"),
+            "unverified_figures": [str(p) for p in problems],
+            "sources": sorted((final.get("data") or {}).keys()),
+        }
+    else:
+        result = await engine.chat(
+            req.message,
+            req.history,
+            user_model=user_model,
+            session_id=req.session_id,
+        )
     # Persist the exchange to the shared ConversationBuffer so
     # /chat/{session_id}/history returns real turns. Previously the legacy
     # /chat handler answered the request but never wrote to the buffer, so
@@ -294,6 +424,13 @@ async def chat(req: ChatRequest):
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("legacy_chat_buffer_append_failed: %s", exc)
+
+    # Persist patient context so it survives a restart. Best-effort: a failed
+    # write must not fail an answer the clinician already has.
+    try:
+        await engine.save_session(req.session_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("session_persist_failed: %s", exc)
     return result
 
 
@@ -323,6 +460,37 @@ async def chat_fast(req: ChatRequest):
             logger.warning("fast_buffer_append_failed: %s", exc)
         return {**entry, "cache_hit": True}
     return {"cache_hit": False, "reason": "no_match"}
+
+
+@app.post("/chat/graph", tags=["chat"])
+async def chat_graph(req: ChatRequest):
+    """Explicit graph endpoint, kept for inspection and A/B comparison.
+
+    /chat now uses the same pipeline; this one additionally returns the plan,
+    the sources and the verification verdict, which is what you want when
+    asking *why* an answer came out the way it did.
+    """
+    runner = _graph()
+    if runner is None:
+        raise HTTPException(status_code=503, detail="graph pipeline unavailable")
+    final = await runner.run(
+        req.message, session_id=req.session_id,
+        history=req.history, params=_session_params(req.session_id),
+    )
+    verdict = final.get("verdict") or {}
+    return {
+        "status": "ok",
+        "data": {
+            "response": final.get("answer", ""),
+            "reasoning": final.get("reasoning", []),
+            "plan": final.get("plan", []),
+            "sources": sorted((final.get("data") or {}).keys()),
+            "verified": verdict.get("ok"),
+            "unverified_figures": verdict.get("problems") or [],
+            "errors": final.get("errors", []),
+        },
+        "error": None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -414,29 +582,78 @@ async def chat_stream(req: ChatRequest):
 
         first_token_t: float | None = None
         accumulated_response: list[str] = []
-        try:
-            async for ev, payload in engine.chat_stream(
-                augmented,
-                req.history,
-                user_model=user_model,
-                session_id=req.session_id,
-            ):
-                if ev == "final":
-                    # Engine's internal marker after the stream is flushed.
-                    # Capture the full response for buffer persistence.
-                    if isinstance(payload, dict):
-                        txt = payload.get("response") or ""
+
+        runner = _graph() if GRAPH_ENABLED else None
+        if runner is not None:
+            # Graph path: plan -> retrieve (concurrent) -> synthesize -> verify.
+            # Progress events flow as each node finishes; the answer is emitted
+            # only after verification, so an unverified figure is never shown
+            # and then retracted.
+            source_label = "graph"
+            try:
+                yield _sse("context", engine._session_info(
+                    engine._get_session(req.session_id)))
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                async for ev, payload in runner.stream_events(
+                    augmented,
+                    session_id=req.session_id,
+                    history=req.history,
+                    params=_session_params(req.session_id),
+                ):
+                    if ev == "final":
+                        txt = (payload or {}).get("response") or ""
                         if txt and not accumulated_response:
                             accumulated_response.append(txt)
-                    continue
-                if ev == "token":
-                    if first_token_t is None:
-                        first_token_t = time.monotonic()
-                    if isinstance(payload, str):
-                        accumulated_response.append(payload)
-                yield _sse(ev, payload)
-        except Exception as exc:  # noqa: BLE001
-            yield _sse("error", f"chat engine failed: {exc}")
+                        try:
+                            widgets = engine._build_widgets(
+                                payload.get("intent"), _flatten(payload.get("data")))
+                            if widgets:
+                                yield _sse("widgets", widgets)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.debug("graph_widgets_failed: %s", exc)
+                        yield _sse("verification", {
+                            "verified": payload.get("verified"),
+                            "unverified_figures": payload.get("unverified_figures"),
+                            "sources": payload.get("sources"),
+                            "plan": payload.get("plan"),
+                        })
+                        continue
+                    if ev == "token":
+                        if first_token_t is None:
+                            first_token_t = time.monotonic()
+                        if isinstance(payload, str):
+                            accumulated_response.append(payload)
+                    yield _sse(ev, payload)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("graph_stream_failed: %s", exc)
+                yield _sse("error", f"graph pipeline failed: {exc}")
+        else:
+            source_label = "engine"
+            try:
+                async for ev, payload in engine.chat_stream(
+                    augmented,
+                    req.history,
+                    user_model=user_model,
+                    session_id=req.session_id,
+                ):
+                    if ev == "final":
+                        # Engine's internal marker after the stream is flushed.
+                        # Capture the full response for buffer persistence.
+                        if isinstance(payload, dict):
+                            txt = payload.get("response") or ""
+                            if txt and not accumulated_response:
+                                accumulated_response.append(txt)
+                        continue
+                    if ev == "token":
+                        if first_token_t is None:
+                            first_token_t = time.monotonic()
+                        if isinstance(payload, str):
+                            accumulated_response.append(payload)
+                    yield _sse(ev, payload)
+            except Exception as exc:  # noqa: BLE001
+                yield _sse("error", f"chat engine failed: {exc}")
 
         # Persist the exchange to the ConversationBuffer so
         # GET /chat/{session_id}/history (and the UI's "View session buffer"
@@ -458,9 +675,14 @@ async def chat_stream(req: ChatRequest):
             except Exception as exc:  # noqa: BLE001
                 logger.warning("conversation_buffer_append_failed: %s", exc)
 
+        try:
+            await engine.save_session(req.session_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("session_persist_failed: %s", exc)
+
         done_t = time.monotonic()
         yield _sse("done", {
-            "source": "engine",
+            "source": source_label,
             "latency_ms": int((done_t - start) * 1000),
             "ttft_ms": int((first_token_t - start) * 1000) if first_token_t else None,
         })
@@ -558,9 +780,16 @@ async def clear_patient_context(session_id: str):
 
 @app.get("/session/{session_id}")
 async def get_session(session_id: str):
-    """Retrieve current session state (for debugging / UI display)."""
-    if session_id in engine.sessions:
-        mem = engine.sessions[session_id]
+    """Retrieve current session state (for debugging / UI display).
+
+    Restores from storage rather than reading the in-process dict, so
+    reloading the page after a restart still shows the patient the
+    conversation is about — which is the whole point of persisting it.
+    """
+    known = session_id in engine.sessions
+    mem = engine._get_session(session_id)
+    restored = not known and mem.current_patient_id is not None
+    if known or mem.current_patient_id is not None or mem.conversation_topics:
         return {
             "session_id": session_id,
             "patient_id": mem.current_patient_id,
@@ -569,6 +798,7 @@ async def get_session(session_id: str):
             "conversation_topics": mem.conversation_topics,
             "pending_action": mem.pending_action,
             "cached_patients": list(mem.patient_data_cache.keys()),
+            "restored_from_store": restored,
         }
     return {"session_id": session_id, "status": "not_found"}
 

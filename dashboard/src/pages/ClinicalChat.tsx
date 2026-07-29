@@ -1006,6 +1006,35 @@ Try asking: "Look up patient 10312052" or "Triage a patient with HR 42, SpO2 82,
                 setMessages((prev) => prev.map((m) =>
                   m.id === assistantId ? { ...m, thinking: [...(m.thinking ?? []), String(payload)] } : m
                 ));
+              } else if (ev === "sources") {
+                // Which hospital services the answer was built from. The
+                // graph pipeline can consult several for one question, so
+                // naming them is the difference between "it said 152" and
+                // "it read 152 from TrolleyGAR".
+                const srcs = Array.isArray(payload) ? payload : [];
+                if (srcs.length) {
+                  setMessages((prev) => prev.map((m) =>
+                    m.id === assistantId
+                      ? { ...m, thinking: [...(m.thinking ?? []), `Sources: ${srcs.join(", ")}`] }
+                      : m
+                  ));
+                }
+              } else if (ev === "verification") {
+                // Every figure in the answer is checked against the retrieved
+                // data. Surfacing the verdict is the point — a silent check
+                // the reader cannot see is not a safeguard they can trust.
+                const bad = Array.isArray(payload?.unverified_figures)
+                  ? payload.unverified_figures : [];
+                const note = payload?.verified === true
+                  ? "✓ Verified: every figure appears in the retrieved data."
+                  : payload?.verified === false
+                    ? `⚠️ Unverified figures: ${bad.join(", ") || "see answer"}`
+                    : "Answered from clinical knowledge — no data to verify against.";
+                setMessages((prev) => prev.map((m) =>
+                  m.id === assistantId
+                    ? { ...m, thinking: [...(m.thinking ?? []), note] }
+                    : m
+                ));
               } else if (ev === "context") {
                 if (payload && (payload.patient_id || payload.hadm_id)) {
                   setSessionContext(payload);

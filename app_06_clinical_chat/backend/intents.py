@@ -14,9 +14,39 @@ INTENT_PATTERNS = {
     "lab_check": r"lab|blood\s+work|cbc|bmp|troponin|creatinine|wbc|hemoglobin|platelet|glucose",
     "vitals": r"vital|heart\s+rate|blood\s+pressure|spo2|temperature|respiratory\s+rate|bp\b|hr\b",
     "medication_review": r"medication|drug|prescription|antibiotic|dose|pharma|medicine",
-    "cohort_stats": r"cohort|population|statistics|how\s+many|distribution|aggregate|overall",
+    # "how many" used to live here, which sent "how many patients are in ED"
+    # to the oncology cohort endpoint. That endpoint needs a dataset artifact
+    # this deployment doesn't build, so it 404s and the question died. Bare
+    # "how many" now belongs to hospital_status; cohort_stats keeps the
+    # genuinely cohort-level vocabulary.
+    "cohort_stats": r"cohort|population\s+stat|distribution|aggregate|overall\s+stat",
     "note_analysis": r"note|clinical\s+note|analyze.*note|nlp|extract.*from.*note",
-    "sofa": r"sofa|sepsis|organ\s+failure|deteriorat",
+    "sofa": (r"sofa|sepsis|organ\s+failure|deteriorat"
+             r"|sickest|most\s+unwell|highest\s+risk|most\s+critical"),
+    # Live national ED-crowding figures. "INMO" is the Irish Nurses and
+    # Midwives Organisation, whose Trolley Watch is the figure Irish media
+    # quote daily; TrolleyGAR is the HSE's own equivalent. Without this
+    # pattern the question fell through to general_clinical, which fetches
+    # nothing and leaves the model to invent numbers — it answered "42 new
+    # patients admitted today" and, in its reasoning, decided INMO stood for
+    # "Indian National Medical Organisation".
+    # Live census of THIS hospital — distinct from trolley_watch, which is the
+    # national published figure. "How many patients are in ED" is the most
+    # basic question the system can be asked and had no intent at all.
+    "hospital_status": (
+        r"how\s+many\s+patients|how\s+busy|current\s+census|\bcensus\b"
+        r"|occupancy|bed\s+(availab|occupan|state|status)|available\s+beds"
+        r"|free\s+beds|empty\s+beds"
+        r"|(patients?|people|anyone)\s+(are\s+|is\s+)?(currently\s+)?in\s+(the\s+)?"
+        r"(ed|a\&e|icu|hdu|mau|amau|sau|cdu|ward|hospital|department)"
+        r"|(ed|icu|hdu|mau|hospital)\s+(census|status|occupancy|load)"
+        r"|nedocs|crowding\s+level|how\s+full"
+    ),
+    "trolley_watch": (
+        r"inmo|trolley\s*gar|trolleygar|trolley|daily\s+snapshot"
+        r"|overcrowd|ed\s+crowding|surge\s+capacity|delayed\s+transfer"
+        r"|patients?\s+waiting\s+for\s+(a\s+)?bed|national\s+total"
+    ),
 }
 
 
@@ -47,7 +77,44 @@ def detect_intent(message: str) -> dict:
     has_numbers = bool(re.search(r"\b\d{5,}\b", message_lower))
     has_imperative = bool(re.search(r"^(show|check|get|look|find|fetch|pull|run|predict|assess|triage\b)", message_lower))
 
-    if is_knowledge and not has_numbers and not has_imperative:
+    # A live-data question can be phrased like a knowledge question
+    # ("what's the INMO daily snapshot for today"). Asking for today's
+    # published figures is a DATA request, so it must not be short-circuited
+    # into general_clinical — that is exactly how it ended up hallucinated.
+    LIVE_DATA_PATTERNS = [
+        r"\binmo\b", r"trolley", r"\btoday\b", r"\bcurrent(ly)?\b",
+        r"\bright\s+now\b", r"\blatest\b", r"\bnow\b", r"daily\s+snapshot",
+        r"how\s+many\s+patients", r"\bcensus\b", r"how\s+busy", r"how\s+full",
+    ]
+    wants_live = any(re.search(p, message_lower) for p in LIVE_DATA_PATTERNS)
+
+    # A question about a SPECIFIC patient is a data request even when it opens
+    # like a knowledge question. "Show me his vitals" already routed to vitals
+    # because of the imperative; "what are his vital signs" — the way a
+    # clinician actually asks — fell through to general_clinical and answered
+    # with a textbook description of vital signs instead of the patient's.
+    PATIENT_REFERENCE_PATTERNS = [
+        r"\b(his|her|hers|their|theirs)\b",
+        r"\bthe\s+patient'?s?\b",
+        r"\b(this|that|the\s+above)\s+patient\b",
+        r"\bmy\s+patient\b",
+        r"\bpatient\s+\d+",
+    ]
+    refers_to_patient = any(re.search(p, message_lower) for p in PATIENT_REFERENCE_PATTERNS)
+
+    # ...unless it is explicitly asking what a value MEANS rather than what it
+    # is. "What is the normal range for his heart rate" is a reference-range
+    # question that happens to mention a patient, not a request for his obs.
+    STRONG_KNOWLEDGE = (
+        r"normal\s+range|reference\s+range|\bdefinition\b|\bcriteria\b"
+        r"|guideline|protocol|\bmean(s|ing)?\b|difference\s+between"
+        r"|what\s+counts\s+as|how\s+is\s+\w+\s+calculated"
+    )
+    is_strong_knowledge = bool(re.search(STRONG_KNOWLEDGE, message_lower))
+    wants_patient_data = refers_to_patient and not is_strong_knowledge
+
+    if (is_knowledge and not has_numbers and not has_imperative
+            and not wants_live and not wants_patient_data):
         return {
             "intent": "general_clinical",
             "params": {},
@@ -68,6 +135,13 @@ def detect_intent(message: str) -> dict:
         "note_analysis": 2,
         "pathway": 2,
         "risk_assessment": 2,
+        # Explicit and unambiguous — if someone says INMO or trolley they
+        # want the live national figures, not a generic clinical answer.
+        "trolley_watch": 10,
+        # Beats cohort_stats/vitals on census questions, stays below
+        # trolley_watch so "how many patients are on trolleys" still routes
+        # to the national figure rather than this hospital's census.
+        "hospital_status": 8,
     }
 
     for intent, pattern in INTENT_PATTERNS.items():
@@ -99,6 +173,27 @@ def detect_intent(message: str) -> dict:
     if hadm_match:
         params["hadm_id"] = hadm_match.group(1)
 
+    # Department mentioned in the question ("...in ICU", "on the surgery ward"),
+    # used to scope cohort queries such as "who has the highest SOFA in ICU".
+    DEPARTMENT_ALIASES = {
+        "ED": r"\b(ed|a&e|a\s*and\s*e|emergency\s+department|emergency)\b",
+        "ICU": r"\b(icu|intensive\s+care|critical\s+care)\b",
+        "HDU": r"\b(hdu|high\s+dependency)\b",
+        "MAU": r"\b(mau|medical\s+assessment)\b",
+        "AMAU": r"\b(amau|acute\s+medical\s+assessment)\b",
+        "SAU": r"\b(sau|surgical\s+assessment)\b",
+        "CDU": r"\b(cdu|clinical\s+decision)\b",
+        "Medicine": r"\bmedicine\b|\bmedical\s+ward\b",
+        "Surgery": r"\bsurgery\b|\bsurgical\s+ward\b",
+        "Cardiology": r"\bcardiology\b|\bcardiac\s+ward\b",
+        "Respiratory": r"\brespiratory\s+ward\b|\brespiratory\s+unit\b",
+        "Orthopaedics": r"\borthopaed|\borthoped",
+    }
+    for _dept, _pat in DEPARTMENT_ALIASES.items():
+        if re.search(_pat, message_lower):
+            params["department"] = _dept
+            break
+
     # Extract vital signs from the message
     vitals = _extract_vitals(message_lower)
     if vitals:
@@ -112,7 +207,7 @@ def detect_intent(message: str) -> dict:
         params["note_text"] = note_match.group(1).strip()
 
     reasoning = (
-        f"Fallback regex detection matched: {', '.join(match_details) if match_details else 'none'}"
+        f"Rule-based intent match: {', '.join(match_details) if match_details else 'none'}"
     )
 
     return {

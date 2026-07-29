@@ -15,6 +15,13 @@ ENV APP_NAME=${APP} \
 # Each app's source. Tests, pycache, and notebooks are excluded via .dockerignore.
 COPY ${APP}/ ./${APP}/
 
+# Optional per-app dependencies. Anything only one service needs lives in
+# app_NN/requirements.txt rather than the shared base image, so adding a
+# library to one service doesn't force a rebuild of the other eighteen.
+RUN if [ -f ./${APP}/requirements.txt ]; then \
+      pip install --no-cache-dir -r ./${APP}/requirements.txt; \
+    fi
+
 EXPOSE ${PORT}
 
 # Use shell form so $APP_MODULE / $APP_PORT expand at run time; this

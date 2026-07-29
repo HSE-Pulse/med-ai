@@ -9,12 +9,14 @@ Agentic capabilities:
   4. Proactive alerts (vital deterioration detection)
 """
 
+import asyncio
 import json
 import logging
 import os
 import re
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +29,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from app_06_clinical_chat.backend.intents import detect_intent
+from app_06_clinical_chat.backend.service_catalog import ServiceCatalog
 
 logger = logging.getLogger("clinical_chat")
 
@@ -90,17 +93,240 @@ INTENT_SYSTEM_PROMPT_TEMPLATE = _INTENT_PROMPT_BASE
 RESPONSE_SYSTEM_PROMPT = (
     "You are a clinical AI assistant. Given data from the hospital system, provide a "
     "clear, concise clinical summary. Be specific with numbers and values from the data. "
-    "Suggest follow-up actions when appropriate. Write in a professional medical tone."
+    "Suggest follow-up actions when appropriate. Write in a professional medical tone.\n\n"
+    "Any number describing the CURRENT state of this hospital or its patients — counts, "
+    "censuses, waits, occupancy — must come from the 'Hospital system data' block. Never "
+    "estimate one, illustrate with a made-up one, or carry one over from an earlier "
+    "message. If a live figure the question needs is absent, say plainly that it is "
+    "unavailable — that is a correct answer, an invented number is not.\n"
+    "This restricts live figures ONLY. When a question asks for clinical knowledge — "
+    "what a condition is, how it is managed, what a score measures, normal ranges, "
+    "guidelines — answer it fully from established medical knowledge, whether or not "
+    "any data block is present. Do not refuse a knowledge question for lack of data, "
+    "and do not preface such an answer with remarks about the hospital data.\n"
+    "Glossary — expand these acronyms only as given, never guess:\n"
+    "INMO = Irish Nurses and Midwives Organisation, which publishes Trolley Watch.\n"
+    "TrolleyGAR = the HSE Special Delivery Unit's daily count of admitted patients "
+    "waiting on trolleys.\n"
+    "NEDOCS = National Emergency Department Overcrowding Scale (a crowding score; it "
+    "is NOT an early warning score).\n"
+    "PET = Patient Experience Time, the 6-hour ED target.\n"
+    "DToC = delayed transfers of care."
+)
+
+def _wants_cohort_ranking(params: dict) -> bool:
+    """A SOFA question with no patient is a cohort question."""
+    return not params.get("patient_id")
+
+
+def _pick_admission(admissions):
+    """Choose the admission a follow-up question is about.
+
+    Prefer the one flagged active; otherwise the most recent by admittime.
+    The previous code took admissions[0] on the assumption it is the current
+    stay. That happens to hold for the replay, but nothing guarantees it —
+    and picking the wrong element means answering "what are his vitals" from
+    a discharged admission years earlier, which reads as current.
+    """
+    if not admissions:
+        return None
+    active = [a for a in admissions if a.get("is_active")]
+    if active:
+        return active[0]
+    dated = [a for a in admissions if a.get("admittime")]
+    if dated:
+        return max(dated, key=lambda a: str(a.get("admittime")))
+    return admissions[0]
+
+
+def _unwrap(payload):
+    """Return the useful body of a service response.
+
+    Services answer with a ``{"status", "data", "error"}`` envelope, and
+    _fetch_patient_lookup stores that envelope verbatim under "summary".
+    Callers reading ``summary["admissions"]`` therefore always got None: the
+    patient's name was never cached and the current admission was never
+    picked up, which is why a follow-up question about a patient stalled
+    asking for an admission id the system had already fetched. Unwrapping
+    here rather than in the fetcher keeps the payload handed to the model
+    unchanged.
+    """
+    if isinstance(payload, dict) and "data" in payload and (
+        "status" in payload or "error" in payload
+    ):
+        inner = payload.get("data")
+        if isinstance(inner, (dict, list)):
+            return inner
+    return payload
+
+
+def _render_data(data: dict) -> str:
+    """Serialise fetched data for the prompt.
+
+    Values under a ``*_report`` key are already laid out as plain text by the
+    fetcher; JSON-encoding them would bury the table under escaped newlines
+    and quotes, which is precisely the shape the response model misreads.
+    Those pass through verbatim; everything else is JSON as before.
+    """
+    pre = {k: v for k, v in data.items() if k.endswith("_report") and isinstance(v, str)}
+    rest = {k: v for k, v in data.items() if k not in pre}
+    parts = list(pre.values())
+    if rest:
+        parts.append(json.dumps(rest, indent=2, default=str))
+    return "\n\n".join(parts)
+
+
+NO_LIVE_DATA_INSTRUCTION = (
+    "\n\nNo live data was returned for this question. State that the current figures "
+    "could not be retrieved and say what you would need. Do NOT supply example, "
+    "approximate or remembered numbers — no patient counts, no trolley counts, no "
+    "admission figures of any kind."
 )
 
 
 # ── Session Memory ──────────────────────────────────────────────────────
 
+SESSION_COLL = "chat_sessions"
+SESSION_TTL_DAYS = int(os.environ.get("CHAT_SESSION_TTL_DAYS", "7"))
+# The cached patient summaries are the bulky part of a session and are
+# rebuildable from patient_journey, so only the active patient's entry is
+# persisted. Without a bound, a long-lived session grows the document until
+# the write fails and nothing is saved at all.
+SESSION_CACHE_MAX_BYTES = 64_000
+
+
+class SessionStore:
+    """Mongo-backed persistence for :class:`SessionMemory`.
+
+    Session state used to live only in ``ClinicalChatEngine.sessions``, a
+    process-local dict. Every restart — a deploy, a crash, a config change —
+    silently forgot which patient the clinician was discussing, so the next
+    "what are his vitals" asked them to identify the patient again. That is
+    the same defect class that emptied the waiting list on restart, and the
+    fix is the same: write it down.
+
+    Degrades to memory-only if Mongo is unreachable; losing durability is
+    survivable, refusing to answer is not.
+    """
+
+    def __init__(self):
+        self._coll = None
+        self._tried = False
+
+    def _collection(self):
+        if self._tried:
+            return self._coll
+        self._tried = True
+        try:
+            from shared.db.mongo import MongoManager
+            mgr = MongoManager()
+            coll = mgr.client["MIMIC_SIM"][SESSION_COLL]
+            # Mongo expires documents itself, so abandoned sessions do not
+            # accumulate and no sweeper job is needed.
+            try:
+                coll.create_index("updated_at", expireAfterSeconds=SESSION_TTL_DAYS * 86400)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("session_ttl_index_skipped: %s", exc)
+            self._coll = coll
+            logger.info("session_store_ready coll=%s ttl_days=%d",
+                        SESSION_COLL, SESSION_TTL_DAYS)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("session_store_unavailable, sessions are in-memory "
+                           "only: %s", exc)
+            self._coll = None
+        return self._coll
+
+    # ── load ─────────────────────────────────────────────────────────
+    def load(self, session_id: str):
+        """Read one session. Called only on a cache miss, so a single
+        indexed _id lookup — cheap enough to do inline."""
+        coll = self._collection()
+        if coll is None:
+            return None
+        try:
+            doc = coll.find_one({"_id": session_id}, {"_id": 0, "updated_at": 0})
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("session_load_failed id=%s: %s", session_id, exc)
+            return None
+        if not doc:
+            return None
+        try:
+            mem = SessionMemory(
+                current_patient_id=doc.get("current_patient_id"),
+                current_hadm_id=doc.get("current_hadm_id"),
+                current_patient_name=doc.get("current_patient_name"),
+                patient_data_cache=doc.get("patient_data_cache") or {},
+                conversation_topics=doc.get("conversation_topics") or [],
+                alert_watchlist=doc.get("alert_watchlist") or [],
+                pending_action=doc.get("pending_action"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("session_decode_failed id=%s: %s", session_id, exc)
+            return None
+        logger.info("session_restored id=%s patient=%s hadm=%s",
+                    session_id, mem.current_patient_id, mem.current_hadm_id)
+        return mem
+
+    # ── save ─────────────────────────────────────────────────────────
+    def _to_doc(self, memory) -> dict:
+        cache = memory.patient_data_cache or {}
+        pid = str(memory.current_patient_id) if memory.current_patient_id else None
+        trimmed = {}
+        if pid and pid in cache:
+            entry = cache[pid]
+            try:
+                if len(json.dumps(entry, default=str)) <= SESSION_CACHE_MAX_BYTES:
+                    trimmed = {pid: entry}
+            except (TypeError, ValueError):
+                trimmed = {}
+        return {
+            "current_patient_id": memory.current_patient_id,
+            "current_hadm_id": memory.current_hadm_id,
+            "current_patient_name": memory.current_patient_name,
+            "patient_data_cache": trimmed,
+            "conversation_topics": (memory.conversation_topics or [])[-20:],
+            "alert_watchlist": (memory.alert_watchlist or [])[-20:],
+            "pending_action": memory.pending_action,
+            "updated_at": datetime.now(timezone.utc),
+        }
+
+    def save(self, session_id: str, memory) -> bool:
+        coll = self._collection()
+        if coll is None:
+            return False
+        try:
+            coll.replace_one({"_id": session_id},
+                             {"_id": session_id, **self._to_doc(memory)},
+                             upsert=True)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("session_save_failed id=%s: %s", session_id, exc)
+            return False
+
+    def delete(self, session_id: str) -> bool:
+        coll = self._collection()
+        if coll is None:
+            return False
+        try:
+            coll.delete_one({"_id": session_id})
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("session_delete_failed id=%s: %s", session_id, exc)
+            return False
+
+
 @dataclass
 class SessionMemory:
     """Persists patient context across messages within a session."""
     current_patient_id: int | None = None
-    current_hadm_id: int | None = None
+    # Stored as a STRING. Simulated admissions carry ids like
+    # "SIM-27705504-1791905712"; this field used to be an int and every
+    # assignment went through int(), which threw ValueError into a bare
+    # `except: pass`. The result was that a simulated admission could never
+    # populate it, so "what are his vital signs" always stalled asking the
+    # user for an admission id the system already knew. Every consumer
+    # already stringifies this value.
+    current_hadm_id: str | None = None
     current_patient_name: str | None = None
     patient_data_cache: dict = field(default_factory=dict)   # patient_id -> summary data
     conversation_topics: list[str] = field(default_factory=list)  # recent intents
@@ -156,6 +382,10 @@ class ClinicalChatEngine:
             "ed": os.environ.get("ED_TRIAGE_URL", "http://localhost:8201"),
             "oncology": os.environ.get("ONCOLOGY_AI_URL", "http://localhost:8204"),
             "journey": os.environ.get("PATIENT_JOURNEY_URL", "http://localhost:8205"),
+            "trolley": os.environ.get("TROLLEY_WATCH_URL", "http://localhost:8216"),
+            "sim": os.environ.get("DATA_INGESTION_URL", "http://localhost:8207"),
+            "beds": os.environ.get("BED_MANAGEMENT_URL", "http://localhost:8208"),
+            "ed_flow": os.environ.get("ED_FLOW_URL", "http://localhost:8214"),
         }
         # GPT for intent detection (fast, accurate, understands knowledge vs data questions)
         self.openai_client = None
@@ -169,14 +399,48 @@ class ClinicalChatEngine:
                 logger.info("OpenAI GPT enabled for intent detection")
             except Exception as exc:
                 logger.warning("Failed to initialize OpenAI client: %s", exc)
-        # Session memory store: session_id -> SessionMemory
+        # Session memory store: session_id -> SessionMemory. Backed by Mongo
+        # so patient context survives a restart; this dict is the hot cache.
         self.sessions: dict[str, SessionMemory] = {}
+        self.session_store = SessionStore()
+
+        # Live endpoint catalogue. Curated intents above still win — they
+        # pre-render their data and are more reliable — but anything they
+        # don't cover can now be reached generically, and the catalogue
+        # re-discovers itself on a timer so new routes appear without a
+        # code change here.
+        self.catalog = ServiceCatalog()
 
     def _get_session(self, session_id: str) -> SessionMemory:
-        """Get or create a session memory for the given session_id."""
+        """Get, restore, or create the memory for a session.
+
+        A miss falls through to Mongo before creating a blank one, so a
+        conversation picks up its patient context after a restart instead of
+        asking the clinician to identify the patient again. The read is a
+        single indexed _id lookup and happens once per session, so it is done
+        inline; saves are the frequent operation and those go to a thread.
+        """
         if session_id not in self.sessions:
-            self.sessions[session_id] = SessionMemory()
+            restored = self.session_store.load(session_id)
+            self.sessions[session_id] = restored or SessionMemory()
         return self.sessions[session_id]
+
+    async def save_session(self, session_id: str) -> bool:
+        """Persist a session. Called at the end of a turn.
+
+        PyMongo is synchronous; writing inline would stall the event loop for
+        every other request in flight — the same starvation that wedged the
+        simulation engine earlier in this project.
+        """
+        memory = self.sessions.get(session_id)
+        if memory is None:
+            return False
+        try:
+            return await asyncio.to_thread(
+                self.session_store.save, session_id, memory)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("session_save_dispatch_failed id=%s: %s", session_id, exc)
+            return False
 
     def clear_patient(self, session_id: str) -> dict:
         """Forget only the active patient for this session.
@@ -187,9 +451,11 @@ class ClinicalChatEngine:
         chat history. Returned payload reports what was cleared so the UI
         can show a toast.
         """
-        memory = self.sessions.get(session_id)
-        if memory is None:
-            return {"cleared": False, "reason": "no_session"}
+        # Restore before clearing. Reading self.sessions directly reported
+        # "no_session" after a restart while Mongo still held the patient, so
+        # "forget this patient" left the record in place and the next message
+        # picked the patient straight back up.
+        memory = self._get_session(session_id)
         had_patient = memory.current_patient_id is not None
         had_cache = bool(memory.patient_data_cache)
         memory.current_patient_id = None
@@ -197,10 +463,15 @@ class ClinicalChatEngine:
         memory.current_patient_name = None
         memory.patient_data_cache = {}
         memory.pending_action = None
+        # Persist immediately — a clear that survives only until the next
+        # restart is not a clear. Synchronous because this is rare and
+        # user-initiated, and the caller must know it actually happened.
+        persisted = self.session_store.save(session_id, memory)
         return {
             "cleared": True,
             "had_patient": had_patient,
             "had_cache": had_cache,
+            "persisted": persisted,
             "session_id": session_id,
         }
 
@@ -335,6 +606,24 @@ class ClinicalChatEngine:
                 f"Step 3{'abcde'[step+1] if step+1 < 5 else 'x'}: "
                 f"Chaining to '{next_intent}' for additional context..."
             )
+
+        # ── Catalogue fallback ────────────────────────────────────────
+        # Curated intents cover the common ground and pre-render their data.
+        # Anything they miss is attempted against the live endpoint catalogue
+        # so the whole estate is reachable, not just the hand-wired services.
+        # A knowledge question needs a much stronger match before it is
+        # diverted to an API call.
+        if not all_data:
+            try:
+                cat_data, cat_err = await self._fetch_via_catalog(
+                    message, params, min_score=6 if intent in NO_PARAMS_INTENTS else 1,
+                )
+                if cat_data:
+                    all_data.update(cat_data)
+                elif cat_err:
+                    all_errors.append(cat_err)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("catalog_fallback_failed: %s", exc)
 
         api_error = "; ".join(all_errors) if all_errors else None
 
@@ -493,7 +782,7 @@ class ClinicalChatEngine:
 
         # patient_lookup + has ICU stays -> chain to vitals
         if intent == "patient_lookup":
-            summary = data.get("summary", {})
+            summary = _unwrap(data.get("summary", {})) or {}
             admissions = summary.get("admissions", [])
             for adm in admissions:
                 icu_stays = adm.get("icu_stays", [])
@@ -502,14 +791,15 @@ class ClinicalChatEngine:
                     hadm_id = adm.get("hadm_id")
                     if hadm_id and params.get("patient_id"):
                         params["hadm_id"] = str(hadm_id)
-                        memory.current_hadm_id = int(hadm_id)
+                        memory.current_hadm_id = str(hadm_id).strip()
                         return "vitals"
-            # Even without ICU stays, pick the first admission for context
+            # Even without ICU stays, carry the current admission for context
             if admissions and not params.get("hadm_id"):
-                first_hadm = admissions[0].get("hadm_id")
+                chosen = _pick_admission(admissions) or {}
+                first_hadm = chosen.get("hadm_id")
                 if first_hadm:
                     params["hadm_id"] = str(first_hadm)
-                    memory.current_hadm_id = int(first_hadm)
+                    memory.current_hadm_id = str(first_hadm).strip()
 
         # triage + ESI <= 2 (critical) + has patient_id -> chain to patient_lookup
         if intent == "triage":
@@ -660,12 +950,12 @@ class ClinicalChatEngine:
         hadm = params.get("hadm_id")
         if hadm:
             try:
-                memory.current_hadm_id = int(hadm)
+                memory.current_hadm_id = str(hadm).strip()
             except (ValueError, TypeError):
                 pass
 
         if intent == "patient_lookup":
-            summary = data.get("summary", {})
+            summary = _unwrap(data.get("summary", {})) or {}
             # Try to extract patient name
             patient_name = summary.get("patient_name") or summary.get("name")
             if patient_name:
@@ -675,13 +965,13 @@ class ClinicalChatEngine:
             if pid:
                 memory.patient_data_cache[str(pid)] = summary
 
-            # Auto-pick first hadm_id if not set
+            # Auto-pick the current admission if not already set
             admissions = summary.get("admissions", [])
             if admissions and not memory.current_hadm_id:
-                first_hadm = admissions[0].get("hadm_id")
+                first_hadm = (_pick_admission(admissions) or {}).get("hadm_id")
                 if first_hadm:
                     try:
-                        memory.current_hadm_id = int(first_hadm)
+                        memory.current_hadm_id = str(first_hadm).strip()
                     except (ValueError, TypeError):
                         pass
 
@@ -781,10 +1071,19 @@ class ClinicalChatEngine:
                 return await self._fetch_cohort_stats()
             elif intent == "note_analysis":
                 return await self._fetch_note_analysis(params)
+            elif intent == "trolley_watch":
+                return await self._fetch_trolley_watch()
+            elif intent == "hospital_status":
+                return await self._fetch_hospital_status()
             elif intent == "sofa":
-                # If patient_id provided, look up patient; otherwise just answer from knowledge
+                # With a patient, look that patient up. Without one, the
+                # question is almost always comparative ("who has the highest
+                # SOFA in ICU"), which needs a scored cohort — previously this
+                # fetched nothing and the model refused.
                 if params.get("patient_id"):
                     return await self._fetch_patient_lookup(params)
+                if _wants_cohort_ranking(params):
+                    return await self._fetch_sofa_cohort(params.get("department"))
                 return None, None  # answer from LLM knowledge
             else:
                 return None, None  # general_clinical — no API call needed
@@ -888,16 +1187,107 @@ class ClinicalChatEngine:
             resp.raise_for_status()
             return resp.json(), None
 
+    async def _live_admission(self, client, pid) -> dict | None:
+        """The simulator's current admission for a patient, if any.
+
+        The journey summary reports the MIMIC admission id (27705504); the
+        simulator replays it under its own string id
+        ("SIM-27705504-1792172734") and stores live observations against
+        that. A patient can hold more than one admission marked "admitted",
+        so the most recent by sim_admittime wins.
+        """
+        try:
+            body = (await client.get(
+                f"{self.api_endpoints['sim']}/active-patients?limit=500"
+            )).json()
+        except Exception:  # noqa: BLE001
+            return None
+        # /active-patients answers {"count", "patients"} with no envelope,
+        # unlike most services here. Accept the bare list, the enveloped
+        # list, and the {"patients": [...]} form rather than assuming one.
+        rows = body
+        if isinstance(rows, dict):
+            rows = rows.get("patients") or rows.get("data") or rows
+        if isinstance(rows, dict):
+            rows = rows.get("patients") or rows
+        if not isinstance(rows, list):
+            return None
+        mine = [r for r in rows if str(r.get("subject_id")) == str(pid)]
+        if not mine:
+            return None
+        return max(mine, key=lambda r: str(r.get("sim_admittime") or ""))
+
     async def _fetch_vitals(self, params: dict) -> tuple[dict | None, str | None]:
+        """Current observations for a patient.
+
+        Prefers the LIVE simulated values. The journey service's vitals route
+        reads historical MIMIC chartevents joined through ICU stay_ids, so it
+        returns {} for any admission without an ICU stay and cannot accept a
+        simulated admission id at all (the path parameter is typed int). For a
+        patient who is currently admitted, the answer to "what are his vitals"
+        is the simulator's live observation set, not an empty historical one.
+        """
         pid = params.get("patient_id")
         hadm = params.get("hadm_id")
-        if not pid or not hadm:
-            return None, "Patient ID and admission ID are required for vitals lookup."
-        base = self.api_endpoints["journey"]
-        async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
-            resp = await client.get(f"{base}/patient/{pid}/admission/{hadm}/vitals")
+        if not pid:
+            return None, "A patient ID is required for a vitals lookup."
+
+        async with httpx.AsyncClient(timeout=20.0, verify=False, trust_env=False) as client:
+            live = await self._live_admission(client, pid)
+            if live:
+                sim_hadm = live.get("hadm_id")
+                try:
+                    twin = (await client.get(
+                        f"{self.api_endpoints['sim']}/digital-twin/patient/{sim_hadm}"
+                    )).json()
+                    ctx = (twin.get("data") or {}).get("context") or {}
+                except Exception:  # noqa: BLE001
+                    ctx = {}
+                vitals = ctx.get("vitals") or {}
+                if vitals:
+                    labels = {
+                        "heart_rate": ("Heart rate", "bpm"),
+                        "sbp": ("Systolic BP", "mmHg"),
+                        "dbp": ("Diastolic BP", "mmHg"),
+                        "respiratory_rate": ("Respiratory rate", "breaths/min"),
+                        "spo2": ("SpO2", "%"),
+                        "temperature": ("Temperature", "degC"),
+                    }
+                    lines = [
+                        f"CURRENT OBSERVATIONS for patient {pid} "
+                        f"(live, admission {sim_hadm}, currently in "
+                        f"{ctx.get('current_department') or ctx.get('department') or 'unknown'}):",
+                    ]
+                    for key, (label, unit) in labels.items():
+                        if vitals.get(key) is not None:
+                            lines.append(f"- {label}: {vitals[key]} {unit}")
+                    for key, val in vitals.items():
+                        if key not in labels and val is not None:
+                            lines.append(f"- {key}: {val}")
+                    lines.append(
+                        "These are the patient's current observations. Report them "
+                        "exactly; do not convert units or add values not listed."
+                    )
+                    return {"vitals_report": "\n".join(lines)}, None
+
+            # Not currently admitted (or the twin had nothing) — fall back to
+            # the historical record, which needs the MIMIC admission id.
+            if not hadm:
+                return None, (
+                    f"Patient {pid} is not currently admitted and no admission ID was "
+                    "given, so there are no observations to report."
+                )
+            journey = self.api_endpoints["journey"]
+            resp = await client.get(f"{journey}/patient/{pid}/admission/{hadm}/vitals")
             resp.raise_for_status()
-            return resp.json(), None
+            body = _unwrap(resp.json())
+            if not (body or {}).get("vitals"):
+                return None, (
+                    f"No recorded vital signs for patient {pid} admission {hadm}. "
+                    "The historical record only holds observations for ICU stays. "
+                    "Do not substitute values."
+                )
+            return body, None
 
     async def _fetch_medications(self, params: dict) -> tuple[dict | None, str | None]:
         pid = params.get("patient_id")
@@ -916,6 +1306,507 @@ class ClinicalChatEngine:
             resp = await client.get(f"{base}/cohort-stats")
             resp.raise_for_status()
             return resp.json(), None
+
+    async def _fetch_via_catalog(self, message: str, params: dict,
+                                 min_score: int = 0
+                                 ) -> tuple[dict | None, str | None]:
+        """Answer from any GET endpoint in the estate.
+
+        Curated intents cover the common questions and pre-render their data.
+        This is the long tail: the model is shown the best-matching endpoints
+        from the live catalogue, picks one, and the result is fetched and
+        handed back. Only endpoints present in the catalogue can be called,
+        and the catalogue holds GET operations exclusively, so this cannot
+        mutate anything.
+        """
+        if not self.catalog.endpoints:
+            try:
+                await self.catalog.refresh()
+            except Exception:  # noqa: BLE001
+                return None, "The endpoint catalogue is unavailable."
+
+        ranked = self.catalog.search_scored(message, limit=12)
+        if not ranked or ranked[0][0] < min_score:
+            # Below the bar this is a knowledge question that merely shares
+            # vocabulary with a service name ("what is sepsis" matches the
+            # sepsis_icu routes). Answering it from an endpoint would be worse
+            # than answering it from clinical knowledge.
+            return None, None
+        candidates = [ep for _, ep in ranked]
+
+        listing = "\n".join(f"{i}. {ep.signature()}" for i, ep in enumerate(candidates, 1))
+        known = {k: v for k, v in params.items() if v not in (None, "")}
+        pick_prompt = (
+            "You are selecting ONE read-only API endpoint to answer a question about a "
+            "hospital system.\n\n"
+            f"Question: {message}\n\n"
+            f"Known values you may use for parameters: {json.dumps(known, default=str)}\n\n"
+            f"Endpoints:\n{listing}\n\n"
+            "Reply with ONLY a JSON object, no prose, no markdown fence:\n"
+            '{"choice": <number>, "path_params": {}, "query_params": {}}\n'
+            "Use choice 0 if none of them can answer the question. Only supply a "
+            "parameter if you know its value from the question or the known values — "
+            "never invent an identifier."
+        )
+        # Endpoint selection is a classification task, not a reasoning one.
+        # The default response model emits chain-of-thought, which buries the
+        # JSON; the fast model answers directly.
+        prev_model = self.model
+        self.model = self.MODEL_ROUTING.get("intent_detection", self.model)
+        try:
+            raw = await self._call_ollama([{"role": "user", "content": pick_prompt}])
+        finally:
+            self.model = prev_model
+        if not raw:
+            return None, None
+        m = re.search(r"\{.*\}", raw, re.S)
+        if not m:
+            return None, None
+        try:
+            plan = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            return None, None
+
+        try:
+            idx = int(plan.get("choice", 0))
+        except (TypeError, ValueError):
+            return None, None
+        if idx < 1 or idx > len(candidates):
+            return None, None
+        ep = candidates[idx - 1]
+
+        # Fill the path template. A missing path parameter is fatal — guessing
+        # an identifier would fabricate a patient.
+        supplied = {str(k): v for k, v in (plan.get("path_params") or {}).items()}
+        for name, val in list(known.items()):
+            supplied.setdefault(name, val)
+        url_path = ep.path
+        for pp in ep.path_params:
+            val = supplied.get(pp["name"])
+            if val in (None, ""):
+                return None, (
+                    f"Answering that needs a {pp['name']} and none was given. "
+                    "Ask the user for it rather than guessing."
+                )
+            url_path = url_path.replace("{" + pp["name"] + "}", str(val))
+
+        allowed = {q["name"] for q in ep.query_params}
+        query = {k: v for k, v in (plan.get("query_params") or {}).items()
+                 if k in allowed and v not in (None, "")}
+
+        try:
+            async with httpx.AsyncClient(timeout=25.0, verify=False, trust_env=False) as client:
+                resp = await client.get(f"{ep.base_url}{url_path}", params=query)
+            if resp.status_code >= 400:
+                return None, (
+                    f"{ep.key} returned HTTP {resp.status_code}. Report that the data "
+                    "could not be retrieved; do not substitute figures."
+                )
+            payload = _unwrap(resp.json())
+        except Exception as exc:  # noqa: BLE001
+            return None, f"{ep.key} could not be reached ({type(exc).__name__})."
+
+        rendered = json.dumps(payload, indent=2, default=str)
+        truncated = len(rendered) > 6000
+        if truncated:
+            rendered = rendered[:6000] + "\n… (truncated)"
+        report = (
+            f"Result of {ep.key}"
+            + (f" with {json.dumps(query)}" if query else "")
+            + (f" — {ep.summary}" if ep.summary else "")
+            + ".\n\n" + rendered
+            + ("\n\nNOTE: this response was truncated; say so if you summarise it."
+               if truncated else "")
+            + "\n\nAnswer the question from these values only. Do not add figures that "
+              "are not present here."
+        )
+        return {"api_result_report": report}, None
+
+    async def _fetch_sofa_cohort(self, department: str | None = None
+                                 ) -> tuple[dict | None, str | None]:
+        """Score every currently-admitted patient and rank them by SOFA.
+
+        There is no SOFA endpoint anywhere in the estate — the score is
+        computed here from each patient's live observations and labs using
+        the same shared.clinical.risk implementation the rest of the platform
+        uses, so chat cannot drift from the other consumers.
+        """
+        from shared.clinical.risk import compute_sofa
+
+        sim = self.api_endpoints["sim"]
+        async with httpx.AsyncClient(timeout=30.0, verify=False, trust_env=False) as client:
+            try:
+                body = (await client.get(f"{sim}/active-patients?limit=500")).json()
+            except Exception as exc:  # noqa: BLE001
+                return None, f"Could not read the active patient list ({type(exc).__name__})."
+            rows = body
+            if isinstance(rows, dict):
+                rows = rows.get("patients") or rows.get("data") or []
+            if not isinstance(rows, list) or not rows:
+                return None, "No patients are currently admitted, so there is nothing to rank."
+
+            sem = asyncio.Semaphore(8)
+
+            async def score(row):
+                async with sem:
+                    try:
+                        twin = (await client.get(
+                            f"{sim}/digital-twin/patient/{row.get('hadm_id')}")).json()
+                        ctx = (twin.get("data") or {}).get("context") or {}
+                    except Exception:  # noqa: BLE001
+                        return None
+                vitals = dict(ctx.get("vitals") or {})
+                labs = ctx.get("labs") or {}
+                if not vitals and not labs:
+                    return None
+                # SOFA's cardiovascular component needs mean arterial pressure;
+                # the twin publishes systolic and diastolic. MAP = (SBP+2*DBP)/3
+                # is the standard derivation, not an invented value.
+                if vitals.get("mbp") is None and vitals.get("sbp") and vitals.get("dbp"):
+                    try:
+                        vitals["mbp"] = round(
+                            (float(vitals["sbp"]) + 2 * float(vitals["dbp"])) / 3, 1)
+                    except (TypeError, ValueError):
+                        pass
+                parts = compute_sofa(vitals, labs)
+                return {
+                    "subject_id": ctx.get("subject_id") or row.get("subject_id"),
+                    "hadm_id": row.get("hadm_id"),
+                    "department": ctx.get("current_department") or ctx.get("department"),
+                    "parts": parts,
+                    "total": parts.get("total", 0),
+                }
+
+            scored = [r for r in await asyncio.gather(*[score(r) for r in rows]) if r]
+
+        if not scored:
+            return None, "No live observations are available, so SOFA cannot be computed."
+
+        pool = scored
+        scope = "the hospital"
+        if department:
+            pool = [r for r in scored if str(r.get("department", "")).upper()
+                    == department.upper()]
+            scope = department
+            if not pool:
+                return None, (
+                    f"No patients are currently in {department}, so there is no SOFA "
+                    f"ranking for it. Do not report a patient from another department."
+                )
+        pool.sort(key=lambda r: -r["total"])
+        top = pool[0]
+
+        lines = [
+            f"SOFA SCORES for every patient currently in {scope} "
+            f"({len(pool)} patient(s)), computed from live observations and labs.",
+            "",
+            f"HIGHEST: patient {top['subject_id']} in {top['department']} with a total "
+            f"SOFA of {top['total']}.",
+            "",
+            "Full ranking, worst first:",
+        ]
+        for rank, r in enumerate(pool[:10], 1):
+            p = r["parts"]
+            lines.append(
+                f"{rank}. Patient {r['subject_id']} ({r['department']}): total {r['total']} "
+                f"= respiration {p['respiration']}, coagulation {p['coagulation']}, "
+                f"liver {p['liver']}, cardiovascular {p['cardiovascular']}, "
+                f"renal {p['renal']}."
+            )
+        lines += [
+            "",
+            "SOFA components are 0-4 each; the total runs 0-24 and a higher score means "
+            "more organ dysfunction. This build scores five systems (respiration, "
+            "coagulation, liver, cardiovascular, renal) — the neurological component "
+            "needs a GCS, which is not recorded here, so totals are conservative and "
+            "you must say so. Report the ranking exactly as listed; do not recompute.",
+        ]
+        return {"sofa_cohort_report": "\n".join(lines)}, None
+
+    async def _fetch_hospital_status(self) -> tuple[dict | None, str | None]:
+        """Live census of THIS hospital — ED, ICU, wards, beds, crowding.
+
+        Answers "how many patients are in ED", which previously routed to the
+        oncology cohort endpoint and 404'd. Three sources are queried and
+        cross-checked rather than trusted individually: the simulation census
+        (:8207), the bed register (:8208) and the ED board (:8214). They are
+        independent, so a disagreement is worth surfacing rather than hiding
+        behind whichever one answered first.
+
+        Pre-rendered as sentences for the same reason as the trolley report —
+        the response model misreads nested JSON.
+        """
+        base_sim, base_beds, base_ed = (
+            self.api_endpoints["sim"],
+            self.api_endpoints["beds"],
+            self.api_endpoints["ed_flow"],
+        )
+        stats: dict = {}
+        beds: list = []
+        ed: dict = {}
+        failures: list[str] = []
+        async with httpx.AsyncClient(timeout=20.0, verify=False, trust_env=False) as client:
+            for label, coro in (
+                ("census", client.get(f"{base_sim}/stats-dashboard")),
+                ("bed register", client.get(f"{base_beds}/beds/summary")),
+                ("ED board", client.get(f"{base_ed}/ed-state")),
+            ):
+                try:
+                    body = (await coro).json()
+                    payload = body.get("data", body)
+                    if label == "census":
+                        stats = payload or {}
+                    elif label == "bed register":
+                        beds = payload or []
+                    else:
+                        ed = payload or {}
+                except Exception as exc:  # noqa: BLE001
+                    failures.append(f"{label} unavailable ({type(exc).__name__})")
+
+        if not stats and not beds and not ed:
+            return None, (
+                "Live hospital census could not be retrieved from any source "
+                f"({'; '.join(failures)}). Do not estimate patient numbers."
+            )
+
+        def g(d, k, default=None):
+            v = (d or {}).get(k)
+            return default if v is None else v
+
+        ed_bed = next((b for b in beds if str(b.get("department")).upper() == "ED"), {})
+        ed_counts = {
+            "simulation census": g(stats, "ed_count"),
+            "bed register": ed_bed.get("occupied"),
+            "ED board": g(ed, "total_patients"),
+        }
+        reported = [v for v in ed_counts.values() if v is not None]
+        agree = len(set(reported)) <= 1
+
+        total_cap = sum((b.get("capacity") or 0) for b in beds)
+        total_occ = sum((b.get("occupied") or 0) for b in beds)
+        total_free = sum((b.get("available") or 0) for b in beds)
+
+        lines = [
+            f"LIVE HOSPITAL CENSUS (this hospital's own simulation, NOT the national "
+            f"trolley figures). Simulation time: {g(stats, 'sim_time', 'unknown')}.",
+            "",
+        ]
+        if reported:
+            lines.append(
+                f"PATIENTS CURRENTLY IN ED: {reported[0]}."
+                + ("" if agree else
+                   "  WARNING — sources disagree: "
+                   + ", ".join(f"{k} says {v}" for k, v in ed_counts.items() if v is not None)
+                   + ". Report this disagreement; do not pick one silently.")
+            )
+        if ed_bed:
+            lines.append(
+                f"ED beds: {ed_bed.get('occupied')} occupied of {ed_bed.get('capacity')} "
+                f"({ed_bed.get('available')} available); alert level "
+                f"{ed_bed.get('alert_level')}."
+            )
+        if ed:
+            lines.append(
+                f"ED board detail: {g(ed, 'waiting_count', 0)} waiting, "
+                f"{g(ed, 'in_treatment_count', 0)} in treatment, "
+                f"{g(ed, 'boarding_count', 0)} boarding; resus "
+                f"{g(ed, 'resus_occupied', 0)}/{g(ed, 'resus_capacity', 0)}. "
+                f"Average wait {g(ed, 'avg_wait_minutes', 0)} min, longest "
+                f"{g(ed, 'longest_wait_minutes', 0)} min. NEDOCS "
+                f"{g(ed, 'nedocs_score', 0)} ({g(ed, 'crowding_level', 'unknown')})."
+            )
+        lines += [
+            "",
+            # icu_count is deliberately NOT quoted here. It is a separate field
+            # from the same service as department_distribution and the two
+            # disagree (9 vs 7), which produced a report saying "9 in ICU" three
+            # lines above a table saying ICU holds 7. The department table below
+            # is the single source for per-department numbers.
+            f"WHOLE HOSPITAL: {g(stats, 'total_active', 'unknown')} patients currently "
+            f"admitted. {g(stats, 'total_discharged', 'unknown')} discharged to date. "
+            f"Per-department numbers are in the table below — use only those.",
+            # Pre-computed because the model otherwise sums the per-department
+            # capacities itself and gets it wrong — it reported "5 beds out of
+            # 1,682" for a hospital with 458 beds and 34 patients.
+            (f"HOSPITAL-WIDE BEDS: {total_occ} occupied of {total_cap} "
+             f"({total_free} free), across {len(beds)} departments. "
+             f"Occupancy {round(100 * total_occ / total_cap, 1)}%."
+             if total_cap else "HOSPITAL-WIDE BEDS: bed register unavailable."),
+        ]
+        # ONE reconciled per-department table, not two independent ones. The
+        # simulation census and the bed register are separate services sampled
+        # microseconds apart, so a patient mid-transfer shows in one and not
+        # the other. Printing both as separate lists produced answers that
+        # contradicted themselves inside a single paragraph ("HDU (4)" then
+        # "HDU 2/8 occupied"). Where they differ, the difference is stated.
+        dept = g(stats, "department_distribution") or {}
+        bed_by_dept = {str(b.get("department")): b for b in beds}
+        all_depts = sorted(set(dept) | set(bed_by_dept))
+        if all_depts:
+            lines.append("")
+            lines.append("BY DEPARTMENT (patients — bed occupancy — free beds):")
+            disagreements = []
+            for name in all_depts:
+                census_n = dept.get(name)
+                bed = bed_by_dept.get(name, {})
+                occ, cap = bed.get("occupied"), bed.get("capacity")
+                avail = bed.get("available")
+                if census_n is not None and occ is not None and census_n != occ:
+                    disagreements.append(f"{name} ({census_n} vs {occ})")
+                    count_txt = (
+                        f"{min(census_n, occ)}-{max(census_n, occ)} patients "
+                        f"(census says {census_n}, bed register says {occ})"
+                    )
+                else:
+                    shown = census_n if census_n is not None else occ
+                    count_txt = (
+                        "unknown patient count" if shown is None
+                        else f"{shown} patient{'' if shown == 1 else 's'}"
+                    )
+                if cap is not None:
+                    lines.append(
+                        f"- {name}: {count_txt}; {occ} of {cap} beds occupied, "
+                        f"{avail} free."
+                    )
+                else:
+                    lines.append(f"- {name}: {count_txt}.")
+            if disagreements:
+                lines.append(
+                    "Note: the simulation census and the bed register disagree slightly "
+                    f"for {', '.join(disagreements)}. These are independent services "
+                    "sampled a moment apart, so a patient mid-transfer appears in one "
+                    "and not the other. Give the range and say the two systems differ "
+                    "by one or two — do not silently pick a single figure."
+                )
+
+        if failures:
+            lines.append("")
+            lines.append("Note: " + "; ".join(failures) + ".")
+        lines += [
+            "",
+            "Report these figures exactly as given. A count of 0 means that department "
+            "is genuinely empty right now — say so plainly; do not treat 0 as missing "
+            "data and do not substitute a number of your own. Only call a department "
+            "empty if its count is exactly 0; a department holding even one patient is "
+            "occupied. Write numbers as digits, not words. Do NOT add up the "
+            "per-department figures yourself — every total you need is already given "
+            "above; a computed total will be wrong.",
+        ]
+        return {"hospital_census_report": "\n".join(lines)}, None
+
+    async def _fetch_trolley_watch(self) -> tuple[dict | None, str | None]:
+        """Live HSE TrolleyGAR figures — national, all six zones, worst sites.
+
+        Returns ONE pre-rendered table rather than nested JSON. The 8B
+        response model reliably garbles multi-level JSON: handed the zone
+        objects it reported West & North West as 147 trolleys (actually 21) and
+        labelled a zone subtotal row as a hospital. Every number here is
+        already computed and laid out, so the model's only job is to quote
+        it — there is no arithmetic left to get wrong.
+        """
+        base = self.api_endpoints["trolley"]
+        async with httpx.AsyncClient(timeout=20.0, verify=False, trust_env=False) as client:
+            latest = (await client.get(f"{base}/trolley/hse/latest")).json().get("data", {})
+            if not latest.get("available"):
+                return None, (
+                    "No reconciled HSE TrolleyGAR report is available yet. "
+                    "Do not estimate or invent trolley figures."
+                )
+            zones = (await client.get(f"{base}/trolley/hse/zones")).json().get("data", {})
+
+        nat = latest.get("national") or {}
+        zone_rows = zones.get("zones", []) if zones.get("available") else []
+
+        def n(v):
+            return "n/a" if v is None else str(v)
+
+        # Rows are written as sentences, not a fixed-width table. The response
+        # model misaligns columns — given a padded table it read the ED figure
+        # as the zone total and dropped the ward count. It also rewrote the
+        # report year 2026 as 2025 and then declared its own live data stale,
+        # so today's date and the report's age are stated outright.
+        today = datetime.now(timezone.utc).date()
+        rep_date = str(latest.get("report_date") or "")
+        try:
+            age = (today - datetime.strptime(rep_date, "%Y-%m-%d").date()).days
+        except ValueError:
+            age = None
+        if age == 0:
+            freshness = f"This IS today's report ({rep_date}) — it is current, not historical."
+        elif age is not None:
+            freshness = (
+                f"This report is dated {rep_date}, {age} day(s) before today. It is the "
+                f"most recent one the HSE has published."
+            )
+        else:
+            freshness = f"Report date {rep_date}."
+
+        lines = [
+            f"Today's date is {today.isoformat()}. The current year is {today.year}. "
+            f"Write every date in exactly the YYYY-MM-DD form given below — do not "
+            f"reformat it into words or another order, and do not change the year. "
+            f"(A previous answer turned {today.isoformat()} into '01 July 2026'.)",
+            f"HSE TrolleyGAR / INMO Trolley Watch, 08:00 count, "
+            f"{latest.get('hospital_count')} hospitals reporting. {freshness}",
+            "",
+            f"NATIONAL TOTAL: {n(nat.get('total_trolleys'))} patients waiting on trolleys "
+            f"= {n(nat.get('ed_trolleys'))} in EDs + {n(nat.get('ward_trolleys'))} on wards. "
+            f"Surge capacity: {n(nat.get('surge_capacity'))}. "
+            f"Delayed transfers of care: {n(nat.get('delayed_transfers'))}.",
+            "",
+            "BY HEALTH REGION, worst first (these six totals sum to the national "
+            "total). The list is already ranked — the first row is the highest:",
+        ]
+        ranked = sorted(zone_rows, key=lambda r: -(r.get("total_trolleys") or 0))
+        for z in ranked:
+            lines.append(
+                f"- {z.get('zone')}: {n(z.get('total_trolleys'))} total trolleys "
+                f"= {n(z.get('ed_trolleys'))} ED + {n(z.get('ward_trolleys'))} ward; "
+                f"surge capacity {n(z.get('surge_capacity'))}; "
+                f"delayed transfers {n(z.get('delayed_transfers'))}."
+            )
+
+        if ranked:
+            # Stated outright because the model otherwise narrates its own
+            # ranking wrongly — it wrote "Mid West highest (36), followed by
+            # Dublin and South East (44)" while displaying a correct table.
+            hi, lo = ranked[0], ranked[-1]
+            lines.append(
+                f"Worst-affected region: {hi.get('zone')} with "
+                f"{n(hi.get('total_trolleys'))}. Least-affected: {lo.get('zone')} with "
+                f"{n(lo.get('total_trolleys'))}."
+            )
+
+        hospitals = [h for z in zone_rows for h in (z.get("hospitals") or [])]
+        sites_affected = len([h for h in hospitals if (h.get("total_trolleys") or 0) > 0])
+        worst = sorted(
+            (h for h in hospitals if (h.get("total_trolleys") or 0) > 0),
+            key=lambda h: -(h.get("total_trolleys") or 0),
+        )[:10]
+        if worst:
+            lines += ["",
+                      f"WORST-AFFECTED HOSPITALS — top {len(worst)} individual sites "
+                      f"(not regions); {sites_affected} sites reported trolleys in total:"]
+            for rank, h in enumerate(worst, 1):
+                lines.append(
+                    f"{rank}. {h.get('hospital')} ({h.get('zone')}): "
+                    f"{n(h.get('total_trolleys'))} total "
+                    f"= {n(h.get('ed_trolleys'))} ED + {n(h.get('ward_trolleys'))} ward."
+                )
+        lines += [
+            "",
+            "Source: HSE Special Delivery Unit TrolleyGAR, published daily.",
+            "Reproduce these figures exactly as given; do not recompute, reorder or "
+            "adjust them, and if you list hospitals keep them in rank order. When you "
+            "name a hospital or region, give its ED and ward numbers separately as "
+            "written above — never compress a site to 'all ED' or 'all ward' shorthand, "
+            "which has produced wrong figures (UH Limerick is 6 ED + 30 ward, not "
+            "'36, all ED'). Report surge capacity as a plain count — do not describe "
+            "those beds as 'available' or 'free'; the report does not say whether they "
+            "are occupied.",
+        ]
+
+        return {"hse_trolley_report": "\n".join(lines)}, None
 
     async def _fetch_note_analysis(self, params: dict) -> tuple[dict | None, str | None]:
         note_text = params.get("note_text", "")
@@ -942,9 +1833,11 @@ class ClinicalChatEngine:
         """Generate a clinical response using Ollama with the fetched data."""
         data_section = ""
         if api_data:
-            data_section = f"\n\nHospital system data:\n{json.dumps(api_data, indent=2, default=str)}"
+            data_section = f"\n\nHospital system data:\n{_render_data(api_data)}"
         if api_error:
             data_section += f"\n\nNote: {api_error}"
+        if not api_data and intent not in NO_PARAMS_INTENTS:
+            data_section += NO_LIVE_DATA_INSTRUCTION
 
         # Include alerts in prompt so the LLM can reference them
         alerts_section = ""
@@ -1106,13 +1999,18 @@ class ClinicalChatEngine:
                         "messages": messages,
                         "stream": True,
                         "options": {
-                            # Cap CoT + answer at 512 tokens — ample for a
-                            # clinical summary, prevents 3 000-token CoT spirals.
-                            "num_predict": 512,
+                            # num_predict caps CoT *and* answer together. At 512
+                            # a reasoning model (deepseek-r1) spends nearly all
+                            # of it thinking and the reply dies mid-sentence —
+                            # the "answers stuck in between" symptom. Budget for
+                            # both: the CoT is streamed separately as `thinking`
+                            # so a longer cap costs the reader nothing.
+                            "num_predict": int(os.environ.get("CHAT_NUM_PREDICT", "2048")),
                         },
                     },
                 ) as resp:
                     resp.raise_for_status()
+                    answer_chars = 0
                     async for line in resp.aiter_lines():
                         if not line:
                             continue
@@ -1126,8 +2024,22 @@ class ClinicalChatEngine:
                             yield ("reasoning", think)
                         content = msg.get("content")
                         if content:
+                            answer_chars += len(content)
                             yield ("content", content)
                         if obj.get("done"):
+                            # Never end on a silent stump. If the model hit the
+                            # token ceiling, say so rather than leaving a
+                            # sentence hanging — a truncated clinical answer
+                            # reads as a complete one.
+                            if obj.get("done_reason") == "length":
+                                if answer_chars == 0:
+                                    yield ("content",
+                                           "I ran out of response budget while reasoning and "
+                                           "could not produce an answer. Please ask again, or "
+                                           "narrow the question.")
+                                else:
+                                    yield ("content",
+                                           "\n\n_[response truncated at the token limit]_")
                             return
         except Exception as exc:  # noqa: BLE001
             logger.warning("_call_ollama_stream failed: %s", exc)
@@ -1260,12 +2172,38 @@ class ClinicalChatEngine:
             thinking.append(f"Step 3{'abcde'[step+1] if step+1 < 5 else 'x'}: Chaining to '{next_intent}'…")
             yield ("thinking", thinking[-1])
 
+        # ── Catalogue fallback ────────────────────────────────────────
+        # Curated intents cover the common ground and pre-render their data.
+        # Anything they miss is attempted against the live endpoint catalogue
+        # so the whole estate is reachable, not just the hand-wired services.
+        # A knowledge question needs a much stronger match before it is
+        # diverted to an API call.
+        if not all_data:
+            try:
+                cat_data, cat_err = await self._fetch_via_catalog(
+                    message, params, min_score=6 if intent in NO_PARAMS_INTENTS else 1,
+                )
+                if cat_data:
+                    all_data.update(cat_data)
+                elif cat_err:
+                    all_errors.append(cat_err)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("catalog_fallback_failed: %s", exc)
+
         api_error = "; ".join(all_errors) if all_errors else None
 
         if all_data:
             thinking.append(f"Step 4: Received data ({_data_summary(all_data)}). Generating clinical summary…")
         else:
             thinking.append("Step 4: No structured data. Generating response from clinical knowledge…")
+            if intent not in NO_PARAMS_INTENTS:
+                # A data intent that returned nothing must not be answered from
+                # the model's imagination. Asked for today's INMO snapshot with
+                # no data, it previously produced "42 new patients admitted
+                # today" — a fabricated figure in a clinical tool.
+                thinking.append(
+                    "Step 4b: Data request with no data — answering without invented figures."
+                )
         yield ("thinking", thinking[-1])
 
         # Widgets available now — emit so the dashboard can render them before
@@ -1287,9 +2225,11 @@ class ClinicalChatEngine:
         yield ("thinking", thinking[-1])
 
         # Build the prompt same as _generate_response
-        data_section = f"\n\nHospital system data:\n{json.dumps(all_data, indent=2, default=str)}" if all_data else ""
+        data_section = f"\n\nHospital system data:\n{_render_data(all_data)}" if all_data else ""
         if api_error:
             data_section += f"\n\nNote: {api_error}"
+        if not all_data and intent not in NO_PARAMS_INTENTS:
+            data_section += NO_LIVE_DATA_INSTRUCTION
         alerts_section = ""
         if alerts:
             alerts_section = (
