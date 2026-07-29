@@ -3,7 +3,7 @@
 // render before its upstream service is online — it just shows an empty
 // state instead of crashing.
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { AlertTriangle, CheckCircle2, ShieldAlert, XCircle, Activity, Briefcase, MapPin, Flag, Gavel, BookLock, BellRing, MessageCircle, Save, RefreshCw } from "lucide-react";
 import {
   opsPendingActions,
@@ -400,11 +400,62 @@ export function RegionCensusPanel() {
           );
         })}
       </div>
-      {data.capacity_note && (
-        <p className="text-[10px] text-text-muted mt-2">{data.capacity_note}</p>
-      )}
+      {/* The full explanation is long; keep it on hover rather than as a
+          paragraph of small print under a three-line panel. */}
+      <p
+        className="text-[10px] text-text-muted mt-2 cursor-help"
+        title={data.capacity_note}
+      >
+        Occupancy is measured against the bed register's denominator, which is
+        larger than the bed establishment — hover for why.
+      </p>
     </section>
   );
+}
+
+/**
+ * ICD codes arrive as objects — {code, description, confidence, is_primary} —
+ * and were rendered with `.join(", ")`, so every cell in the activity log read
+ * "[object Object], [object Object]". Show the codes, mark the primary one,
+ * and keep the description on hover.
+ */
+function renderIcdCodes(codes: unknown): ReactNode {
+  if (!Array.isArray(codes) || codes.length === 0) return "—";
+  return (
+    <span className="flex flex-wrap gap-1">
+      {codes.map((c: any, i: number) => {
+        const code = typeof c === "string" ? c : c?.code;
+        if (!code) return null;
+        const desc = typeof c === "object" ? c?.description : undefined;
+        const primary = typeof c === "object" && c?.is_primary;
+        return (
+          <span
+            key={`${code}-${i}`}
+            title={desc && desc !== code ? desc : undefined}
+            className={`font-mono-clinical px-1 rounded text-[10px] ${
+              primary
+                ? "bg-blue-500/20 text-blue-300 border border-blue-500/40"
+                : "bg-bg-primary text-slate-300 border border-border"
+            }`}
+          >
+            {code}
+          </span>
+        );
+      })}
+    </span>
+  );
+}
+
+/** Sim-clock ISO strings were printed raw ("2026-10-26T10:35:46.372700+00:00"). */
+function formatLogTime(ts: unknown): string {
+  if (typeof ts !== "string" || !ts) return "—";
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return ts;
+  return d.toLocaleString(undefined, {
+    day: "2-digit", month: "short",
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+    hour12: false,
+  });
 }
 
 // --------------------------------------------------------------------------- ERP activity log
@@ -436,10 +487,12 @@ export function ERPActivityLogPanel() {
             <tbody>
               {rows.map((r, i) => (
                 <tr key={i} className="border-t border-border">
-                  <td className="py-1 font-mono-clinical text-xs text-slate-400">{r.timestamp}</td>
+                  <td className="py-1 font-mono-clinical text-xs text-slate-400 whitespace-nowrap">
+                    {formatLogTime(r.timestamp)}
+                  </td>
                   <td className="py-1 text-xs">{r.department || "—"}</td>
-                  <td className="py-1 text-xs">{r.note_type || "—"}</td>
-                  <td className="py-1 text-xs">{Array.isArray(r.icd_codes) ? r.icd_codes.join(", ") : "—"}</td>
+                  <td className="py-1 text-xs">{(r.note_type || "—").replace(/_/g, " ")}</td>
+                  <td className="py-1 text-xs">{renderIcdCodes(r.icd_codes)}</td>
                 </tr>
               ))}
             </tbody>

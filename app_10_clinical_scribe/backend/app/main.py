@@ -95,6 +95,17 @@ async def lifespan(application: FastAPI):
     state["service_client"] = ServiceClient()
     state["event_bus"] = get_event_bus()
 
+    # ICD reference titles. Read in a thread — PyMongo is synchronous and this
+    # walks 109k rows, which would otherwise block the event loop through
+    # startup.
+    try:
+        import asyncio as _asyncio
+        state["icd_titles"] = await _asyncio.to_thread(_load_icd_titles)
+        logger.info("icd_titles_loaded count=%d", len(state["icd_titles"]))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("icd_titles_unavailable: %s", exc)
+        state["icd_titles"] = {}
+
     # Load ML models
     registry = ModelRegistry(base_path=str(MODEL_DIR))
     for name, key in [("scribe_icd_coder", "icd_model"),
@@ -577,14 +588,70 @@ def _extract_entities(text: str) -> Dict[str, Any]:
     return entities
 
 
+def _icd_key(code) -> str:
+    """Normalise an ICD code for dictionary lookup.
+
+    d_icd_diagnoses stores numeric ICD-9 codes as ints (4019) and everything
+    else as strings (I10, V1582), so both shapes have to collapse onto one key.
+    """
+    return str(code).strip().upper()
+
+
+def _load_icd_titles() -> Dict[str, str]:
+    """Build the code -> long_title map once at startup.
+
+    109,775 rows, held in memory rather than queried per note: coding runs on
+    every generated note and a per-code round trip would put ten lookups in
+    the path of each one.
+    """
+    titles: Dict[str, str] = {}
+    ambiguous: set = set()
+    try:
+        from shared.db.mongo import MongoManager
+        coll = MongoManager().client["MIMIC"]["d_icd_diagnoses"]
+        for doc in coll.find({}, {"_id": 0, "icd_code": 1, "icd_version": 1,
+                                  "long_title": 1}):
+            code = doc.get("icd_code")
+            title = doc.get("long_title")
+            if code is None or not title:
+                continue
+            key = _icd_key(code)
+            existing = titles.get(key)
+            if existing is not None and existing != title:
+                # Two different diagnoses share this key. 851 do, because the
+                # table stores numeric ICD-9 codes as ints with leading zeros
+                # lost — "311" is both genuine ICD-9 311 (depressive disorder)
+                # and 031.1 (cutaneous mycobacteria). Nothing in a predicted
+                # code says which is meant, so neither is shown: a plausible
+                # wrong diagnosis on a clinical note is worse than a bare code.
+                ambiguous.add(key)
+                continue
+            titles[key] = title
+        for key in ambiguous:
+            titles.pop(key, None)
+        if ambiguous:
+            logger.info("icd_titles_ambiguous_dropped count=%d", len(ambiguous))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("icd_title_load_failed: %s", exc)
+    return titles
+
+
 def _suggest_icd_codes(text: str) -> List[Dict[str, str]]:
     """Suggest ICD-10-AM codes using ML model or keyword fallback."""
     icd_model = state.get("icd_model")
     if icd_model is not None:
         try:
             predictions = icd_model.predict_top_k(text, k=10)
+            titles = state.get("icd_titles") or {}
             return [
-                {"code": code, "description": code, "confidence": round(prob, 3),
+                # description used to be set to the code itself, so every coded
+                # note carried "I10 -> I10" and the audit log had 193 entries
+                # with no readable diagnosis text at all. MIMIC ships the
+                # dictionary; use it, and fall back to the code only when a
+                # prediction is not in it.
+                {"code": code,
+                 "description": titles.get(_icd_key(code)) or code,
+                 "confidence": round(prob, 3),
                  "category": "diagnosis", "is_primary": i == 0}
                 for i, (code, prob) in enumerate(predictions) if prob > 0.1
             ]
