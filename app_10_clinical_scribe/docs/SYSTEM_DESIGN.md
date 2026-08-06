@@ -87,7 +87,7 @@ This module provides AI-powered clinical documentation: ambient encounter transc
 - **No medical ASR training data:** Need Irish-accented medical speech data for fine-tuning
 - **Quality assurance:** No human review layer (unlike Augmedix)
 - **EHR integration:** FHIR output is planned but not connected to any EHR yet
-- **LLM dependency:** Note quality depends on LLM capability (Ollama vs. a commercial LLM API)
+- **LLM dependency:** Note quality depends on LLM capability (Ollama vs. Claude API)
 - **No clinical conversation training data:** Can't match Abridge's 1M+ conversation dataset
 - **Single-developer limitations:** Can't match R&D investment of Nuance/Microsoft
 
@@ -220,7 +220,7 @@ Architecture:
 
 **Performance targets:** WER < 8% on medical conversations; latency < 2x real-time.
 
-#### Note Generation: a commercial LLM API with Structured Prompting
+#### Note Generation: Claude API with Structured Prompting
 **Why chosen:** Best clinical reasoning; structured output; high faithfulness; available via API with fallback to local Ollama.
 
 ```
@@ -238,7 +238,7 @@ Pipeline:
    ├── Template: Irish clinical note format (consultant letter format)
    ├── Guidelines: HSE clinical documentation standards
    └── Output schema: JSON with SOAP sections + structured fields
-4. LLM generation (a commercial LLM API primary, Ollama fallback)
+4. LLM generation (Claude API primary, Ollama fallback)
 5. Post-processing:
    ├── Faithfulness check (NLI-based: verify claims against transcript)
    ├── Safety check: allergies mentioned? medications reconciled? red flags?
@@ -319,7 +319,7 @@ Pipeline:
 │  ┌────────────────┐  ┌──────────────────┐  ┌─────────────────┐  │
 │  │  ASR Engine     │  │  Note Generation │  │  Coding Engine  │  │
 │  │                 │  │  Engine          │  │                 │  │
-│  │ - Whisper v3    │  │ - a commercial LLM API     │  │ - LLM + PLM-ICD│  │
+│  │ - Whisper v3    │  │ - Claude API     │  │ - LLM + PLM-ICD│  │
 │  │ - Speaker       │  │ - SOAP template  │  │ - ICD-10-AM    │  │
 │  │   diarization   │  │ - Context enrich │  │ - ACHI coding  │  │
 │  │ - Medical vocab │  │ - Faithfulness   │  │ - SNOMED CT    │  │
@@ -382,7 +382,7 @@ Audio Input (microphone / uploaded file)
            │
            ▼
 ┌─────────────────────┐
-│ 4. Note Generation   │  a commercial LLM API / Ollama with SOAP template
+│ 4. Note Generation   │  Claude API / Ollama with SOAP template
 │                      │  Input: transcript + context + entities
 │                      │  Output: structured clinical note
 └──────────┬──────────┘
@@ -469,7 +469,7 @@ GET  /model-info                      # Model metadata
 | Task | Description | Dependencies |
 |------|-------------|--------------|
 | 2.1 | Build context enrichment module (HTTP calls to existing APIs) | Existing APIs |
-| 2.2 | Implement a commercial LLM API integration with structured prompting | a commercial LLM API key |
+| 2.2 | Implement Claude API integration with structured prompting | Claude API key |
 | 2.3 | Implement Ollama fallback for on-premise deployment | Ollama |
 | 2.4 | Build SOAP note generation pipeline | 2.1, 2.2 |
 | 2.5 | Implement NLI-based faithfulness checker | 2.4 |
@@ -568,7 +568,7 @@ app_10_clinical_scribe/
 │   │   ├── __init__.py
 │   │   ├── whisper_asr.py       # Whisper Large-v3 ASR + diarization
 │   │   ├── clinical_ner.py      # Bio-ClinicalBERT NER
-│   │   ├── note_generator.py    # a commercial LLM API / Ollama note generation
+│   │   ├── note_generator.py    # Claude API / Ollama note generation
 │   │   ├── icd_coder.py         # Hybrid LLM + PLM-ICD coding
 │   │   └── faithfulness.py      # NLI-based faithfulness checker
 │   ├── engines/

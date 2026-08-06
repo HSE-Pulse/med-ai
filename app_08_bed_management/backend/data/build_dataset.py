@@ -91,7 +91,7 @@ LAB_RANGES = {
 }
 
 DATASET_OUT_DIR = Path(
-    os.getenv("DATASET_OUT_DIR", "./datasets/bed_management")
+    os.getenv("DATASET_OUT_DIR", "/home/hari/hse/datasets/bed_management")
 )
 
 BATCH = 5000

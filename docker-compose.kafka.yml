@@ -25,6 +25,7 @@ services:
   redpanda:
     image: docker.redpanda.com/redpandadata/redpanda:v24.3.1
     container_name: medai-redpanda
+    restart: unless-stopped
     command:
       - redpanda
       - start
@@ -59,10 +60,17 @@ services:
       interval: 5s
       timeout: 3s
       retries: 12
+    # Also on the shared services network so Prometheus (on cancer_default) can
+    # scrape redpanda:9644/metrics. Applied on next `docker compose up`;
+    # a runtime `docker network connect` covers the gap.
+    networks:
+      - default
+      - cancer_default
 
   console:
     image: docker.redpanda.com/redpandadata/console:v2.8.3
     container_name: medai-redpanda-console
+    restart: unless-stopped
     entrypoint: /bin/sh
     command: |-
       -c 'echo "$$CONSOLE_CONFIG_FILE" > /tmp/config.yml && /app/console'
@@ -83,6 +91,20 @@ services:
     depends_on:
       redpanda:
         condition: service_healthy
+
+  # Read-only reverse proxy in front of the console — the public-facing entry
+  # (redpanda.harishankar.info → :18090). Blocks all mutating HTTP methods so
+  # the exposed console is view-only (OSS console has no RBAC).
+  console-ro:
+    image: nginx:1.27-alpine
+    container_name: medai-redpanda-console-ro
+    restart: unless-stopped
+    volumes:
+      - ./docker/redpanda-console-ro.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "18090:8080"
+    depends_on:
+      - console
 
   # Optional topic bootstrap — creates the domain topics used by the platform.
   # Runs once and exits. Re-run manually with: docker compose -f ... run topic-init
@@ -122,3 +144,8 @@ services:
 volumes:
   redpanda_data:
     name: medai-redpanda-data
+
+networks:
+  default:
+  cancer_default:
+    external: true

@@ -498,6 +498,35 @@ async def startup() -> None:
     asyncio.create_task(_VITALS_CACHE.run(_CACHE_TAIL_SECONDS))
     asyncio.create_task(_LABS_CACHE.run(_CACHE_TAIL_SECONDS))
 
+    # Auto-start the sim on boot so the dashboard is never frozen for visitors
+    # after a reboot/restart (it otherwise comes up stopped and has to be
+    # started by hand from the Simulation Control page). Mirrors POST /start:
+    # begin the engine and publish the shared sim-clock anchor so downstream
+    # services (hospital_ops, bed_management, …) align. Disable with
+    # SIM_AUTOSTART=0; override the speed with SIM_AUTOSTART_SPEED.
+    if os.getenv("SIM_AUTOSTART", "1") != "0":
+        async def _autostart_sim() -> None:
+            try:
+                if engine.running:
+                    return
+                try:
+                    sp = float(os.getenv("SIM_AUTOSTART_SPEED", "10"))
+                    engine.clock.set_speed(max(0.1, min(100.0, sp)))
+                except (TypeError, ValueError):
+                    pass
+                await engine.start()
+                try:
+                    from shared.integration.sim_clock import SimClock as _SC
+                    _SC.get_instance().set_anchor(
+                        engine.clock.now(), running=True, speed=engine.clock.speed,
+                    )
+                except Exception:
+                    logger.exception("autostart_shared_clock_sync_failed")
+                logger.info("sim auto-started on boot (speed=%.1fx)", engine.clock.speed)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("sim_autostart_failed: %s", exc)
+        asyncio.create_task(_autostart_sim())
+
 
 # ── latest-vitals cache ──────────────────────────────────────────────
 #
@@ -1143,21 +1172,45 @@ async def reset_sim(req: Optional[ResetRequest] = None):
             # per data-retention policy. Add it here only if the audit store
             # has been moved out (e.g. to an append-only vault).
         ]
+        # A service that answers status=error used to fall through both
+        # branches: no log on the error path, retry, then silent give-up. A
+        # half-failed reset still reported "Simulation reset." Track them.
+        reset_failures: list[str] = []
         for svc, path in reset_targets:
+            ok = False
+            last_err = ""
             for attempt in range(2):
                 try:
                     client = _reset_client._get_client(svc)
                     r = await client.post(path, {})
                     if r.get("status") != "error":
                         logger.info("%s reset ok", svc)
+                        ok = True
                         break
+                    last_err = str(r.get("error") or "status=error")
+                    logger.warning(
+                        "reset_returned_error",
+                        extra={"service": svc, "attempt": attempt, "error": last_err},
+                    )
                 except Exception as exc:
-                    logger.warning("reset_attempt_failed", extra={"service": svc, "attempt": attempt, "error": str(exc)})
+                    last_err = str(exc)
+                    logger.warning("reset_attempt_failed", extra={"service": svc, "attempt": attempt, "error": last_err})
+            if not ok:
+                reset_failures.append(f"{svc}: {last_err or 'no response'}")
+                logger.error("reset_failed service=%s err=%s", svc, last_err)
 
         # Re-initialise generator pool
         pool_limit = req.pool_limit if req else 500
         engine.generator.initialize(limit=pool_limit)
 
+        if reset_failures:
+            logger.error("Simulation reset INCOMPLETE — %d service(s) did not reset: %s",
+                         len(reset_failures), "; ".join(reset_failures))
+            return MessageResponse(
+                message=(f"Simulation reset, but {len(reset_failures)} service(s) did not "
+                         f"reset: {'; '.join(reset_failures)}"),
+                state=engine.get_state(),
+            )
         logger.info("Simulation reset (pool_limit=%d).", pool_limit)
         return MessageResponse(message="Simulation reset.", state=engine.get_state())
     finally:
@@ -1745,12 +1798,19 @@ def patient_journey(hadm_id: str):
         val = doc.get("valuenum")
         if not name or val is None:
             continue
+        # ``valuenum`` is occasionally an empty string / non-numeric in the
+        # source data — float("") raises and 500s the whole journey. Skip
+        # those rows rather than crash the endpoint.
+        try:
+            fval = float(val)
+        except (TypeError, ValueError):
+            continue
         vitals_series.setdefault(name, []).append({
             "time": doc.get("charttime"),
-            "value": round(float(val), 2),
+            "value": round(fval, 2),
         })
         # Snapshot = most-recent value seen so far
-        vitals[name] = round(float(val), 1)
+        vitals[name] = round(fval, 1)
 
     # ── Labs: full time series since admission + snapshot.
     all_lab_ids = _LAB_IDS
@@ -1768,13 +1828,17 @@ def patient_journey(hadm_id: str):
         val = doc.get("valuenum")
         if not name or val is None:
             continue
+        try:
+            fval = float(val)
+        except (TypeError, ValueError):
+            continue
         labs_series.setdefault(name, []).append({
             "time": doc.get("charttime"),
-            "value": round(float(val), 3),
+            "value": round(fval, 3),
             "unit": doc.get("valueuom"),
             "flag": doc.get("flag"),
         })
-        labs[name] = round(float(val), 2)
+        labs[name] = round(fval, 2)
 
     # Medications
     medications = list(sim_db["prescriptions"].find(

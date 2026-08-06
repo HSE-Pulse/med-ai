@@ -213,6 +213,17 @@ async def _hops_startup():
     except Exception as exc:  # noqa: BLE001
         logger.warning("startup_resync_failed: %s", exc)
 
+    # Keep the dashboard's Wait/Throughput ("MADDPG vs Baseline") charts live
+    # even when no external admission stream (Kafka / bed_management census) is
+    # driving the DES. Without this the engine sits frozen at t=0 and both
+    # chart series are dead-flat at zero. See ``_chart_demo_sampler_loop``.
+    if _CHART_SAMPLER_ENABLED:
+        try:
+            asyncio.create_task(_chart_demo_sampler_loop())
+            logger.info("chart_demo_sampler: task launched")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("chart_demo_sampler_launch_failed: %s", exc)
+
 
 # Ring buffer for observed cross-service Kafka events (visible via /kafka-events)
 _cross_service_events: List[Dict[str, Any]] = []
@@ -258,12 +269,12 @@ _prom_metrics = None
 
 # MARL model — loaded once at module level for inference.
 # Checkpoint path is env-overridable so the same code runs on the host
-# (where models live at ./models/...) and inside the
+# (where models live at /home/hari/hse/models/...) and inside the
 # container (where they're bind-mounted at /models/hospital_ops).
 _marl_agent = None
 _MARL_CHECKPOINT = os.environ.get(
     "MARL_CHECKPOINT",
-    os.path.join(os.environ.get("MODEL_DIR", "./models/hospital_ops"), "final_model.pt"),
+    os.path.join(os.environ.get("MODEL_DIR", "/home/hari/hse/models/hospital_ops"), "final_model.pt"),
 )
 
 def _load_marl_agent():
@@ -1178,6 +1189,181 @@ def _record_metrics_sample() -> None:
                 logger.debug("prom_gauge_update_failed: %s", exc)
     except Exception as exc:  # noqa: BLE001
         logger.debug("metrics_history_sample_failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Live chart sampler
+# ---------------------------------------------------------------------------
+# The dashboard's Hospital Ops page plots two time-series — Wait Time and
+# Throughput "Over Time", MADDPG vs Baseline — from this service's rolled
+# metrics history. Those samples are only produced when something drives the
+# DES forward: a bed_management ``notify-census`` tick or a Kafka
+# ``admission_complete`` event. When neither is flowing (e.g. the census poll
+# / Kafka bridge is idle) the engine stays frozen at simulation_time=0 and both
+# chart lines sit dead-flat at zero.
+#
+# This background loop keeps the chart refreshing on a short timer *without*
+# fabricating patients. It drives the SAME engines the Kafka / census handlers
+# feed — i.e. the real mirrored-MIMIC admission stream — aligns them to the
+# shared sim clock, runs the whole-hospital MADDPG staffing sweep on the live
+# engine, and records a metrics sample. The baseline engine (no sweep) is the
+# honest "do nothing" counterfactual. It is a no-op until a real session exists
+# and never advances faster than the shared clock, so hospital_ops stays pinned
+# to the rest of the platform's sim time instead of diverging into a private
+# simulation. (An earlier version stood up its own internal-arrival engines,
+# which drifted years ahead of the shared sim; that is deliberately gone.)
+# The data_ingestion sim must be *running* for the series to move — a paused
+# sim correctly leaves the chart holding its last real state. Set
+# ``HOPS_CHART_SAMPLER=0`` to disable.
+_CHART_SAMPLER_ENABLED = os.getenv("HOPS_CHART_SAMPLER", "1") != "0"
+_CHART_SAMPLER_INTERVAL_S = float(os.getenv("HOPS_CHART_SAMPLER_INTERVAL_S", "5"))
+
+
+async def _chart_demo_sampler_loop() -> None:
+    """Refresh the dashboard chart series from the real DES on a short timer.
+
+    Mirrors what ``notify-census`` does — align both engines to the shared sim
+    clock, MADDPG sweep on the live engine, record a sample — but on a fixed
+    cadence, so the chart keeps updating between bed_management census polls.
+    Operates only on the real mirrored-admission engines; it never injects
+    synthetic patients, so hospital_ops tracks the shared sim rather than
+    diverging. Set ``HOPS_CHART_SAMPLER=0`` to disable.
+    """
+    # Let broker attach + startup resync settle so a real session exists.
+    await asyncio.sleep(5)
+    cleared = False
+    while True:
+        try:
+            await asyncio.sleep(_CHART_SAMPLER_INTERVAL_S)
+            if not _sessions:
+                continue  # no real session yet — nothing to sample
+            live = list(_sessions.values())[-1]["engine"]
+            base = _get_baseline_engine()
+            # One-time: drop the frozen boot-time zero samples (and any stale
+            # history) so the chart starts from the real live state.
+            if not cleared:
+                _metrics_history.clear()
+                cleared = True
+            # Advance both engines to the shared sim clock (real sim time),
+            # run the whole-hospital MADDPG sweep on the live engine, record.
+            _align_engine_to_sim_clock(live)
+            _align_engine_to_sim_clock(base)
+            try:
+                _apply_global_marl_sweep(live)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("chart_sampler_sweep_failed: %s", exc)
+            _align_engine_to_sim_clock(live)
+            _record_metrics_sample()
+        except asyncio.CancelledError:  # noqa: PERF203
+            break
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("chart_sampler_tick_failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Policy benchmark — MADDPG (adaptive) vs static staffing under a fixed load
+# ---------------------------------------------------------------------------
+# The live "Over Time" charts show the real hospital, where adaptive and static
+# staffing are indistinguishable whenever occupancy is low (no congestion to
+# optimise against). This benchmark evaluates the policy the way the capstone
+# measures it: replay a fixed, congested workload through two identical engines
+# — one that re-optimises staffing every sim-hour (MADDPG policy + HSE
+# safety-floor layer), one held at static baseline staffing — and report the
+# wait-time / throughput gap. Deterministic (fixed seed) so the number is
+# stable and repeatable. Cached; force a fresh run with ?refresh=1.
+_BENCH_CACHE: Dict[str, Any] = {"value": None, "at": 0.0}
+_BENCH_TTL_S = 600.0
+_BENCH_HORIZON_H = int(os.getenv("HOPS_BENCH_HORIZON_H", "168"))       # 7 sim-days
+_BENCH_ARRIVAL_RATE = float(os.getenv("HOPS_BENCH_ARRIVAL_RATE", "12"))  # congesting load
+_BENCH_SEED = int(os.getenv("HOPS_BENCH_SEED", "42"))
+
+
+def _run_policy_benchmark(hours: int, seed: int, arrival_rate: float) -> Dict[str, Any]:
+    """Replay a fixed congested workload through an adaptive vs a static engine.
+
+    Both engines are identical (same seed, same internal Poisson arrivals) so
+    they see the same patient stream; the only difference is that the adaptive
+    engine gets the whole-hospital MADDPG staffing sweep each sim-hour while the
+    static engine is held at baseline staffing. Returns a per-hour series plus a
+    summary (mean wait reduction, throughput gain) measured after a warm-up so
+    the transient fill isn't scored.
+    """
+    cfg = dict(internal_arrivals=True, seed=seed, arrival_rate_per_hour=arrival_rate)
+    adaptive = DESEngine(DESConfig(**cfg))
+    static = DESEngine(DESConfig(**cfg))
+    adaptive.initialize()
+    static.initialize()
+
+    series: List[Dict[str, Any]] = []
+    step_h = 1.0
+    warmup_h = min(24.0, hours * 0.1)
+    a_wait_sum = s_wait_sum = a_thr_sum = s_thr_sum = 0.0
+    scored = 0
+    t = 0.0
+    while t < hours:
+        # Adaptive engine re-optimises staffing every hour; static never does.
+        try:
+            _apply_global_marl_sweep(adaptive)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("benchmark_sweep_failed: %s", exc)
+        adaptive.step(step_h)
+        static.step(step_h)
+        aw, at_, _ = _summarize_engine(adaptive)
+        sw, st_, _ = _summarize_engine(static)
+        t += step_h
+        series.append({
+            "sim_time_h": round(t, 1),
+            "adaptive_wait_min": round(aw, 1),
+            "static_wait_min": round(sw, 1),
+            "adaptive_throughput": at_,
+            "static_throughput": st_,
+        })
+        if t >= warmup_h:
+            a_wait_sum += aw
+            s_wait_sum += sw
+            a_thr_sum += at_
+            s_thr_sum += st_
+            scored += 1
+
+    scored = max(1, scored)
+    a_wait, s_wait = a_wait_sum / scored, s_wait_sum / scored
+    a_thr, s_thr = a_thr_sum / scored, s_thr_sum / scored
+    wait_red = ((s_wait - a_wait) / s_wait * 100.0) if s_wait > 0 else 0.0
+    thr_gain = ((a_thr - s_thr) / s_thr * 100.0) if s_thr > 0 else 0.0
+    return {
+        "horizon_hours": hours,
+        "arrival_rate_per_hour": arrival_rate,
+        "seed": seed,
+        "warmup_hours": round(warmup_h, 1),
+        "series": series,
+        "summary": {
+            "adaptive_wait_avg_min": round(a_wait, 1),
+            "static_wait_avg_min": round(s_wait, 1),
+            "wait_reduction_pct": round(wait_red, 1),
+            "adaptive_throughput_avg": round(a_thr, 2),
+            "static_throughput_avg": round(s_thr, 2),
+            "throughput_gain_pct": round(thr_gain, 1),
+        },
+    }
+
+
+@app.get("/api/policy-benchmark", response_model=BaseResponse, tags=["simulation"])
+async def get_policy_benchmark(refresh: bool = False) -> BaseResponse:
+    """MADDPG (adaptive) vs static staffing on a fixed congested workload.
+
+    Cached for 10 minutes; pass ``?refresh=1`` to force a fresh run. The sim
+    runs off-thread so the few-seconds compute doesn't block the event loop.
+    """
+    now = time.time()
+    cached = _BENCH_CACHE["value"]
+    if not refresh and cached is not None and (now - _BENCH_CACHE["at"]) < _BENCH_TTL_S:
+        return BaseResponse(data=cached)
+    result = await asyncio.to_thread(
+        _run_policy_benchmark, _BENCH_HORIZON_H, _BENCH_SEED, _BENCH_ARRIVAL_RATE,
+    )
+    _BENCH_CACHE["value"] = result
+    _BENCH_CACHE["at"] = now
+    return BaseResponse(data=result)
 
 
 # ---------------------------------------------------------------------------

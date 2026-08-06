@@ -61,7 +61,7 @@ LAB_RANGES = {
 DISPOSITION_LABELS = ["admit_to_inpatient", "discharge_home", "transfer", "expired", "lwbs"]
 
 DATASET_OUT_DIR = Path(
-    os.getenv("DATASET_OUT_DIR", "./datasets/ed_flow")
+    os.getenv("DATASET_OUT_DIR", "/home/hari/hse/datasets/ed_flow")
 )
 BATCH = 5000
 

@@ -49,24 +49,25 @@ scrape_configs:
     scrape_interval: 15s
     static_configs:
       - targets:
-          - "host.docker.internal:8201"
-          - "host.docker.internal:8202"
-          - "host.docker.internal:8203"
-          - "host.docker.internal:8204"
-          - "host.docker.internal:8205"
-          - "host.docker.internal:8206"
-          - "host.docker.internal:8207"
-          - "host.docker.internal:8208"
-          - "host.docker.internal:8209"
-          - "host.docker.internal:8210"
-          - "host.docker.internal:8214"
-          - "host.docker.internal:8215"
-          - "host.docker.internal:8216"
-          - "host.docker.internal:8217"
-          - "host.docker.internal:8218"
-          - "host.docker.internal:8219"
-          - "host.docker.internal:8220"
-          - "host.docker.internal:8221"
+          - "ed_triage:8201"
+          - "sepsis_icu:8202"
+          - "hospital_ops:8203"
+          - "oncology_ai:8204"
+          - "patient_journey:8205"
+          - "clinical_chat:8206"
+          - "data_ingestion:8207"
+          - "bed_management:8208"
+          - "waiting_list:8209"
+          - "clinical_scribe:8210"
+          - "ed_flow:8214"
+          - "erp:8215"
+          - "trolley_watch:8216"
+          - "gdpr:8217"
+          - "xai:8218"
+          - "fhir:8219"
+          - "deterioration:8220"
+          - "discharge_lounge:8221"
+          - "alerts:8222"
     relabel_configs:
       # Use the port as the 'service' label so panels can group per-service.
       - source_labels: [__address__]
@@ -145,6 +146,10 @@ scrape_configs:
         regex: "8221"
         target_label: service
         replacement: "discharge_lounge"
+      - source_labels: [service_port]
+        regex: "8222"
+        target_label: service
+        replacement: "alerts"
 
   # ─────────────────────────────────────────────────────────────
   # Dashboard-specific domain metrics — patient throughput comes

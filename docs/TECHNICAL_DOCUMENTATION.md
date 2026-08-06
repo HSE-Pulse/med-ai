@@ -2,7 +2,7 @@
 
 **Version:** 1.0.0
 **Classification:** Clinical Decision Support System (CDSS)
-**Target Deployment:** the partner hospital
+**Target Deployment:** MS Ramaiah Health Services, Bengaluru, India
 **Last Updated:** 2026-04-02
 
 ---
@@ -31,7 +31,7 @@
 
 ### 1.1 Purpose
 
-MedAI Platform is an integrated healthcare AI system built as a monorepo (`med-ai`) containing seven specialized microservices, a real-time simulation engine, and a unified clinical dashboard. The system delivers machine-learning-powered clinical decision support across four critical hospital domains: Emergency Department triage, ICU sepsis prediction, hospital operations optimization, and oncology risk assessment.
+MedAI Platform is an integrated healthcare AI system built as a monorepo (`cancer-ai`) containing seven specialized microservices, a real-time simulation engine, and a unified clinical dashboard. The system delivers machine-learning-powered clinical decision support across four critical hospital domains: Emergency Department triage, ICU sepsis prediction, hospital operations optimization, and oncology risk assessment.
 
 ### 1.2 Core Problem Statement
 
@@ -1091,7 +1091,7 @@ Roles:
 - [ ] Sepsis ICU API serving (port 8202) with full alert pipeline
 - [ ] Hospital Ops API serving (port 8203) for server-side MARL inference
 - [ ] Performance benchmarking: latency (P50/P95/P99), throughput (requests/sec)
-- [ ] Clinical validation pilot at the partner hospital (50 patients, ED triage accuracy vs. physician)
+- [ ] Clinical validation pilot at MS Ramaiah (50 patients, ED triage accuracy vs. physician)
 - [ ] ABDM Health ID integration (consent-based data sharing)
 
 ### 12.2 Medium-Term (6-12 Months)
@@ -1239,7 +1239,7 @@ MedAI predictions → FHIR DiagnosticReport → Hospital HIS display
 
 ### 14.1 Case Study: ED Triage Acceleration
 
-**Scenario:** 55-year-old male arrives at the partner hospital ED via ambulance with chest pain and diaphoresis.
+**Scenario:** 55-year-old male arrives at MS Ramaiah ED via ambulance with chest pain and diaphoresis.
 
 **Traditional workflow:** Triage nurse manually assesses (3-5 min), assigns ESI based on experience.
 
@@ -1357,7 +1357,7 @@ MedAI SepsisLGBM output at Hour 6:
 **Requirements:**
 | Requirement | Status | Plan |
 |-------------|--------|------|
-| Clinical validation | Planned | Pilot study at the partner hospital (50+ patients, ED triage accuracy vs. attending physician) |
+| Clinical validation | Planned | Pilot study at MS Ramaiah (50+ patients, ED triage accuracy vs. attending physician) |
 | Risk classification | Class B (medium risk) | Non-autonomous; clinician makes final decision |
 | Technical documentation | This document | Complete |
 | Quality Management System | Planned | ISO 13485 implementation |
@@ -1403,7 +1403,7 @@ This system does not provide definitive diagnoses."
 
 ```
 Study Design: Prospective observational study
-Setting: the partner hospital Emergency Department
+Setting: MS Ramaiah Emergency Department, Bengaluru
 Population: Adult patients (≥18 years) presenting to ED
 Sample Size: Minimum 500 patients (powered for F1 comparison)
 
@@ -1415,7 +1415,7 @@ Protocol:
 5. Measure: Cohen's κ, weighted F1, per-class sensitivity/specificity
 6. Secondary: Time-to-triage, patient throughput, adverse events
 
-Ethics: IRB approval from the partner hospital institutional review board
+Ethics: IRB approval from MS Ramaiah institutional review board
 Duration: 3 months (expected enrollment rate: 50-80 patients/day)
 Outcome: Published validation study + CDSCO submission data
 ```
@@ -1502,4 +1502,4 @@ procedures_icd
 
 ---
 
-*Document generated from codebase analysis of `med-ai` monorepo. All metrics, architectures, and specifications reflect actual implementation as of 2026-04-02.*
+*Document generated from codebase analysis of `cancer-ai` monorepo. All metrics, architectures, and specifications reflect actual implementation as of 2026-04-02.*

@@ -15,8 +15,8 @@ Usage::
     uvicorn app_01_ed_triage.backend.app.main:app --host 0.0.0.0 --port 8001
 
 Environment variables:
-    MODEL_DIR    Path to saved models (default: ./models/ed_triage)
-    DATASET_DIR  Path to Parquet splits (default: ./datasets/ed_triage)
+    MODEL_DIR    Path to saved models (default: /home/hari/hse/models/ed_triage)
+    DATASET_DIR  Path to Parquet splits (default: /home/hari/hse/datasets/ed_triage)
 """
 
 from __future__ import annotations
@@ -57,8 +57,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ed_triage.api")
 
-MODEL_DIR = Path(os.getenv("MODEL_DIR", "./models/ed_triage"))
-DATASET_DIR = Path(os.getenv("DATASET_DIR", "./datasets/ed_triage"))
+MODEL_DIR = Path(os.getenv("MODEL_DIR", "/home/hari/hse/models/ed_triage"))
+DATASET_DIR = Path(os.getenv("DATASET_DIR", "/home/hari/hse/datasets/ed_triage"))
 
 # ---------------------------------------------------------------------------
 # Application factory

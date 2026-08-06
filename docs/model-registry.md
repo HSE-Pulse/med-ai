@@ -1,4 +1,4 @@
-# Model Registry — Med AI Healthcare Platform
+# Model Registry — Cancer AI Healthcare Platform
 
 Complete inventory of all machine learning models across the monorepo, including features, outputs, architecture, hyperparameters, and performance metrics.
 

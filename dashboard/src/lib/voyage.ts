@@ -4,7 +4,7 @@
  * ordered list of cinematic stages, plus the reducer that mutates the
  * stages from WebSocket deltas.
  *
- *
+ * See ~/.claude/plans/create-a-new-workflow-agile-quasar.md for the
  * design intent.
  */
 

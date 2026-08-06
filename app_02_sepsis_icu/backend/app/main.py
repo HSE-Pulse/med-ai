@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 from fastapi import HTTPException, WebSocket, WebSocketDisconnect
 
+from shared.integration.sim_clock import get_sim_time
 from shared.api.base import create_app
 from prometheus_client import Counter, Gauge, Histogram, generate_latest
 
@@ -463,7 +464,7 @@ async def patient_timeline(stay_id: int):
     """
     REQUEST_COUNT.labels(method="GET", endpoint="/patient/timeline", status=200).inc()
 
-    now = datetime.utcnow()
+    now = get_sim_time().replace(tzinfo=None)
     admission_time = now - timedelta(hours=random.randint(12, 72))
     n_points = int((now - admission_time).total_seconds() / 3600)
 
@@ -555,7 +556,7 @@ async def unit_overview():
     mongo = _state.get("_mongo") or MongoManager()
     sim_db = mongo.client["MIMIC_SIM"]
 
-    now = datetime.utcnow()
+    now = get_sim_time().replace(tzinfo=None)
     patients: List[PatientSummary] = []
 
     admitted = sim_db["admissions"].find(
@@ -652,7 +653,7 @@ async def ws_monitor(websocket: WebSocket):
     try:
         while True:
             # Generate a simulated update
-            now = datetime.utcnow()
+            now = get_sim_time().replace(tzinfo=None)
             stay_id = random.randint(30000001, 30000020)
             risk = random.betavariate(2, 5)
             alert = risk_to_alert(risk)

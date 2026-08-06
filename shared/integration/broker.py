@@ -178,6 +178,10 @@ class MongoBroker(BrokerBase):
         return len(docs)  # caller does the dispatch; this returns count
 
 
+_RECONNECT_MIN_S = 5.0
+_RECONNECT_MAX_S = 60.0
+
+
 class KafkaBroker(BrokerBase):
     """Kafka (or Redpanda) async broker using aiokafka.
 
@@ -197,9 +201,14 @@ class KafkaBroker(BrokerBase):
         self._producer: Optional[AIOKafkaProducer] = None  # type: ignore
         self._consumers: List[AIOKafkaConsumer] = []  # type: ignore
         self._consumer_tasks: List[asyncio.Task] = []
+        # Set once the producer is live. Consumers await this rather than
+        # sampling _producer once, so a late broker still gets picked up.
+        self._ready = asyncio.Event()
+        self._reconnect_task: Optional[asyncio.Task] = None
 
-    async def start(self) -> None:
-        self._producer = AIOKafkaProducer(
+    async def _try_start(self) -> bool:
+        """One connection attempt. True when the producer is live."""
+        producer = AIOKafkaProducer(
             bootstrap_servers=self.bootstrap,
             value_serializer=_serialise,
             enable_idempotence=True,
@@ -208,13 +217,60 @@ class KafkaBroker(BrokerBase):
             linger_ms=5,
         )
         try:
-            await self._producer.start()
-            logger.info("kafka_broker_started bootstrap=%s", self.bootstrap)
-        except Exception as exc:
-            logger.warning("kafka_producer_start_failed: %s — broker disabled", exc)
+            await producer.start()
+        except Exception as exc:  # noqa: BLE001
+            # Close the half-built producer, otherwise aiokafka logs an
+            # "Unclosed AIOKafkaProducer" error on every failed attempt.
+            try:
+                await producer.stop()
+            except Exception:  # noqa: BLE001
+                pass
             self._producer = None
+            logger.warning("kafka_producer_start_failed: %s", exc)
+            return False
+        self._producer = producer
+        self._ready.set()
+        logger.info("kafka_broker_started bootstrap=%s", self.bootstrap)
+        return True
+
+    async def _reconnect_forever(self) -> None:
+        """Retry with exponential backoff until the broker answers.
+
+        Services routinely boot before Redpanda accepts connections. Without
+        this the race was terminal: the service could neither consume nor
+        produce for the life of the process, and the only symptom was a
+        single INFO line at startup.
+        """
+        delay = _RECONNECT_MIN_S
+        while self._producer is None:
+            await asyncio.sleep(delay)
+            if await self._try_start():
+                logger.info("kafka_reconnected bootstrap=%s", self.bootstrap)
+                return
+            delay = min(delay * 2, _RECONNECT_MAX_S)
+
+    async def start(self) -> None:
+        if self._producer is not None:      # already connected; startup() is
+            return                          # called once per service but be safe
+        if await self._try_start():
+            return
+        if self._reconnect_task is None or self._reconnect_task.done():
+            self._reconnect_task = asyncio.create_task(
+                self._reconnect_forever(), name="kafka-reconnect",
+            )
+        logger.warning(
+            "kafka_unreachable at boot — retrying in background every "
+            "%.0f-%.0fs; produce() is a no-op until connected",
+            _RECONNECT_MIN_S, _RECONNECT_MAX_S,
+        )
+
+    async def wait_ready(self) -> None:
+        """Block until the producer is live (returns at once if it already is)."""
+        await self._ready.wait()
 
     async def stop(self) -> None:
+        if self._reconnect_task is not None:
+            self._reconnect_task.cancel()
         for task in self._consumer_tasks:
             task.cancel()
         for consumer in self._consumers:

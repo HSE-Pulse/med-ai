@@ -377,12 +377,39 @@ async def lifespan(application: FastAPI):
                         hid, removed, len(stale_esc),
                     )
 
+            async def _on_transfer(_topic, payload):
+                """Follow the patient when they change department.
+
+                patient_transferred was already subscribed but had no handler,
+                so a snapshot kept whatever department it was admitted with for
+                the rest of its life. /deterioration/stats builds by_department
+                straight off those snapshots, which is why its ED count sat at
+                4-5 while the actual ED census moved between 1 and 3.
+                """
+                hid = _resolve_hid(payload)
+                dest = payload.get("to_department") or payload.get("department")
+                if not hid or not dest:
+                    return
+                snap = _state["active_alerts"].get(hid)
+                if snap is None or snap.get("department") == dest:
+                    return
+                snap["department"] = dest
+                db = _mongo_db() if "_mongo_db" in globals() else None
+                if db is not None:
+                    try:
+                        db[COLL_ACTIVE].update_many(
+                            {"hadm_id": hid}, {"": {"department": dest}},
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+
             await attach_with_ring_buffer(
                 service_id="deterioration",
                 topics=["admission_complete", "patient_discharged", "patient_transferred"],
                 mongo_client=_state["mongo"].client,
                 extra_handlers={
                     "patient_discharged": _on_discharge,
+                    "patient_transferred": _on_transfer,
                 },
             )
     except Exception as exc:  # noqa: BLE001

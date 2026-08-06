@@ -35,7 +35,7 @@ from shared.ml.registry import ModelRegistry
 from shared.integration.event_bus import get_event_bus
 from shared.integration.service_client import ServiceClient
 
-MODEL_DIR = Path(os.getenv("MODEL_DIR", "./models/waiting_list"))
+MODEL_DIR = Path(os.getenv("MODEL_DIR", "/home/hari/hse/models/waiting_list"))
 
 from app_09_waiting_list.backend.app.schemas import (
     IRISH_SPECIALTIES,

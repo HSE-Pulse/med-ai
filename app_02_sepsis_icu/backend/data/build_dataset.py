@@ -29,7 +29,7 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 # Allow imports from the shared package two levels up
 # ---------------------------------------------------------------------------
-PROJECT_ROOT = Path(__file__).resolve().parents[4]  # .
+PROJECT_ROOT = Path(__file__).resolve().parents[4]  # /home/hari/hse
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from shared.db.mongo import MongoManager

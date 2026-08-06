@@ -25,6 +25,7 @@ services:
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.115.1
     container_name: medai-otel-collector
+    restart: unless-stopped
     command: ["--config=/etc/otel-collector-config.yaml"]
     networks: [cancer_default]
     volumes:
@@ -45,6 +46,7 @@ services:
   jaeger:
     image: jaegertracing/all-in-one:1.60
     container_name: medai-jaeger
+    restart: unless-stopped
     networks: [cancer_default]
     environment:
       COLLECTOR_OTLP_ENABLED: "true"

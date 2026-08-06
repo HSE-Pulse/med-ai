@@ -394,6 +394,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Prometheus /metrics — the same shared helper every other MedAI service
+# installs. Alerts was the one service that never called it, so it exposed
+# only /health and Prometheus could not scrape it at all: the medai-services
+# job carried 18 targets while the platform runs 19, and the console read
+# "AI services up 18 / 18".
+try:
+    from shared.integration.prometheus_metrics import install_metrics
+    install_metrics(app, service_name="alerts")
+except Exception as exc:  # noqa: BLE001
+    logger.warning("prometheus_metrics_install_failed: %s", exc)
+
 
 # ──────────────────────────────────────────────────────────────────────
 # REST endpoints

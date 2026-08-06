@@ -194,7 +194,7 @@ Your platform currently has **7 modules** built on MIMIC-IV data. This report re
 |-----------|--------|
 | **HSE Alignment** | "AI for Care" Year 1 priority: "AI scribe tools to cut documentation time by up to 40%" |
 | **What It Does** | Real-time clinical encounter transcription, structured note generation (SOAP format), auto-coding (ICD-10, SNOMED CT), integration with Clinical Chat for conversational documentation, specialty-specific templates |
-| **Technical Approach** | Whisper/local ASR for transcription; LLM (Ollama or a commercial LLM API) for structuring; NER for entity extraction; rule-based for ICD-10 coding |
+| **Technical Approach** | Whisper/local ASR for transcription; LLM (Ollama or Claude API) for structuring; NER for entity extraction; rule-based for ICD-10 coding |
 | **Key Metrics** | Documentation time reduction (target: 40%), coding accuracy, clinician satisfaction |
 | **Competitors** | Nabla (France), Nuance DAX (Microsoft), Suki AI. **None deployed in Irish public hospitals.** |
 | **Interoperability** | Extends: Clinical Chat (App 06) with audio input and structured output. Feeds: Patient Journey (structured clinical notes), Oncology AI (clinical note analysis), ED Triage (chief complaint extraction) |
@@ -361,7 +361,7 @@ Your platform currently has **7 modules** built on MIMIC-IV data. This report re
 
 | What to Change | Why | How |
 |----------------|-----|-----|
-| Replace Ollama with **a commercial LLM API** or production LLM | Ollama is local/experimental; Irish hospital deployment needs enterprise-grade LLM | Integrate a commercial LLM API via the vendor SDK; add fallback chain |
+| Replace Ollama with **Claude API** or production LLM | Ollama is local/experimental; Irish hospital deployment needs enterprise-grade LLM | Integrate Claude API via Anthropic SDK; add fallback chain |
 | Add **Irish clinical guidelines** as RAG context | HSE publishes clinical guidelines; clinicians need guideline-aware responses | Build RAG pipeline with HSE/HIQA/NCCP guidelines |
 | Add **Irish formulary** integration | Irish hospitals use specific formulary (HSE-approved medications) | Index Irish formulary for medication queries |
 | Add **role-based access** | Different clinical roles need different information levels | Implement RBAC: consultant, registrar, SHO, nurse, pharmacist |
@@ -404,7 +404,7 @@ Your platform currently has **7 modules** built on MIMIC-IV data. This report re
 +----v--v+ +---v---+ +-v------+v+ +--v----+ +v------v+ +---v--v----+
 |ED Triage| |Sepsis | |Hosp Ops | |Oncology| |Patient | |Clinical   |
 |  (01)   | |ICU(02)| | (03)    | |AI (04) | |Journey | |Chat (06)  |
-|+MTS     | |+NEWS2 | |+MARL    | |+NCCP   | |(05)    | |+LLM API|
+|+MTS     | |+NEWS2 | |+MARL    | |+NCCP   | |(05)    | |+Claude API|
 |+6hr PET | |+Wards | |+Irish   | |+MDT    | |+FHIR   | |+RAG+RBAC  |
 +---------+ +-------+ +---------+ +--------+ |+HIPE   | +-----------+
      |          |          |          |       +--------+       |
@@ -503,7 +503,7 @@ External Systems (EHR, PACS, Lab, Pharmacy)
 | **Sepsis ICU Activation (02)** | 10 | 8 | 8 | 8 | 9 | 7 | **50** | **#2** |
 | **Patient Journey + FHIR (05)** | 6 | 8 | 10 | 10 | 7 | 8 | **49** | **#4** |
 | **Oncology + NCCP (04)** | 9 | 7 | 8 | 8 | 7 | 8 | **47** | **#5** |
-| **Clinical Chat + LLM (06)** | 7 | 8 | 8 | 7 | 8 | 7 | **45** | **#6** |
+| **Clinical Chat + Claude (06)** | 7 | 8 | 8 | 7 | 8 | 7 | **45** | **#6** |
 
 ### Recommended Implementation Phases
 
@@ -516,7 +516,7 @@ External Systems (EHR, PACS, Lab, Pharmacy)
 **Phase 2 (Months 3-6): Core Operational Modules**
 5. Bed Management completion + ED Flow Optimizer (New #8, #14)
 6. Hospital Ops MARL completion (Refinement #3)
-7. Clinical Chat upgrade to a commercial LLM API (Refinement #6)
+7. Clinical Chat upgrade to Claude API (Refinement #6)
 8. Begin Waiting List Intelligence (New #9)
 
 **Phase 3 (Months 6-9): Clinical Intelligence**
@@ -657,7 +657,7 @@ HIHI is the **primary gateway** for AI companies to pilot in Irish hospitals. Re
 | 03 | Hospital Ops + MARL | Refined | Complete MARL + Irish profiles | 50 |
 | 04 | Oncology AI + NCCP | Refined | Align with Irish cancer strategy | 47 |
 | 05 | Patient Journey + FHIR | Refined | Add FHIR output + ICD-10-AM | 49 |
-| 06 | Clinical Chat + LLM | Refined | Upgrade LLM + RAG + RBAC | 45 |
+| 06 | Clinical Chat + Claude | Refined | Upgrade LLM + RAG + RBAC | 45 |
 | 07 | Data Ingestion Sim | Existing | Unchanged (training/demo use) | - |
 | **08** | **Bed Management** | **New** | Real-time beds + discharge prediction | **54** |
 | **09** | **Waiting List Intel** | **New** | ML prioritization + scheduling | **53** |

@@ -1,6 +1,6 @@
 # AI Clinical Documentation / Ambient Scribe Systems: Deep Research Report
 
-**Prepared for:** MedAI Platform -- Med AI Healthcare System
+**Prepared for:** MedAI Platform -- Cancer AI Healthcare System
 **Date:** April 2026
 **Classification:** Research Reference Document
 
@@ -366,8 +366,8 @@
 
 | Aspect | State of the Art |
 |--------|-----------------|
-| **Architecture** | Encoder-decoder Transformers dominate. Three approaches: (1) End-to-end LLM (GPT-4, a commercial LLM) from transcript to note; (2) Pipeline: ASR -> section extraction -> section summarization; (3) Section-specific fine-tuned adapters (15 LoRA adapters for 15 note sections). |
-| **Leading Models** | GPT-4/GPT-4o (commercial), commercial LLMs, GatorTronGPT (20B params, clinical-specific), Med-PaLM 2 (Google, medical domain), Llama 3 fine-tuned variants (open-source). |
+| **Architecture** | Encoder-decoder Transformers dominate. Three approaches: (1) End-to-end LLM (GPT-4, Claude) from transcript to note; (2) Pipeline: ASR -> section extraction -> section summarization; (3) Section-specific fine-tuned adapters (15 LoRA adapters for 15 note sections). |
+| **Leading Models** | GPT-4/GPT-4o (commercial), Claude 3.5 (commercial), GatorTronGPT (20B params, clinical-specific), Med-PaLM 2 (Google, medical domain), Llama 3 fine-tuned variants (open-source). |
 | **Clinical-Specific LLMs** | GatorTronGPT: 20B params, trained on 277B words (82B clinical from UF Health). BioGPT: Pre-trained on 15M PubMed abstracts. BioMedLM: 2.7B params, biomedical focused. |
 | **Fine-Tuning Approach** | LoRA/QLoRA adapters per note section (Chief Complaint, HPI, ROS, PMH, Assessment, Plan). CliniKnote dataset: 1,200 conversation-note pairs for training. |
 | **Prompting Techniques** | Few-shot prompting with specialty-specific examples; chain-of-thought for diagnostic reasoning in Assessment section; retrieval-augmented generation (RAG) with patient chart data. |
@@ -426,7 +426,7 @@
 |-----------------|-------------------|
 | **Lexical Overlap** | ROUGE-1/2/L (recall-oriented): standard for summarization quality. BLEU (precision-oriented): less used in clinical context. Limitation: penalizes valid paraphrases; misses semantic equivalence. |
 | **Semantic Similarity** | BERTScore: contextual embedding similarity. BLEURT: learned evaluation metric. Better at capturing meaning-preserving variations. |
-| **LLM-as-Evaluator** | commercial LLMs used to evaluate note quality on multiple dimensions. More tolerant of paraphrasing, sensitive to clinically relevant changes. Emerging as scalable alternative to human review. |
+| **LLM-as-Evaluator** | GPT-4/Claude used to evaluate note quality on multiple dimensions. More tolerant of paraphrasing, sensitive to clinically relevant changes. Emerging as scalable alternative to human review. |
 | **Human Expert Evaluation** | PDQI-9 instrument (validated 9-item physician documentation quality index). Dimensions: accuracy, completeness, organization, clarity, conciseness, internal consistency, appropriateness of assessment, appropriateness of plan, overall quality. |
 | **Clinical-Specific Metrics** | Critical error defect rate (DeepScribe): percentage of notes with clinically dangerous errors. Clinician correction rate: percentage of generated text modified before signing. Time-to-sign: seconds from note generation to physician signature. Hallucination rate: factual claims not supported by source conversation/chart. |
 | **Recommended Evaluation Strategy** | Layered approach (2025 best practice): Layer 1: Automated semantic metrics (BERTScore, BLEURT) for scalable screening. Layer 2: LLM-as-evaluator for nuanced quality assessment. Layer 3: Targeted human physician adjudication for safety validation. Cross-institutional and multilingual validation required before deployment. |

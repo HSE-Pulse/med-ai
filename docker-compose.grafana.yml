@@ -27,13 +27,17 @@ services:
   prometheus:
     image: prom/prometheus:v2.55.1
     container_name: medai-prometheus
+    restart: unless-stopped
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.retention.time=30d
       - --storage.tsdb.retention.size=2GB
       - --web.enable-lifecycle        # /-/reload without restart
+      - --web.console.templates=/etc/prometheus/consoles
+      - --web.console.libraries=/etc/prometheus/console_libraries
     volumes:
       - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/consoles/medai.html:/etc/prometheus/consoles/medai.html:ro
       - prom_data:/prometheus
     ports:
       - "9091:9090"
@@ -48,6 +52,7 @@ services:
   grafana:
     image: grafana/grafana:11.3.1
     container_name: medai-grafana
+    restart: unless-stopped
     depends_on:
       prometheus:
         condition: service_healthy

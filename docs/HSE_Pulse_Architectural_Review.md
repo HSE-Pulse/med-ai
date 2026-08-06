@@ -1,6 +1,6 @@
 # MedAI Platform (HSE Pulse) — Architectural Gap Analysis & Implementation Roadmap
 
-**Reviewer model:** an internal AI architectural review
+**Reviewer model:** Claude Opus 4.7
 **Scope:** v3.0 system design (18 backend microservices, shared integration layer, React 19 dashboard, MongoDB persistence, MIMIC-IV simulation pool)
 **Review lens:** Irish HSE Model 4 hospital deployment readiness
 **Date:** 23 April 2026

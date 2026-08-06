@@ -1,0 +1,22 @@
+%% Med AI — architecture (renders on GitHub / mermaid.live)
+flowchart LR
+  subgraph PIPE["Reproducible ML pipeline (per app)"]
+    direction LR
+    DB[("MongoDB<br/>MIMIC-IV<br/>260M+ hosp · 332M+ ICU")] -->
+    BD["build_dataset.py<br/>cohort · features · labels · split"] -->
+    DS[("datasets/<br/>Parquet · NPZ")] -->
+    TR["train.py<br/>train · tune · eval"] -->
+    MD[("models/<br/>XGBoost · LightGBM · PyTorch")] -->
+    API["FastAPI<br/>/predict · /health · /model-info"] -->
+    UI["React + Vite<br/>live dashboard"]
+  end
+
+  APPS["20+ clinical apps:<br/>ED Triage · Sepsis/ICU · Oncology · Hospital Ops ·<br/>Patient Journey · Clinical Chat/Scribe · FHIR · …"] -.consumes.-> UI
+  LLM["Ollama — local LLMs<br/>Llama · DeepSeek · MedGemma · OpenBioLLM"] -.-> API
+  PLAT["Platform: MongoDB 7 · Kafka/Redpanda · Redis · Docker Compose"] -.-> API
+  OBS["Observability: Prometheus · Grafana · Loki · OpenTelemetry · Jaeger"] -.-> API
+
+  classDef store fill:#ccfbf1,stroke:#0d9488,color:#0f172a;
+  classDef proc fill:#fff,stroke:#0d9488,color:#0f172a;
+  class DB,DS,MD store;
+  class BD,TR,API,UI proc;

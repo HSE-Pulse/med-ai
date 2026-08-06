@@ -32,7 +32,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("waiting_list.build_dataset")
 
 DATASET_OUT_DIR = Path(
-    os.getenv("DATASET_OUT_DIR", "./datasets/waiting_list")
+    os.getenv("DATASET_OUT_DIR", "/home/hari/hse/datasets/waiting_list")
 )
 BATCH = 5000
 

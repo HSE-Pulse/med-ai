@@ -28,15 +28,51 @@ interface Forecast {
 }
 interface Bottleneck { bottleneck_type: string; severity: string; affected_patients: number; recommended_action: string; }
 interface Recommendation { priority: string; title: string; description: string; }
+interface FlowCheck {
+  panel: "bottlenecks" | "recommendations";
+  rule: string; metric: string;
+  value: number | string; threshold: number | string;
+  comparator: string; tripped: boolean;
+}
 interface WhatIf { scenario_type: string; baseline_avg_los: number; simulated_avg_los: number; los_reduction_minutes: number; baseline_pet_compliance: number; simulated_pet_compliance: number; summary: string; }
 
 import { MTS_COLORS, CROWDING_COLORS as CROWD_COLORS } from "../lib/colors";
+
+/** What a panel is watching, when it has nothing to report. Shows the live
+ *  value against the threshold so "empty" reads as "checked and clear",
+ *  never as "broken". */
+function Watching({ checks, panel, label }: {
+  checks: FlowCheck[]; panel: FlowCheck["panel"]; label: string;
+}) {
+  const rows = checks.filter(c => c.panel === panel);
+  if (rows.length === 0) {
+    return <div className="text-text-muted text-[11px] py-8 text-center">{label}</div>;
+  }
+  return (
+    <div className="py-4">
+      <div className="text-text-muted text-[11px] text-center mb-3">{label}</div>
+      <div className="space-y-1.5">
+        {rows.map(c => (
+          <div key={c.rule}
+               className="flex items-center justify-between gap-2 text-[10px] px-2 py-1.5 rounded-md bg-slate-500/5 border border-border">
+            <span className="text-text-secondary capitalize truncate">{c.metric}</span>
+            <span className="text-text-muted tabular-nums whitespace-nowrap">
+              <span className="text-text-primary font-medium">{String(c.value)}</span>
+              {" "}<span className="opacity-60">{c.comparator} {String(c.threshold)}</span>
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 export default function EDFlowOptimizer() {
   const [st, setSt] = useState<EDState | null>(null);
   const [fc, setFc] = useState<Forecast[]>([]);
   const [bn, setBn] = useState<Bottleneck[]>([]);
   const [rec, setRec] = useState<Recommendation[]>([]);
+  const [checks, setChecks] = useState<FlowCheck[]>([]);
   const [wi, setWi] = useState<WhatIf | null>(null);
   const [scenario, setScenario] = useState("add_doctor");
   const [sVal, setSVal] = useState(1);
@@ -45,16 +81,18 @@ export default function EDFlowOptimizer() {
 
   const fetchAll = useCallback(async () => {
     try {
-      const [s, f, b, r] = await Promise.all([
+      const [s, f, b, r, c] = await Promise.all([
         fetch("/api/ed-flow/ed-state").then(r => r.json()),
         fetch("/api/ed-flow/forecast/arrivals").then(r => r.json()),
         fetch("/api/ed-flow/ed-state/bottlenecks").then(r => r.json()),
         fetch("/api/ed-flow/recommendations").then(r => r.json()),
+        fetch("/api/ed-flow/ed-state/checks").then(r => r.json()),
       ]);
       if (s.status === "ok") setSt(s.data);
       if (f.status === "ok") setFc(f.data || []);
       if (b.status === "ok") setBn(b.data || []);
       if (r.status === "ok") setRec(r.data || []);
+      if (c.status === "ok") setChecks(c.data || []);
     } catch (e) { setError(e instanceof Error ? e.message : "Request failed"); }
     setLoading(false);
   }, []);
@@ -226,7 +264,7 @@ export default function EDFlowOptimizer() {
                 </div>
               ))}
             </div>
-          ) : <div className="text-text-muted text-[11px] py-8 text-center">No bottlenecks detected</div>}
+          ) : <Watching checks={checks} panel="bottlenecks" label="No bottlenecks detected — watching" />}
         </div>
 
         {/* Recommendations */}
@@ -246,7 +284,7 @@ export default function EDFlowOptimizer() {
                 </div>
               ))}
             </div>
-          ) : <div className="text-text-muted text-[11px] py-8 text-center">No recommendations</div>}
+          ) : <Watching checks={checks} panel="recommendations" label="No recommendations — watching" />}
         </div>
 
         {/* What-If */}

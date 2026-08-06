@@ -1,4 +1,4 @@
-# Med AI Healthcare Platform - Technical Overview
+# Cancer AI Healthcare Platform - Technical Overview
 
 **Version:** 1.0.0
 **Last Updated:** 2026-03-31
@@ -28,7 +28,7 @@
 
 ## 1. Executive Summary
 
-The Med AI Healthcare Platform is a production-oriented monorepo comprising five clinical
+The Cancer AI Healthcare Platform is a production-oriented monorepo comprising five clinical
 applications built on the MIMIC-IV critical-care database. The platform spans the
 full clinical decision-support spectrum -- from emergency department triage and real-time sepsis
 surveillance to hospital-wide operational optimization and oncology pathway intelligence. Each
@@ -1164,5 +1164,5 @@ D:\project-demo\cancer\
 
 ---
 
-*Document generated for the Med AI Healthcare Platform. For questions or updates, refer to
+*Document generated for the Cancer AI Healthcare Platform. For questions or updates, refer to
 the project repository at `D:\project-demo\cancer\`.*

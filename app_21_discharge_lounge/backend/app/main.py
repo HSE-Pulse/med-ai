@@ -1118,7 +1118,11 @@ async def reset_lounge() -> BaseResponse:
     _state.get("completed_order", deque()).clear()
     persistent = _state.get("persistent")
     if persistent is not None:
-        persistent.clear()
+        # Sync pymongo call: must not run on the event loop. A sim
+        # reset issues delete_many({}) over the same database at the
+        # same moment, and blocking here wedged the whole service —
+        # /health included — until it was restarted by hand.
+        await asyncio.to_thread(persistent.clear)
     return BaseResponse(data={"reset": True})
 
 

@@ -34,7 +34,7 @@ from shared.ml.registry import ModelRegistry
 from shared.integration.event_bus import get_event_bus
 from shared.integration.service_client import ServiceClient
 
-MODEL_DIR = Path(os.getenv("MODEL_DIR", "./models/clinical_scribe"))
+MODEL_DIR = Path(os.getenv("MODEL_DIR", "/home/hari/hse/models/clinical_scribe"))
 
 from app_10_clinical_scribe.backend.app.schemas import (
     ClinicalEntity,
@@ -228,7 +228,7 @@ async def generate_note(req: GenerateNoteRequest) -> BaseResponse:
     # Fetch patient context from other modules
     context = await _fetch_patient_context(req.patient_id, req.hadm_id)
 
-    # Generate SOAP note (a commercial LLM API / Ollama in Phase 2)
+    # Generate SOAP note (Claude API / Ollama in Phase 2)
     soap = _generate_soap_from_text(req.transcript, req.note_type, context)
 
     # Extract entities
@@ -538,7 +538,7 @@ async def _resolve_department(hadm_id) -> Optional[str]:
 
 
 def _generate_soap_from_text(text: str, note_type: str, context: Dict) -> SOAPNote:
-    """Generate SOAP note from text (a commercial LLM API / Ollama in Phase 2)."""
+    """Generate SOAP note from text (Claude API / Ollama in Phase 2)."""
     # Keyword-based section splitting (LLM replaces this in Phase 2)
     text_lower = text.lower()
 

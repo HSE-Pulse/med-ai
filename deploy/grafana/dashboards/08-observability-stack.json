@@ -86,7 +86,7 @@
       "gridPos": { "x": 12, "y": 0, "w": 4, "h": 4 },
       "targets": [
         {
-          "expr": "clamp_max(sum(rate(otelcol_exporter_sent_spans_total{exporter=\"otlp/jaeger\"}[5m])) * 0 + 1, 1) OR on() vector(0)",
+          "expr": "clamp_max(sum(rate(otelcol_exporter_sent_spans{exporter=\"otlp/jaeger\"}[5m])) * 0 + 1, 1) OR on() vector(0)",
           "legendFormat": "up"
         }
       ],
@@ -107,7 +107,7 @@
       "gridPos": { "x": 16, "y": 0, "w": 8, "h": 4 },
       "targets": [
         {
-          "expr": "sum(rate(otelcol_exporter_sent_spans_total[5m])) / (sum(rate(otelcol_exporter_sent_spans_total[5m])) + sum(rate(otelcol_exporter_send_failed_spans_total[5m]))) * 100 OR on() vector(100)",
+          "expr": "sum(rate(otelcol_exporter_sent_spans[5m])) / (sum(rate(otelcol_exporter_sent_spans[5m])) + sum(rate(otelcol_exporter_send_failed_spans[5m]))) * 100 OR on() vector(100)",
           "legendFormat": "success %"
         }
       ],
@@ -134,10 +134,10 @@
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
       "targets": [
-        { "expr": "sum(rate(otelcol_receiver_accepted_spans_total[1m]))", "legendFormat": "received/s" },
-        { "expr": "sum(rate(otelcol_exporter_sent_spans_total[1m]))", "legendFormat": "sent/s" },
-        { "expr": "sum(rate(otelcol_exporter_send_failed_spans_total[1m]))", "legendFormat": "failed/s" },
-        { "expr": "sum(rate(otelcol_processor_dropped_spans_total[1m]))", "legendFormat": "dropped/s" }
+        { "expr": "sum(rate(otelcol_receiver_accepted_spans[1m]))", "legendFormat": "received/s" },
+        { "expr": "sum(rate(otelcol_exporter_sent_spans[1m]))", "legendFormat": "sent/s" },
+        { "expr": "sum(rate(otelcol_exporter_send_failed_spans[1m]))", "legendFormat": "failed/s" },
+        { "expr": "sum(rate(otelcol_receiver_refused_spans[1m]))", "legendFormat": "refused/s" }
       ],
       "fieldConfig": { "defaults": { "unit": "ops" } }
     },

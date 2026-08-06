@@ -12,6 +12,8 @@ Usage::
 
 from __future__ import annotations
 
+import asyncio
+
 import logging
 import os
 import sys
@@ -33,7 +35,7 @@ from shared.integration.event_bus import get_event_bus
 from shared.integration.service_client import ServiceClient
 from shared.clinical.risk import rule_based_acuity
 
-MODEL_DIR = Path(os.getenv("MODEL_DIR", "./models/ed_flow"))
+MODEL_DIR = Path(os.getenv("MODEL_DIR", "/home/hari/hse/models/ed_flow"))
 
 from app_14_ed_flow.backend.app.schemas import (
     MTS_CATEGORIES,
@@ -928,6 +930,31 @@ async def get_ed_state() -> BaseResponse:
     return BaseResponse(data=ed_state.model_dump())
 
 
+def _find_ed_patient(patients: Dict[str, Any], patient_id: Any) -> Optional[Dict[str, Any]]:
+    """Resolve an ed_patients entry from any identifier a caller might send.
+
+    ed_patients is keyed by str(hadm_id) for records adopted by the backfill,
+    but callers routinely pass the MIMIC subject_id instead. A bare
+    patients.get(patient_id) misses every one of those, silently.
+    """
+    if patient_id is None:
+        return None
+    hit = patients.get(patient_id) or patients.get(str(patient_id))
+    if hit:
+        return hit
+    wanted = [patient_id]
+    try:
+        wanted.append(int(patient_id))
+    except (TypeError, ValueError):
+        pass
+    candidates = [p for p in patients.values()
+                  if isinstance(p, dict) and p.get("patient_id") in wanted]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p.get("arrival_time") or "", reverse=True)
+    return candidates[0]
+
+
 @app.get("/ed-state/bottlenecks", response_model=BaseResponse, tags=["ed-state"])
 async def get_bottlenecks() -> BaseResponse:
     """Return current top bottlenecks with causal attribution."""
@@ -1278,6 +1305,55 @@ async def get_recommendations() -> BaseResponse:
     return BaseResponse(data=recs)
 
 
+@app.get("/ed-state/checks", response_model=BaseResponse, tags=["ed-state"])
+async def get_flow_checks() -> BaseResponse:
+    """Every bottleneck / recommendation rule, with its current value.
+
+    An empty Active Bottlenecks panel is a legitimate answer in a quiet ED, but
+    a bare [] is indistinguishable from a broken detector — which is how the
+    boarding-lookup bug stayed invisible. This returns the evaluation itself so
+    the UI can show "watching, not tripped" with real numbers.
+    """
+    now = _effective_now()
+    patients = list(state.get("ed_patients", {}).values())
+    active = [p for p in patients if p.get("current_status") not in ("discharged",)]
+    for p in active:
+        _update_predictions(p, now)
+
+    waiting = [p for p in active if p.get("current_status") == "waiting"]
+    boarding = [p for p in active if p.get("current_status") == "boarding"]
+    long_waiters = [p for p in active
+                    if p.get("time_in_ed_minutes", 0) > 120
+                    and p.get("current_status") == "waiting"]
+    nedocs = _compute_nedocs(len(active), waiting, boarding)
+    ed_data = (await get_ed_state()).data
+    at_risk = ed_data.get("patients_at_pet_risk", 0) or 0
+    crowding = ed_data.get("crowding_level", "normal")
+
+    def row(panel, rule, metric, value, threshold, comparator, tripped):
+        return {"panel": panel, "rule": rule, "metric": metric,
+                "value": value, "threshold": threshold,
+                "comparator": comparator, "tripped": bool(tripped)}
+
+    crowded_at = NEDOCS_THRESHOLDS.get("crowded", 180)
+    checks = [
+        row("bottlenecks", "beds", "patients boarding",
+            len(boarding), 3, ">", len(boarding) > 3),
+        row("bottlenecks", "nursing", "waiting over 120 min",
+            len(long_waiters), 5, ">", len(long_waiters) > 5),
+        row("bottlenecks", "overcrowding", "NEDOCS",
+            round(nedocs, 1), crowded_at, ">=", nedocs >= crowded_at),
+        row("recommendations", "surge", "crowding level",
+            crowding, "crowded", "==", crowding in ("crowded", "severe")),
+        row("recommendations", "flow", "patients boarding",
+            ed_data.get("boarding_count", 0) or 0, 5, ">",
+            (ed_data.get("boarding_count", 0) or 0) > 5),
+        row("recommendations", "escalation", "patients at PET risk",
+            at_risk, 3, ">", at_risk > 3),
+    ]
+    return BaseResponse(data=checks)
+
+
 # ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------
@@ -1428,7 +1504,11 @@ async def reset_ed_flow() -> BaseResponse:
     state["last_sim_time"] = None
     persistent = state.get("persistent")
     if persistent is not None:
-        persistent.clear()
+        # Sync pymongo call: must not run on the event loop. A sim
+        # reset issues delete_many({}) over the same database at the
+        # same moment, and blocking here wedged the whole service —
+        # /health included — until it was restarted by hand.
+        await asyncio.to_thread(persistent.clear)
     logger.info("ED Flow state reset — all patients cleared, snapshot purged")
     return BaseResponse(data={"reset": True})
 
@@ -1446,7 +1526,11 @@ async def notify_bed_allocated(data: Dict[str, Any]) -> BaseResponse:
     etm = data.get("estimated_transfer_time_min")
     dest_dept = data.get("department")
     patients = state.get("ed_patients", {})
-    patient = patients.get(patient_id)
+    # Was patients.get(patient_id). ed_patients is keyed by str(hadm_id) while
+    # the digital twin sends subject_id, so this missed on every call: no
+    # patient was ever marked boarding, and both the "beds" bottleneck and the
+    # flow recommendation that key off boarding could never fire.
+    patient = _find_ed_patient(patients, patient_id)
     if patient and patient.get("current_status") != "discharged":
         patient["current_status"] = "boarding"
         patient["current_bottleneck"] = None

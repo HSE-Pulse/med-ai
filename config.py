@@ -1,4 +1,4 @@
-"""Centralised configuration for the Med AI monorepo."""
+"""Centralised configuration for the cancer-AI monorepo."""
 
 from __future__ import annotations
 
@@ -7,11 +7,6 @@ from pathlib import Path
 from typing import Optional
 
 from pydantic_settings import BaseSettings
-
-# Repo root, resolved relative to this file so the project is portable.
-# Override DATA_DIR / MODEL_DIR via env vars or a .env file if your data
-# and models live elsewhere.
-_REPO_ROOT = Path(__file__).resolve().parent
 
 
 class Settings(BaseSettings):
@@ -26,8 +21,8 @@ class Settings(BaseSettings):
     MONGO_URI: str = "mongodb://localhost:27017/"
 
     # -- Paths -----------------------------------------------------------------
-    DATA_DIR: Path = _REPO_ROOT / "datasets"
-    MODEL_DIR: Path = _REPO_ROOT / "models"
+    DATA_DIR: Path = Path("/home/hari/hse/datasets")
+    MODEL_DIR: Path = Path("/home/hari/hse/models")
 
     # -- Logging ---------------------------------------------------------------
     LOG_LEVEL: str = "INFO"

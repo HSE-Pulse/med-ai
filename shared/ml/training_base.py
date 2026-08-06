@@ -47,7 +47,7 @@ def get_dirs(module_slug: str) -> Tuple[Path, Path]:
     module_slug : str
         Module directory name under datasets/ and models/ (e.g. "bed_management").
     """
-    base = Path(os.getenv("PROJECT_ROOT", "."))
+    base = Path(os.getenv("PROJECT_ROOT", "/home/hari/hse"))
     dataset_dir = Path(os.getenv("DATASET_DIR", str(base / "datasets" / module_slug)))
     model_dir = Path(os.getenv("MODEL_DIR", str(base / "models" / module_slug)))
     return dataset_dir, model_dir

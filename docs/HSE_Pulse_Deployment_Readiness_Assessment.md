@@ -1,7 +1,7 @@
 # HSE Pulse — Real-World Hospital Deployment Readiness Assessment
 
 **Date**: 2026-05-27
-**Scope**: Can the HSE Pulse / med-ai simulation be deployed in a real Irish
+**Scope**: Can the HSE Pulse / cancer-ai simulation be deployed in a real Irish
 hospital today, and if not, what would it take?
 **Method**: three parallel deep audits — clinical / AI validity, regulatory
 + security posture, operational + infrastructure readiness — synthesised here.

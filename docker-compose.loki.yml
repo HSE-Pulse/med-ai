@@ -23,12 +23,16 @@ services:
   loki:
     image: grafana/loki:3.2.1
     container_name: medai-loki
+    restart: unless-stopped
     command: -config.file=/etc/loki/config.yml
     volumes:
       - ./deploy/loki/loki-config.yaml:/etc/loki/config.yml:ro
       - loki_data:/loki
+    # Host 3100 is taken by another stack; Loki is reached as loki:3100 on the
+    # cancer_default network by both the services and Grafana, so it doesn't
+    # need the standard host port. Expose on 3110 for optional host debugging.
     ports:
-      - "3100:3100"
+      - "100.118.170.33:3110:3100"
     networks:
       - cancer_default
     healthcheck:
@@ -44,6 +48,7 @@ services:
   promtail:
     image: grafana/promtail:3.2.1
     container_name: medai-promtail
+    restart: unless-stopped
     command: -config.file=/etc/promtail/config.yml
     volumes:
       - ./deploy/loki/promtail-config.yaml:/etc/promtail/config.yml:ro

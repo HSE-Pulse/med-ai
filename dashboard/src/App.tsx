@@ -24,6 +24,7 @@ import FHIRGateway from "./pages/FHIRGateway";
 import DeteriorationMonitor from "./pages/DeteriorationMonitor";
 import DischargeLounge from "./pages/DischargeLounge";
 import PatientVoyage from "./pages/PatientVoyage";
+import PatientFlow from "./pages/PatientFlow";
 
 export default function App() {
   return (
@@ -42,6 +43,7 @@ export default function App() {
         <Route path="/waiting-list" element={<WaitingList />} />
         <Route path="/patient-journey" element={<PatientJourney />} />
         <Route path="/voyage" element={<PatientVoyage />} />
+        <Route path="/patient-flow" element={<PatientFlow />} />
         <Route path="/clinical-scribe" element={<ClinicalScribe />} />
         <Route path="/simulation" element={<SimulationControl />} />
         <Route path="/chat" element={<ClinicalChat />} />

@@ -452,7 +452,7 @@
 - **Metrics:** Micro/Macro F1, AUROC, precision/recall per urgency class
 
 **B. LLM-Based Approaches (2024-2026)**
-- **Architecture:** GPT-4, a commercial LLM, or open-source LLMs (Llama, Mistral) with in-context learning or fine-tuning
+- **Architecture:** GPT-4, Claude, or open-source LLMs (Llama, Mistral) with in-context learning or fine-tuning
 - **Approach:** Zero-shot or few-shot prompting for referral classification; structured output extraction
 - **Advantages:** No labeled training data needed for zero-shot; handles diverse referral formats
 - **Challenges:** Hallucination risk; cost at scale; latency; data privacy (on-premise deployment needed)

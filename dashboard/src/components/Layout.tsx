@@ -28,6 +28,7 @@ import {
   Menu,
   X,
   Route,
+  Waves,
 } from "lucide-react";
 import AlertCenter from "./AlertCenter";
 
@@ -42,6 +43,7 @@ const navItems = [
   { path: "/waiting-list", label: "Waiting List", icon: ClipboardList },
   { path: "/patient-journey", label: "Patient Journey", icon: GitBranch },
   { path: "/voyage", label: "Patient Voyage", icon: Route },
+  { path: "/patient-flow", label: "Patient Flow", icon: Waves },
   { path: "/clinical-scribe", label: "Clinical Scribe", icon: FileText },
   { path: "/simulation", label: "Simulation", icon: Radio },
   { path: "/chat", label: "Clinical Chat", icon: MessageCircle },
@@ -69,6 +71,7 @@ const pageTitles: Record<string, string> = {
   "/waiting-list": "Waiting List Intelligence",
   "/patient-journey": "Patient Journey",
   "/voyage": "Patient Voyage — Live Visualization",
+  "/patient-flow": "Patient Flow — Realtime Census & Movement",
   "/clinical-scribe": "AI Clinical Scribe",
   "/simulation": "Data Ingestion / Simulation",
   "/chat": "Clinical Chat",

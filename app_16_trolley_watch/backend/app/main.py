@@ -221,6 +221,10 @@ async def lifespan(application: FastAPI):
             service_id="trolley_watch",
             topics=["trolley_alert", "capacity_alert", "pet_breach_risk"],
             mongo_client=_mongo.client,
+            extra_handlers={
+                "trolley_alert": _kafka_trolley_alert,
+                "capacity_alert": _kafka_capacity_alert,
+            },
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("trolley_bus_subscribe_failed: %s", exc)
@@ -229,20 +233,25 @@ async def lifespan(application: FastAPI):
     yield
 
 
-def _on_trolley_alert(event) -> None:
-    payload = event.payload or {}
+def _trim_events() -> None:
+    """Cap the in-memory window. capacity_alert is a high-volume topic
+    (~190k messages on the broker), so every append path must trim or the
+    process grows without bound."""
+    if len(_state["events"]) > 5000:
+        _state["events"] = _state["events"][-2500:]
+
+
+def _record_trolley(payload: Dict[str, Any]) -> None:
     _state["events"].append({
         "department": payload.get("department"),
         "location": payload.get("location", "ED"),
         "count": int(payload.get("count", 1)),
         "timestamp": get_sim_time().isoformat(),
     })
-    if len(_state["events"]) > 5000:
-        _state["events"] = _state["events"][-2500:]
+    _trim_events()
 
 
-def _on_capacity_alert(event) -> None:
-    payload = event.payload or {}
+def _record_capacity(payload: Dict[str, Any]) -> None:
     if payload.get("urgency") in ("red", "black"):
         _state["events"].append({
             "department": payload.get("department"),
@@ -251,6 +260,27 @@ def _on_capacity_alert(event) -> None:
             "timestamp": get_sim_time().isoformat(),
             "source": "capacity_alert",
         })
+        _trim_events()
+
+
+# Two transports feed the same recorders. The in-process EventBus only fires
+# for events published inside THIS process; everything produced by the other
+# service containers arrives over Kafka, which is why the Kafka adapters below
+# have to be registered as extra_handlers (see lifespan).
+def _on_trolley_alert(event) -> None:
+    _record_trolley(event.payload or {})
+
+
+def _on_capacity_alert(event) -> None:
+    _record_capacity(event.payload or {})
+
+
+async def _kafka_trolley_alert(_topic, payload) -> None:
+    _record_trolley(payload or {})
+
+
+async def _kafka_capacity_alert(_topic, payload) -> None:
+    _record_capacity(payload or {})
 
 
 app = create_app(

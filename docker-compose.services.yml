@@ -108,6 +108,7 @@ services:
     environment:
       <<: *svc-env
       MODEL_DIR: /models/oncology
+      DATASET_DIR: /datasets/oncology
     ports: ["100.118.170.33:8204:8204"]
 
   patient_journey:
@@ -132,6 +133,9 @@ services:
     container_name: hse-clinical_chat
     environment:
       <<: *svc-env
+      # Ollama runs in a separate stack (llm-stack); it's attached to the shared
+      # external `cancer_default` network (see llm-stack compose) so it resolves
+      # by service alias here. Host-IP routing is blocked by UFW (docker->host).
       OLLAMA_BASE: http://ollama:11434
     ports: ["100.118.170.33:8206:8206"]
 
@@ -284,7 +288,9 @@ services:
       args: { APP: app_22_alerts, MODULE_PATH: app_22_alerts.backend.app.main:app, PORT: 8222 }
     container_name: hse-alerts
     environment: *svc-env
-    ports: ["100.118.170.33:8222:8222"]
+    # Host side moved 8222→8223: 100.118.170.33:8222 is now held by
+    # harishankar-site.service (apex landing page). Container port stays 8222.
+    ports: ["100.118.170.33:8223:8222"]
 
   # ── Dashboard (nginx serving the vite build + reverse-proxy /api/*) ──
   # Source lives in ./dashboard/ — edits picked up by `docker compose
@@ -299,6 +305,12 @@ services:
     restart: unless-stopped
     networks: [cancer_default]
     ports: ["100.118.170.33:3010:3010"]
+    # Mount the maintained nginx.conf over the image's baked copy so the
+    # lazy-resolver fix applies without a full image rebuild. A later
+    # `docker compose build dashboard` still bakes the same file via the
+    # Dockerfile, so this stays consistent.
+    volumes:
+      - ./dashboard/nginx.conf:/etc/nginx/nginx.conf:ro
 
 networks:
   cancer_default:

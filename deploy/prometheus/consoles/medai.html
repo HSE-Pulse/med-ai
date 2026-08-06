@@ -1,0 +1,157 @@
+{{ template "head" . }}
+
+<script>
+// The "head" console template emits a complete <head></head> with no <title>,
+// so the browser tab showed the bare URL. Set it here — this runs before the
+// graphs are constructed and costs nothing.
+document.title = "Med AI Platform — Prometheus Console";
+
+// prom_console.js (loaded by the "head" template above) builds each graph's
+// loading indicator as:
+//     img.src = PATH_PREFIX + '/classic/static/img/ajax-loader.gif'
+// Prometheus 2.55 no longer ships that asset and it is served from the
+// binary's embedded FS, so it cannot be supplied by a bind mount either —
+// every graph fired a 404. The assignment happens inside the Graph
+// constructor, so the only place to intercept is the src setter. Scope is
+// deliberately narrow: <img> elements only, and only that exact filename.
+// The CSS below turns the resulting empty <img> into a real spinner.
+(function () {
+  var TRANSPARENT =
+    'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+  var create = document.createElement.bind(document);
+  document.createElement = function (tag) {
+    var el = create.apply(null, arguments);
+    if (String(tag).toLowerCase() === 'img') {
+      Object.defineProperty(el, 'src', {
+        configurable: true,
+        get: function () { return this.getAttribute('src'); },
+        set: function (v) {
+          this.setAttribute(
+            'src',
+            String(v).indexOf('ajax-loader.gif') !== -1 ? TRANSPARENT : v,
+          );
+        },
+      });
+    }
+    return el;
+  };
+})();
+</script>
+
+<style>
+/*
+ * Paired with the src shim above: the loading <img> now points at a 1x1
+ * transparent GIF, so collapse its content box to zero and draw the spinner
+ * out of its border instead. Same visual intent as the asset Prometheus
+ * dropped, with no network request and no broken-image glyph.
+ */
+img.prom_graph_loading {
+  width: 0;
+  height: 0;
+  padding: 9px;
+  border: 2px solid #d0d0d0;
+  border-top-color: #666;
+  border-radius: 50%;
+  display: inline-block;
+  animation: prom-spin 0.8s linear infinite;
+}
+@keyframes prom-spin { to { transform: rotate(360deg); } }
+</style>
+
+{{ template "prom_right_table_head" }}
+<tr><th colspan="2">Med AI Platform — KPIs</th></tr>
+<tr><td>AI services up</td><td class="text-right">{{ template "prom_query_drilldown" (args "sum(up{job='medai-services'})") }} / {{ template "prom_query_drilldown" (args "count(up{job='medai-services'})") }}</td></tr>
+<tr><td>All targets up</td><td class="text-right">{{ template "prom_query_drilldown" (args "sum(up)") }} / {{ template "prom_query_drilldown" (args "count(up)") }}</td></tr>
+<tr><td>Active patients</td><td class="text-right">{{ template "prom_query_drilldown" (args "sum(medai_active_patients)") }}</td></tr>
+<tr><td>Departments tracked</td><td class="text-right">{{ template "prom_query_drilldown" (args "count(medai_department_queue_length)") }}</td></tr>
+<!-- Scaled at query time, not by the formatter: humanize() applies SI prefixes,
+     which rendered 1674 minutes as "1.674kmin" and a 0.70 ratio as "700.8m". -->
+<tr><td>Avg wait</td><td class="text-right">{{ template "prom_query_drilldown" (args "avg(medai_department_avg_wait_minutes) / 60" "h" "humanize") }}</td></tr>
+<tr><td>Avg occupancy</td><td class="text-right">{{ template "prom_query_drilldown" (args "avg(medai_department_occupancy_ratio) * 100" "%" "humanize") }}</td></tr>
+<tr><td>Spans ingested/s</td><td class="text-right">{{ template "prom_query_drilldown" (args "sum(rate(otelcol_receiver_accepted_spans[5m]))" "/s" "humanizeNoSmallPrefix") }}</td></tr>
+{{ template "prom_right_table_tail" }}
+
+{{ template "prom_content_head" . }}
+<h1>Med AI Platform Metrics</h1>
+<p>Live metrics scraped from the 19-service Med AI platform. Full dashboards in <a href="https://grafana.harishankar.info/d/medai-e2e-flow/medai-end-to-end-flow">Grafana</a>.</p>
+
+<h3>Service Health (targets up)</h3>
+<div id="upGraph"></div>
+<script>
+new PromConsole.Graph({
+  node: document.querySelector("#upGraph"),
+  expr: "sum(up{job='medai-services'})",
+  name: "services up", yTitle: "Services", yUnits: "",
+  // Line, not area. prom_console.js fixes the query step at one point per
+  // pixel (duration / graphTd.offsetWidth), so over a 1h window the area
+  // renderer strokes ~975 adjacent verticals and moirés into a solid
+  // barcode. min:0 is kept deliberately: it flattens 18-vs-19 differences
+  // but makes an actual outage plunge off the top of the chart.
+  min: 0,
+  yAxisFormatter: PromConsole.NumberFormatter.humanizeNoSmallPrefix,
+  yHoverFormatter: PromConsole.NumberFormatter.humanizeNoSmallPrefix
+})
+</script>
+
+<h3>Patient Flow — Active Patients</h3>
+<div id="patGraph"></div>
+<script>
+new PromConsole.Graph({
+  node: document.querySelector("#patGraph"),
+  expr: "sum(medai_active_patients)",
+  name: "active patients", yTitle: "Patients", yUnits: "",
+  yAxisFormatter: PromConsole.NumberFormatter.humanizeNoSmallPrefix,
+  yHoverFormatter: PromConsole.NumberFormatter.humanizeNoSmallPrefix
+})
+</script>
+
+<h3>Department Queue Length</h3>
+<div id="queueGraph"></div>
+<script>
+new PromConsole.Graph({
+  node: document.querySelector("#queueGraph"),
+  expr: "medai_department_queue_length",
+  name: "[[ department ]]", yTitle: "Queue", yUnits: "",
+  yAxisFormatter: PromConsole.NumberFormatter.humanizeNoSmallPrefix,
+  yHoverFormatter: PromConsole.NumberFormatter.humanizeNoSmallPrefix
+})
+</script>
+
+<h3>Department Average Wait (minutes)</h3>
+<div id="waitGraph"></div>
+<script>
+new PromConsole.Graph({
+  node: document.querySelector("#waitGraph"),
+  expr: "medai_department_avg_wait_minutes",
+  name: "[[ department ]]", yTitle: "Minutes", yUnits: "",
+  yAxisFormatter: PromConsole.NumberFormatter.humanizeNoSmallPrefix,
+  yHoverFormatter: PromConsole.NumberFormatter.humanizeNoSmallPrefix
+})
+</script>
+
+<h3>Department Occupancy Ratio</h3>
+<div id="occupancyGraph"></div>
+<script>
+new PromConsole.Graph({
+  node: document.querySelector("#occupancyGraph"),
+  expr: "medai_department_occupancy_ratio",
+  name: "[[ department ]]", yTitle: "Occupancy", yUnits: "",
+  yAxisFormatter: PromConsole.NumberFormatter.humanize,
+  yHoverFormatter: PromConsole.NumberFormatter.humanize
+})
+</script>
+
+<h3>Telemetry — Spans In / Out (per second)</h3>
+<div id="spanGraph"></div>
+<script>
+new PromConsole.Graph({
+  node: document.querySelector("#spanGraph"),
+  expr: ["sum(rate(otelcol_receiver_accepted_spans[5m]))","sum(rate(otelcol_exporter_sent_spans[5m]))"],
+  name: ["accepted","exported"], yTitle: "Spans/s", yUnits: "",
+  yAxisFormatter: PromConsole.NumberFormatter.humanizeNoSmallPrefix,
+  yHoverFormatter: PromConsole.NumberFormatter.humanizeNoSmallPrefix
+})
+</script>
+
+{{ template "prom_content_tail" . }}
+{{ template "tail" }}

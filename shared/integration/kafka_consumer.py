@@ -138,7 +138,7 @@ async def attach_service_to_bus(
         kafka_broker = broker
 
     consumer_task: Optional[asyncio.Task] = None
-    if kafka_broker is not None and kafka_broker._producer is not None:  # noqa: SLF001
+    if kafka_broker is not None:
         topics = list(topic_handlers.keys())
 
         async def _kafka_dispatch(topic: str, payload: Dict[str, Any]) -> None:
@@ -150,14 +150,29 @@ async def attach_service_to_bus(
             body = payload.get("payload") if isinstance(payload, dict) else None
             await handler(topic, body if isinstance(body, dict) else payload or {})
 
+        async def _consume_when_ready() -> None:
+            # Deliberately does NOT sample _producer. A service that boots
+            # before the broker used to fall through to the else-branch and
+            # stay in Mongo-only mode for the life of the process; waiting on
+            # the readiness event lets the reconnect supervisor hand us a live
+            # producer whenever it comes up.
+            await kafka_broker.wait_ready()
+            await kafka_broker.consume_forever(service_id, topics, _kafka_dispatch)
+
         consumer_task = asyncio.create_task(
-            kafka_broker.consume_forever(service_id, topics, _kafka_dispatch),
-            name=f"kafka-consumer-{service_id}",
+            _consume_when_ready(), name=f"kafka-consumer-{service_id}",
         )
-        logger.info(
-            "kafka_consumer_started service=%s topics=%s",
-            service_id, topics,
-        )
+        if kafka_broker._producer is not None:  # noqa: SLF001
+            logger.info(
+                "kafka_consumer_started service=%s topics=%s",
+                service_id, topics,
+            )
+        else:
+            logger.info(
+                "kafka_consumer_pending service=%s topics=%s — broker "
+                "unreachable at boot, will attach as soon as it answers",
+                service_id, topics,
+            )
     else:
         logger.info(
             "kafka_unavailable — service %s running in Mongo-only mode; "

@@ -3,17 +3,11 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "med-ai"
+name = "cancer-ai"
 version = "0.1.0"
 description = "Healthcare AI monorepo — oncology-focused clinical ML pipelines built on MIMIC-IV"
 requires-python = ">=3.10"
-license = {text = "Apache-2.0"}
-classifiers = [
-    "License :: OSI Approved :: Apache Software License",
-    "Programming Language :: Python :: 3",
-    "Intended Audience :: Science/Research",
-    "Topic :: Scientific/Engineering :: Medical Science Apps.",
-]
+license = {text = "MIT"}
 
 dependencies = [
     "pymongo>=4.6",
@@ -23,9 +17,6 @@ dependencies = [
     "numpy>=1.26",
     "scikit-learn>=1.4",
     "torch>=2.1",
-    "xgboost>=2.0",
-    "lightgbm>=4.0",
-    "gymnasium>=0.29",
     "matplotlib>=3.8",
     "structlog>=24.1",
     "pydantic-settings>=2.1",
@@ -43,11 +34,6 @@ dev = [
 ]
 imbalance = [
     "imbalanced-learn>=0.12",
-]
-chat = [
-    # app_06 clinical chat: only needed to use a hosted OpenAI-compatible
-    # endpoint; without it, app_06 falls back to local Ollama models.
-    "openai>=1.0",
 ]
 
 [tool.setuptools.packages.find]

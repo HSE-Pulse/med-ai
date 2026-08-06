@@ -197,7 +197,7 @@ def check_mongo() -> List[str]:
     section("3. MONGO COLLECTIONS")
     findings: List[str] = []
     try:
-        sys.path.insert(0, ".")
+        sys.path.insert(0, "/home/hari/hse")
         import pymongo
 
         client = pymongo.MongoClient("mongodb://localhost:27017", serverSelectionTimeoutMS=2000)

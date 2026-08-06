@@ -4,7 +4,7 @@ import subprocess
 import sys
 import time
 
-ROOT = '.'
+ROOT = '/home/hari/hse'
 COMPOSE_FILE = os.path.join(ROOT, 'docker-compose.kafka.yml')
 DASHBOARD_DIR = os.path.join(ROOT, 'dashboard')
 KAFKA_BOOTSTRAP = 'localhost:19092'

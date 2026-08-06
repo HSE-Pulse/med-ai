@@ -2,7 +2,7 @@
 
 ## Platform Summary
 
-Five healthcare AI applications built on MIMIC-IV data (MongoDB), developed for evaluation with a partner hospital network.
+Five healthcare AI applications built on MIMIC-IV data (MongoDB), designed for clinical deployment at MS Ramaiah Health Services (Bengaluru, India) in collaboration with Lattice Consulting.
 
 | App | Name | Source Document Vertical | Primary Objective | Status |
 |-----|------|--------------------------|-------------------|--------|

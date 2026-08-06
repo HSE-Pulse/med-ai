@@ -49,7 +49,7 @@ SIM_DEPARTMENTS = [
     "Cardiology", "Neurology", "ICU", "Discharge_Lounge",
 ]
 
-DEFAULT_OUTPUT = Path("./datasets/hospital_ops")
+DEFAULT_OUTPUT = Path("/home/hari/hse/datasets/hospital_ops")
 
 BATCH_SIZE = 5000
 

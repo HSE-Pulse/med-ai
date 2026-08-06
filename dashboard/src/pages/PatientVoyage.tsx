@@ -23,7 +23,7 @@ import {
 
 // Live patient voyage — admission → discharge cinematic timeline with
 // hospital-wide context map on the left and a deep single-patient view
-// on the right.
+// on the right. See ~/.claude/plans/create-a-new-workflow-agile-quasar.md.
 export default function PatientVoyage() {
   const [params, setParams] = useSearchParams();
   const selectedHadm = params.get("hadm");

@@ -170,15 +170,15 @@
 5. chartevents queries are limited to 5,000 stays (from 73,141 total) to avoid memory/time issues on 314M rows
 6. Cancer ICD codes follow both ICD-9 (140-239) and ICD-10 (C00-C99) conventions present in MIMIC-IV
 7. Sepsis labels are approximate (Sepsis-3 criteria adapted to available data fields)
-8. DES-MARL simulation parameters are calibrated from MIMIC data but would need recalibration for the partner hospital deployment
+8. DES-MARL simulation parameters are calibrated from MIMIC data but would need recalibration for Ramaiah deployment
 
 ---
 
 ## Missing Information Needed
 
-1. **the partner hospital-specific data schemas:** When real the partner hospital data becomes available, adapter layers will need mapping
+1. **Ramaiah-specific data schemas:** When real Ramaiah data becomes available, adapter layers will need mapping
 2. **ESI ground truth:** MIMIC-IV does not include ESI triage scores; our acuity labels are derived approximations
 3. **Antibiotic list:** Complete list of antibiotic drug names for sepsis definition matching against prescriptions.drug
 4. **Cancer staging data:** MIMIC-IV lacks explicit TNM staging; DRG severity is a proxy
 5. **Real-time vital sign streaming protocol:** For production sepsis monitoring, need HL7/FHIR integration specs
-6. **the partner hospital department structure:** Simulation departments may differ from MIMIC's structure
+6. **Ramaiah department structure:** Simulation departments may differ from MIMIC's structure

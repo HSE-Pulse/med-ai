@@ -13,7 +13,7 @@ Usage::
 
 Environment variables:
     MONGO_URI          MongoDB connection string (default: mongodb://localhost:27017/)
-    DATASET_OUT_DIR    Output directory (default: ./datasets/ed_triage)
+    DATASET_OUT_DIR    Output directory (default: /home/hari/hse/datasets/ed_triage)
 """
 
 from __future__ import annotations
@@ -76,7 +76,7 @@ ACUITY_LABELS = {
 }
 
 DATASET_OUT_DIR = Path(
-    os.getenv("DATASET_OUT_DIR", "./datasets/ed_triage")
+    os.getenv("DATASET_OUT_DIR", "/home/hari/hse/datasets/ed_triage")
 )
 
 

@@ -55,8 +55,8 @@ from shared.integration.idempotency import (
 from shared.integration.persistent_state import PersistentState
 from shared.integration.service_client import ServiceClient
 
-MODEL_DIR = Path(os.getenv("MODEL_DIR", "./models/bed_management"))
-DATASET_DIR = Path(os.getenv("DATASET_DIR", "./datasets/bed_management"))
+MODEL_DIR = Path(os.getenv("MODEL_DIR", "/home/hari/hse/models/bed_management"))
+DATASET_DIR = Path(os.getenv("DATASET_DIR", "/home/hari/hse/datasets/bed_management"))
 
 from app_08_bed_management.backend.app.schemas import (
     IRISH_DEPARTMENTS,
@@ -1192,7 +1192,12 @@ async def allocate_bed(req: BedAllocationRequest) -> BaseResponse:
         if bus:
             await bus.publish("trolley_alert", {
                 "patient_id": req.patient_id,
+                "hadm_id": getattr(req, "hadm_id", None),
                 "acuity": req.acuity,
+                "location": _trolley_location(req, beds),
+                "department": req.department_preference or "ED",
+                "count": 1,
+                "reason": "no_beds_hospital_wide",
                 "message": "No beds available — patient on trolley",
             }, source_module="bed_management")
 
@@ -1212,6 +1217,39 @@ async def allocate_bed(req: BedAllocationRequest) -> BaseResponse:
 
     scored_beds.sort(key=lambda x: x[0], reverse=True)
     best_score, best_bed = scored_beds[0]
+
+    # _score_bed_match returns exactly 0.0 for a hard incompatibility —
+    # isolation, paediatric, maternity. Sorting still floats one of those to
+    # the top when every free bed is unusable, and the allocator used to
+    # assign it: an infectious patient into a non-isolation bed, a paediatric
+    # patient into an adult-only bed. Refuse, and raise the trolley instead;
+    # this — not total hospital saturation — is the condition that actually
+    # occurs, and it is why the trolley topic had never seen a message.
+    if best_score <= 0.0:
+        bus = state.get("event_bus")
+        if bus is not None:
+            await bus.publish("trolley_alert", {
+                "patient_id": req.patient_id,
+                "hadm_id": getattr(req, "hadm_id", None),
+                "acuity": req.acuity,
+                "location": _trolley_location(req, beds),
+                "department": req.department_preference or "ED",
+                "count": 1,
+                "reason": "no_clinically_suitable_bed",
+                "message": ("No clinically suitable bed — patient on trolley "
+                            f"({len(available_beds)} free but none compatible)"),
+            }, source_module="bed_management")
+        logger.warning(
+            "no suitable bed for patient %s (hadm=%s): %d free, all incompatible",
+            req.patient_id, getattr(req, "hadm_id", None), len(available_beds),
+        )
+        return BaseResponse(data=BedAllocation(
+            patient_id=req.patient_id,
+            recommended_department="ED_Trolley",
+            priority_score=req.acuity / 5.0,
+            wait_time_estimate_minutes=120,
+            allocation_reason="No clinically compatible bed available",
+        ).model_dump())
 
     # Actually assign the bed
     from datetime import datetime, timezone, timedelta
@@ -1294,7 +1332,11 @@ async def reset_bed_management() -> BaseResponse:
     state.pop("capacity_alerts", None)
     persistent = state.get("persistent")
     if persistent is not None:
-        persistent.clear()
+        # Sync pymongo call: must not run on the event loop. A sim
+        # reset issues delete_many({}) over the same database at the
+        # same moment, and blocking here wedged the whole service —
+        # /health included — until it was restarted by hand.
+        await asyncio.to_thread(persistent.clear)
     # Seed a fresh snapshot representing the clean state
     if persistent is not None:
         persistent.save_snapshot({
@@ -1615,6 +1657,26 @@ async def _get_staffing_data() -> Dict[str, Dict]:
                 },
             )
     return _staffing_cache
+
+
+def _trolley_location(req: BedAllocationRequest, beds: dict) -> str:
+    """Where this patient physically waits: "ED" | "corridor" | "ward".
+
+    INMO counts trolleys by where the patient is, not where they are going.
+    Derived only from what this service knows for certain — the admission type
+    and the live state of its own ED beds.
+    """
+    emergency = str(getattr(req, "admission_type", "") or "").upper() in (
+        "EMERGENCY", "URGENT", "EW EMER.", "DIRECT EMER."
+    )
+    if not emergency:
+        # Elective/transfer admissions wait on the receiving ward, not in ED.
+        return "ward"
+    ed_beds = [b for b in beds.values() if getattr(b, "department", None) == "ED"]
+    if ed_beds and not any(b.status == "available" for b in ed_beds):
+        # ED itself is full, so the overflow trolley sits in the corridor.
+        return "corridor"
+    return "ED"
 
 
 def _score_bed_match(bed: BedState, req: BedAllocationRequest) -> float:

@@ -34,7 +34,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("clinical_scribe.build_dataset")
 
 DATASET_OUT_DIR = Path(
-    os.getenv("DATASET_OUT_DIR", "./datasets/clinical_scribe")
+    os.getenv("DATASET_OUT_DIR", "/home/hari/hse/datasets/clinical_scribe")
 )
 BATCH = 5000
 MAX_TEXT_LENGTH = 5000

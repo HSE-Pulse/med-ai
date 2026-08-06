@@ -1,0 +1,41 @@
+services:
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.18.0
+    container_name: medai-mlflow
+    restart: unless-stopped
+    command: >
+      sh -c "pip install --no-cache-dir --quiet 'sqlalchemy<3' >/dev/null 2>&1;
+      mlflow server --host 0.0.0.0 --port 5000
+      --backend-store-uri sqlite:////mlflow/mlflow.db
+      --default-artifact-root /mlflow/artifacts
+      --serve-artifacts"
+    volumes:
+      - mlflow_data:/mlflow
+    ports:
+      - "100.118.170.33:5000:5000"
+    networks:
+      - cancer_default
+
+  # Read-only reverse proxy — the public-facing entry (mlflow.harishankar.info
+  # → :5001). Blocks all mutating MLflow endpoints so the exposed tracking
+  # server is view-only. Full admin stays on the internal :5000.
+  mlflow-ro:
+    image: nginx:1.27-alpine
+    container_name: medai-mlflow-ro
+    restart: unless-stopped
+    volumes:
+      - ./docker/mlflow-ro.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "100.118.170.33:5001:5000"
+    networks:
+      - cancer_default
+    depends_on:
+      - mlflow
+
+networks:
+  cancer_default:
+    external: true
+
+volumes:
+  mlflow_data:
+    name: medai-mlflow-data

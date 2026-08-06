@@ -3,6 +3,7 @@ import json
 import re
 import time
 from contextlib import asynccontextmanager
+import os
 from pathlib import Path
 
 import numpy as np
@@ -13,8 +14,12 @@ from shared.api.base import create_app
 from pydantic import BaseModel
 
 ROOT = Path(__file__).resolve().parent.parent.parent.parent
-MODEL_DIR = ROOT / "models" / "oncology"
-DATASET_DIR = ROOT / "datasets" / "oncology"
+# Env first, repo layout second. In the container the datasets/models volumes
+# are mounted at /datasets and /models, NOT under /app, so the __file__-relative
+# path resolved to /app/datasets/oncology and silently did not exist — which is
+# why /cohort-stats returned "Metadata not found. Run build_dataset.py first."
+MODEL_DIR = Path(os.getenv("MODEL_DIR") or ROOT / "models" / "oncology")
+DATASET_DIR = Path(os.getenv("DATASET_DIR") or ROOT / "datasets" / "oncology")
 
 # Global state
 state = {

@@ -11,6 +11,7 @@ import {
   FastForward,
   Calendar,
   Brain,
+  Trophy,
 } from "lucide-react";
 import {
   ResponsiveContainer,
@@ -117,6 +118,45 @@ export default function HospitalOps() {
   });
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // Policy benchmark — MADDPG (adaptive) vs static staffing on a fixed
+  // congested workload. Deliberately separate from the live charts above
+  // (which show the real, currently-light hospital, where the two policies are
+  // indistinguishable because there is no congestion to optimise). This is the
+  // labeled policy evaluation, the way the capstone measures the ~wait cut.
+  interface BenchPoint {
+    sim_time_h: number;
+    adaptive_wait_min: number;
+    static_wait_min: number;
+    adaptive_throughput: number;
+    static_throughput: number;
+  }
+  interface BenchData {
+    horizon_hours: number;
+    arrival_rate_per_hour: number;
+    series: BenchPoint[];
+    summary: {
+      adaptive_wait_avg_min: number;
+      static_wait_avg_min: number;
+      wait_reduction_pct: number;
+      adaptive_throughput_avg: number;
+      static_throughput_avg: number;
+      throughput_gain_pct: number;
+    };
+  }
+  const [benchmark, setBenchmark] = useState<BenchData | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch("/api/ops/api/policy-benchmark");
+        if (!res.ok) return;
+        const j = await res.json();
+        if (!cancelled && j?.status === "ok" && j.data) setBenchmark(j.data as BenchData);
+      } catch { /* benchmark offline */ }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
   // Integration action log
   interface ActionEntry {
     timestamp: string;
@@ -142,10 +182,6 @@ export default function HospitalOps() {
   // simulator may be running independently and would return its current state,
   // not a clean reset.)
   const initialDepartmentsRef = useRef<MockDepartment[] | null>(null);
-
-  const baselineWait = 38;
-  const baselineThroughput = 4.2;
-  const baselineStaffEff = 72;
 
   // Backend sync — pulls the real DES state from hospital_ops on an interval.
   //
@@ -470,14 +506,16 @@ export default function HospitalOps() {
   const avgWait = waitData.length > 0
     ? Math.round(waitData.slice(-20).reduce((s, d) => s + d.marl, 0) / Math.min(20, waitData.length) * 10) / 10
     : 0;
-  const avgUtil = departments.length > 0
-    ? Math.round(departments.reduce((s, d) => s + d.utilization, 0) / departments.length)
+  // Capacity-weighted occupancy — an unweighted dept mean lets small units skew the figure
+  const totalCapacity = departments.reduce((s, d) => s + d.capacity, 0);
+  const avgUtil = totalCapacity > 0
+    ? Math.round(departments.reduce((s, d) => s + d.patients, 0) / totalCapacity * 100)
     : 0;
-  const recentThroughput = throughputData.length >= 5
-    ? Math.round(throughputData.slice(-20).reduce((s, d) => s + d.marl, 0) / Math.min(20, throughputData.length) * 10) / 10
-    : 0;
-  const staffEfficiency = departments.length > 0
-    ? Math.min(99, Math.round(baselineStaffEff + (avgUtil - 50) * 0.3))
+  // Backend throughput is dept.total_served — a cumulative count, not a rate
+  const lastThrptSample = throughputData.length > 0 ? throughputData[throughputData.length - 1] : null;
+  const patientsServed = lastThrptSample ? Math.round(lastThrptSample.marl) : 0;
+  const throughputRate = lastThrptSample && lastThrptSample.time > 0
+    ? Math.round((lastThrptSample.marl / lastThrptSample.time) * 10) / 10
     : 0;
 
   // Improvement: compare last 10 MARL points vs baseline (real data, not hardcoded)
@@ -681,6 +719,11 @@ export default function HospitalOps() {
         })}
       </div>
 
+      {/* Live hospital charts */}
+      <div className="flex items-center gap-2 mt-2">
+        <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Live Hospital</span>
+        <span className="text-[10px] text-slate-500">— real MIMIC patient flow at current occupancy</span>
+      </div>
       {/* Charts row */}
       <div className="grid grid-cols-2 gap-4">
         <div className="bg-bg-card rounded-xl border border-border p-4">
@@ -708,14 +751,14 @@ export default function HospitalOps() {
         </div>
 
         <div className="bg-bg-card rounded-xl border border-border p-4">
-          <h3 className="text-xs font-semibold text-white mb-2">Throughput Over Time</h3>
+          <h3 className="text-xs font-semibold text-white mb-2">Patients Served Over Time</h3>
           <div style={{ height: 220, position: "relative" }}>
             <ResponsiveContainer width="100%" height="100%">
               <LineChart data={throughputData} margin={{ top: 5, right: 10, bottom: 5, left: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="var(--color-segment-empty)" />
                 <XAxis dataKey="time" tick={{ fontSize: 9, fill: "#64748b" }} tickFormatter={(v) => `${v}h`} />
                 <YAxis tick={{ fontSize: 9, fill: "#64748b" }} width={30} domain={["auto", "auto"]} />
-                <Tooltip contentStyle={{ backgroundColor: "var(--color-tooltip-bg)", border: "1px solid var(--color-tooltip-border)", borderRadius: 8, fontSize: 11 }} formatter={(val: number) => `${val.toFixed(2)} p/hr`} />
+                <Tooltip contentStyle={{ backgroundColor: "var(--color-tooltip-bg)", border: "1px solid var(--color-tooltip-border)", borderRadius: 8, fontSize: 11 }} formatter={(val: number) => `${Math.round(val)} patients`} />
                 <Legend wrapperStyle={{ fontSize: 10 }} iconType="plainline" />
                 <Line type="monotone" dataKey="baseline" stroke="#64748b" strokeWidth={1.5} strokeDasharray="4 4" dot={false} name="Baseline" isAnimationActive={false} />
                 <Line type="monotone" dataKey="marl" stroke="#22C55E" strokeWidth={2} dot={false} name={algorithm} isAnimationActive={false} />
@@ -732,6 +775,69 @@ export default function HospitalOps() {
         </div>
       </div>
 
+      {/* Policy Benchmark — labeled MADDPG vs static evaluation */}
+      {benchmark && (
+        <div className="bg-bg-card rounded-xl border border-amber-500/30 p-4">
+          <div className="mb-3">
+            <h3 className="text-xs font-semibold text-white flex items-center gap-2">
+              <Trophy className="w-4 h-4 text-amber-400" /> Policy Benchmark — MADDPG vs Static Staffing
+            </h3>
+            <p className="text-[10px] text-slate-400 mt-1 leading-relaxed">
+              Deterministic evaluation: one identical {benchmark.horizon_hours}h congested workload
+              ({benchmark.arrival_rate_per_hour}/hr arrivals) replayed through an <span className="text-green-400">adaptive</span> engine
+              (MADDPG policy + HSE safety-floor staffing) and a <span className="text-slate-300">static</span> baseline engine.
+              This is the policy evaluation the live hospital above can't show — it currently runs near-empty, so there is no congestion to optimise.
+            </p>
+          </div>
+          <div className="grid grid-cols-2 gap-3 mb-4">
+            <div className="bg-bg-primary rounded-lg p-3">
+              <div className="text-[10px] text-slate-400 uppercase tracking-wider mb-1">Mean Wait Reduction</div>
+              <div className="font-mono-clinical text-3xl font-bold text-green-400">↓{benchmark.summary.wait_reduction_pct}%</div>
+              <div className="text-[10px] text-slate-500 mt-1">{benchmark.summary.adaptive_wait_avg_min} min adaptive vs {benchmark.summary.static_wait_avg_min} min static</div>
+            </div>
+            <div className="bg-bg-primary rounded-lg p-3">
+              <div className="text-[10px] text-slate-400 uppercase tracking-wider mb-1">Throughput Gain</div>
+              <div className="font-mono-clinical text-3xl font-bold text-blue-400">↑{benchmark.summary.throughput_gain_pct}%</div>
+              <div className="text-[10px] text-slate-500 mt-1">more patients cleared vs static staffing</div>
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <h4 className="text-[10px] font-semibold text-slate-300 mb-1">Wait Time (min) across workload</h4>
+              <div style={{ height: 180 }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={benchmark.series} margin={{ top: 5, right: 10, bottom: 5, left: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--color-segment-empty)" />
+                    <XAxis dataKey="sim_time_h" tick={{ fontSize: 9, fill: "#64748b" }} tickFormatter={(v) => `${v}h`} />
+                    <YAxis tick={{ fontSize: 9, fill: "#64748b" }} width={30} />
+                    <Tooltip contentStyle={{ backgroundColor: "var(--color-tooltip-bg)", border: "1px solid var(--color-tooltip-border)", borderRadius: 8, fontSize: 11 }} formatter={(val: number) => `${val.toFixed(1)} min`} />
+                    <Legend wrapperStyle={{ fontSize: 10 }} iconType="plainline" />
+                    <Line type="monotone" dataKey="static_wait_min" stroke="#64748b" strokeWidth={1.5} strokeDasharray="4 4" dot={false} name="Static" isAnimationActive={false} />
+                    <Line type="monotone" dataKey="adaptive_wait_min" stroke="#22C55E" strokeWidth={2} dot={false} name="MADDPG" isAnimationActive={false} />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+            <div>
+              <h4 className="text-[10px] font-semibold text-slate-300 mb-1">Throughput across workload</h4>
+              <div style={{ height: 180 }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={benchmark.series} margin={{ top: 5, right: 10, bottom: 5, left: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--color-segment-empty)" />
+                    <XAxis dataKey="sim_time_h" tick={{ fontSize: 9, fill: "#64748b" }} tickFormatter={(v) => `${v}h`} />
+                    <YAxis tick={{ fontSize: 9, fill: "#64748b" }} width={30} />
+                    <Tooltip contentStyle={{ backgroundColor: "var(--color-tooltip-bg)", border: "1px solid var(--color-tooltip-border)", borderRadius: 8, fontSize: 11 }} />
+                    <Legend wrapperStyle={{ fontSize: 10 }} iconType="plainline" />
+                    <Line type="monotone" dataKey="static_throughput" stroke="#64748b" strokeWidth={1.5} strokeDasharray="4 4" dot={false} name="Static" isAnimationActive={false} />
+                    <Line type="monotone" dataKey="adaptive_throughput" stroke="#3B82F6" strokeWidth={2} dot={false} name="MADDPG" isAnimationActive={false} />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Delta/Svc Rate + Performance Summary */}
       <div className="grid grid-cols-2 gap-4">
         <LiveDeltaSvcRate />
@@ -744,16 +850,12 @@ export default function HospitalOps() {
               <div className="flex items-baseline gap-2"><span className="font-mono-clinical text-2xl font-bold text-white">{avgWait}</span><span className="text-xs text-slate-500">minutes</span></div>
             </div>
             <div className="bg-bg-primary rounded-lg p-3">
-              <div className="flex items-center gap-2 mb-1"><Zap className="w-4 h-4 text-green-400" /><span className="text-xs text-slate-400">Total Throughput</span></div>
-              <div className="flex items-baseline gap-2"><span className="font-mono-clinical text-2xl font-bold text-white">{recentThroughput}</span><span className="text-xs text-slate-500">patients/hr</span></div>
+              <div className="flex items-center gap-2 mb-1"><Zap className="w-4 h-4 text-green-400" /><span className="text-xs text-slate-400">Patients Served</span></div>
+              <div className="flex items-baseline gap-2"><span className="font-mono-clinical text-2xl font-bold text-white">{patientsServed}</span><span className="text-xs text-slate-500">total{throughputRate > 0 ? ` · ≈${throughputRate}/hr` : ""}</span></div>
             </div>
             <div className="bg-bg-primary rounded-lg p-3">
               <div className="flex items-center gap-2 mb-1"><BedDouble className="w-4 h-4 text-purple-400" /><span className="text-xs text-slate-400">Bed Utilization</span></div>
               <div className="flex items-baseline gap-2"><span className="font-mono-clinical text-2xl font-bold text-white">{avgUtil}%</span></div>
-            </div>
-            <div className="bg-bg-primary rounded-lg p-3">
-              <div className="flex items-center gap-2 mb-1"><Users className="w-4 h-4 text-orange-400" /><span className="text-xs text-slate-400">Staff Efficiency</span></div>
-              <div className="flex items-baseline gap-2"><span className="font-mono-clinical text-2xl font-bold text-white">{staffEfficiency}%</span></div>
             </div>
             <div className="bg-green-500/10 border border-green-500/20 rounded-lg p-3">
               <div className="text-[10px] text-green-400 uppercase tracking-wider mb-1">{algorithm} vs Baseline</div>

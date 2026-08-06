@@ -9,6 +9,19 @@ from typing import Dict, List, Optional
 from pydantic import BaseModel, Field
 
 
+def _sim_now() -> datetime:
+    """Simulated clock, tz-naive, for model timestamp defaults.
+
+    Must match every other service: these payloads are read alongside
+    data_ingestion's census, and a wall-clock stamp here made the ICU panel
+    look ~139 days stale whenever the sim clock was offset.
+    """
+    from shared.integration.sim_clock import get_sim_time
+    return get_sim_time().replace(tzinfo=None)
+
+
+
+
 # ============================================================================
 # Enums
 # ============================================================================
@@ -138,7 +151,7 @@ class SepsisPrediction(BaseModel):
     predicted_onset_hours: Optional[float] = Field(None, description="Estimated hours until onset (if risk > threshold)")
     contributing_factors: List[ContributingFactor]
     model_used: str = Field("ensemble", description="Which model produced this prediction")
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=_sim_now)
 
 
 class TimelinePoint(BaseModel):
@@ -190,7 +203,7 @@ class UnitOverview(BaseModel):
     orange_alerts: int
     yellow_alerts: int
     patients: List[PatientSummary]
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=_sim_now)
 
 
 class HealthResponse(BaseModel):
