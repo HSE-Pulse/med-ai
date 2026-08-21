@@ -85,6 +85,84 @@ class ActorNetwork(nn.Module):
         return action
 
 
+def batched_actor_forward(
+    actors: List["ActorNetwork"],
+    obs: torch.Tensor,
+) -> torch.Tensor:
+    """Run N actors over their own observations in one batched pass.
+
+    ``obs`` has shape (N, B, obs_dim); the result is (N, B, action_dim),
+    where row i is ``actors[i](obs[i])``.
+
+    Every department has its own actor, so the natural implementation is a
+    Python loop of N small forward passes. Each pass is ~10 kernels over
+    tensors of a few kilobytes, which on a GPU costs far more in launch
+    latency than in arithmetic — at 14 agents that is ~140 launches per
+    call, and this is called twice per update (current actors and target
+    actors) plus once per environment step.
+
+    Stacking the weights turns each layer into one ``bmm``. The stack is
+    built with ``torch.stack`` rather than ``stack_module_state`` so it
+    stays part of the autograd graph and gradients flow back to each
+    actor's own parameters exactly as they would from a separate pass.
+    """
+    w1 = torch.stack([a.fc1.weight for a in actors])
+    b1 = torch.stack([a.fc1.bias for a in actors])
+    n1w = torch.stack([a.ln1.weight for a in actors])
+    n1b = torch.stack([a.ln1.bias for a in actors])
+    w2 = torch.stack([a.fc2.weight for a in actors])
+    b2 = torch.stack([a.fc2.bias for a in actors])
+    n2w = torch.stack([a.ln2.weight for a in actors])
+    n2b = torch.stack([a.ln2.bias for a in actors])
+    w3 = torch.stack([a.fc3.weight for a in actors])
+    b3 = torch.stack([a.fc3.bias for a in actors])
+
+    hidden = w1.shape[1]
+    x = torch.baddbmm(b1.unsqueeze(1), obs, w1.transpose(1, 2))
+    x = F.layer_norm(x, (hidden,)) * n1w.unsqueeze(1) + n1b.unsqueeze(1)
+    x = F.relu(x)
+    x = torch.baddbmm(b2.unsqueeze(1), x, w2.transpose(1, 2))
+    x = F.layer_norm(x, (hidden,)) * n2w.unsqueeze(1) + n2b.unsqueeze(1)
+    x = F.relu(x)
+    raw = torch.tanh(torch.baddbmm(b3.unsqueeze(1), x, w3.transpose(1, 2)))
+
+    low = actors[0].action_low.to(raw.device)
+    high = actors[0].action_high.to(raw.device)
+    return low + (raw + 1.0) * 0.5 * (high - low)
+
+
+def clip_grads_per_actor(
+    actors: List["ActorNetwork"],
+    max_norm: float,
+) -> None:
+    """Clip each actor's gradients to ``max_norm``, independently, batched.
+
+    Same arithmetic as calling ``clip_grad_norm_`` once per actor, but the
+    norms for every actor are computed in a single ``_foreach_norm`` and the
+    rescaling in a single ``_foreach_mul_`` — ~8 kernels per actor collapsed
+    into a handful for all of them.
+    """
+    grouped = [[p.grad for p in a.parameters() if p.grad is not None] for a in actors]
+    flat = [g for group in grouped for g in group]
+    if not flat:
+        return
+
+    norms = torch._foreach_norm(flat)
+    scales = []
+    idx = 0
+    for group in grouped:
+        if not group:
+            continue
+        sq = torch.stack(norms[idx: idx + len(group)]).pow(2).sum()
+        total = sq.sqrt()
+        # Matches clip_grad_norm_: scale by max_norm/(total + 1e-6), capped
+        # at 1.0 so gradients under the threshold are left untouched.
+        coef = (max_norm / (total + 1e-6)).clamp(max=1.0)
+        scales.extend([coef] * len(group))
+        idx += len(group)
+    torch._foreach_mul_(flat, scales)
+
+
 class CriticNetwork(nn.Module):
     """Centralized critic: maps all agents' observations and actions to Q-value.
 
@@ -209,11 +287,28 @@ class ReplayBuffer:
 
 @dataclass
 class CurriculumStage:
-    """Defines a curriculum learning stage."""
+    """Defines a curriculum learning stage.
+
+    ``target_reward`` is compared against the mean **per-step** reward over
+    the recent window, not the episode sum. It used to be compared against
+    the episode sum, which silently broke when the reward function was
+    rescaled on 2026-05-27: the old reward had an uncapped
+    ``0.3 * new_served`` throughput bonus and produced episode sums around
+    +385, comfortably above the +2.0 gate, so the curriculum advanced. The
+    capped reward produces episode sums around -170, so *no* stage target
+    was reachable any more and training would spend all 2000 episodes on
+    stage 1 — leaving 9 of the 10 department actors at random
+    initialisation. Per-step keeps the gate stable across future rescales.
+
+    ``max_episodes`` is a hard fallback so a stage can never consume the
+    whole budget even if its target is never met. Curriculum completion is
+    the point; hitting a reward bar early is a bonus.
+    """
     name: str
     departments: List[str]
     min_episodes: int
     target_reward: float = -5.0
+    max_episodes: int = 0          # 0 -> 3 x min_episodes, applied by the trainer
     description: str = ""
 
 
@@ -222,21 +317,24 @@ DEFAULT_CURRICULUM: List[CurriculumStage] = [
         name="stage_1_ed",
         departments=["ED"],
         min_episodes=100,
-        target_reward=2.0,         # Achievable with normalized rewards [-10, 10]
+        target_reward=-0.9,        # per-step; ED alone plateaus near -1.0
+        max_episodes=250,
         description="Single department: learn basic staffing in ED",
     ),
     CurriculumStage(
         name="stage_2_core",
         departments=["ED", "MAU", "Medicine", "ICU"],
         min_episodes=200,
-        target_reward=0.0,         # Breakeven is good for 4 departments
+        target_reward=-1.2,        # per-step, averaged over 4 departments
+        max_episodes=450,
         description="Core flow: ED -> assessment -> inpatient -> critical care",
     ),
     CurriculumStage(
         name="stage_3_extended",
         departments=["ED", "MAU", "SAU", "Medicine", "Surgery", "ICU", "Discharge_Lounge"],
         min_episodes=300,
-        target_reward=-1.0,
+        target_reward=-1.4,        # per-step, averaged over 7 departments
+        max_episodes=600,
         description="Extended: medical + surgical pathways with discharge",
     ),
     CurriculumStage(
@@ -247,7 +345,8 @@ DEFAULT_CURRICULUM: List[CurriculumStage] = [
             "ICU", "HDU", "Day_Ward", "Discharge_Lounge",
         ],
         min_episodes=500,
-        target_reward=-2.0,
+        target_reward=-1.6,        # per-step, averaged over 14 departments
+        max_episodes=100_000,      # last stage: use the remaining budget
         description="All 14 Irish HSE departments at full complexity",
     ),
 ]
@@ -315,6 +414,7 @@ class MADDPGAgent:
         self.actor_optimizers: Dict[str, optim.Adam] = {}
         self.noise_processes: Dict[str, OUNoise] = {}
 
+        self.actor_lr = actor_lr
         for dept in department_names:
             actor = ActorNetwork(obs_dim, action_dim).to(self.device)
             target_actor = copy.deepcopy(actor)
@@ -322,6 +422,18 @@ class MADDPGAgent:
             self.target_actors[dept] = target_actor
             self.actor_optimizers[dept] = optim.Adam(actor.parameters(), lr=actor_lr)
             self.noise_processes[dept] = OUNoise(action_dim)
+
+        # One optimizer covering every actor, with a param group per actor.
+        #
+        # Adam's state is per-parameter and the actors' parameter sets are
+        # disjoint, so a single optimizer produces bit-identical updates to
+        # the n_agents separate ones — but it steps in one fused call rather
+        # than n_agents calls, which was 25 % of update() time on GPU.
+        # ``self.actor_optimizers`` is retained because the checkpoint format
+        # stores per-actor optimizer state; the two are kept in sync by
+        # sharing the same parameter objects and by the state translation in
+        # save_checkpoint / load_checkpoint.
+        self._rebuild_actor_optimizer()
 
         # Critic network (shared, centralized) — always sized for max 14 agents
         # so it doesn't need rebuilding during curriculum stage transitions
@@ -336,6 +448,35 @@ class MADDPGAgent:
         # Training state
         self.training_step = 0
         self.episodes_completed = 0
+
+    def _rebuild_actor_optimizer(self) -> None:
+        """(Re)create the fused actor optimizer, one param group per actor.
+
+        Called at construction and whenever a curriculum stage introduces new
+        actors. Any Adam moment state already accumulated for existing
+        parameters is carried across, keyed by the parameter objects
+        themselves, so advancing a stage never silently resets the optimizer
+        for the departments that were already training.
+        """
+        old_state = getattr(self, "_actor_optimizer", None)
+        carried: Dict[torch.Tensor, Any] = {}
+        if old_state is not None:
+            for group in old_state.param_groups:
+                for p in group["params"]:
+                    if p in old_state.state:
+                        carried[p] = old_state.state[p]
+
+        groups = [
+            {"params": list(self.actors[d].parameters()), "lr": self.actor_lr}
+            for d in self.department_names
+        ]
+        self._actor_optimizer = optim.Adam(groups, lr=self.actor_lr)
+        for p, st in carried.items():
+            self._actor_optimizer.state[p] = st
+
+    def _actor_param_index(self) -> Dict[str, List[torch.Tensor]]:
+        """Department -> its parameter tensors, in a stable order."""
+        return {d: list(self.actors[d].parameters()) for d in self.department_names}
 
     def select_actions(
         self,
@@ -357,24 +498,36 @@ class MADDPGAgent:
         """
         actions: Dict[str, np.ndarray] = {}
 
+        present = [d for d in self.department_names if observations.get(d) is not None]
         for dept in self.department_names:
-            obs = observations.get(dept)
-            if obs is None:
+            if observations.get(dept) is None:
                 actions[dept] = np.zeros(self.action_dim, dtype=np.float32)
-                continue
+        if not present:
+            return actions
 
-            obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
-            with torch.no_grad():
-                action = self.actors[dept](obs_tensor).cpu().numpy().squeeze(0)
+        # One host-to-device copy for every department's observation, one
+        # device-to-host copy for every department's action. The previous
+        # loop did a separate round trip per department — 28 transfers per
+        # environment step at 14 agents, each carrying 48 bytes, so the call
+        # was pure latency. The forward passes still run per department
+        # because each has its own actor weights, but they now queue back to
+        # back without a synchronising copy between them.
+        obs_batch = np.stack([observations[d] for d in present]).astype(np.float32)
+        obs_t = torch.from_numpy(obs_batch).to(self.device, non_blocking=True)
 
+        with torch.no_grad():
+            out = batched_actor_forward(
+                [self.actors[d] for d in present], obs_t.unsqueeze(1),
+            ).squeeze(1)
+        out_np = out.cpu().numpy()
+
+        low = np.array([-3.0, -5.0, 0.0, 0.0], dtype=np.float32)
+        high = np.array([3.0, 5.0, 1.0, 1.0], dtype=np.float32)
+        for i, dept in enumerate(present):
+            action = out_np[i]
             if explore:
-                noise = self.noise_processes[dept].sample()
-                action = action + noise.astype(np.float32)
-                # Clip to valid range
-                low = np.array([-3.0, -5.0, 0.0, 0.0])
-                high = np.array([3.0, 5.0, 1.0, 1.0])
+                action = action + self.noise_processes[dept].sample().astype(np.float32)
                 action = np.clip(action, low, high)
-
             actions[dept] = action
 
         return actions
@@ -396,38 +549,59 @@ class MADDPGAgent:
             dones=dones,
         ))
 
-    def update(self) -> Dict[str, float]:
+    def update(self, return_losses: bool = False) -> Dict[str, float]:
         """Perform one training update step.
+
+        Parameters
+        ----------
+        return_losses:
+            Read the loss scalars back to the host. Every ``.item()`` is a
+            device synchronisation that stalls the CUDA pipeline, and this
+            method produced ``n_agents + 1`` of them per call — on a 14-agent
+            stage that is 15 syncs per environment step, for numbers the
+            trainer only logs every 50 steps. Off by default; the trainer
+            asks for them on logging steps.
 
         Returns
         -------
-        Dict of loss values for logging.
+        Dict of loss values for logging (empty unless ``return_losses``).
         """
         if len(self.replay_buffer) < self.batch_size:
             return {}
 
         batch = self.replay_buffer.sample(self.batch_size)
         losses: Dict[str, float] = {}
+        n_dep = len(self.department_names)
+        bsz = len(batch)
 
-        # Prepare batch tensors
-        batch_obs = {
-            dept: torch.FloatTensor(
-                np.stack([exp.obs.get(dept, np.zeros(self.obs_dim)) for exp in batch])
-            ).to(self.device)
-            for dept in self.department_names
-        }
-        batch_actions = {
-            dept: torch.FloatTensor(
-                np.stack([exp.actions.get(dept, np.zeros(self.action_dim)) for exp in batch])
-            ).to(self.device)
-            for dept in self.department_names
-        }
-        batch_next_obs = {
-            dept: torch.FloatTensor(
-                np.stack([exp.next_obs.get(dept, np.zeros(self.obs_dim)) for exp in batch])
-            ).to(self.device)
-            for dept in self.department_names
-        }
+        # Prepare batch tensors.
+        #
+        # Built as three contiguous numpy arrays and moved to the device in
+        # three transfers rather than 3 x n_agents small ones. At 14 agents
+        # that is 42 host-to-device copies per update collapsed into 3, each
+        # of which was individually far too small to saturate the bus.
+        obs_np = np.zeros((n_dep, bsz, self.obs_dim), dtype=np.float32)
+        act_np = np.zeros((n_dep, bsz, self.action_dim), dtype=np.float32)
+        next_obs_np = np.zeros((n_dep, bsz, self.obs_dim), dtype=np.float32)
+        for i, dept in enumerate(self.department_names):
+            o = [e.obs.get(dept) for e in batch]
+            a = [e.actions.get(dept) for e in batch]
+            no = [e.next_obs.get(dept) for e in batch]
+            for j in range(bsz):
+                if o[j] is not None:
+                    obs_np[i, j] = o[j]
+                if a[j] is not None:
+                    act_np[i, j] = a[j]
+                if no[j] is not None:
+                    next_obs_np[i, j] = no[j]
+
+        obs_t = torch.from_numpy(obs_np).to(self.device, non_blocking=True)
+        act_t = torch.from_numpy(act_np).to(self.device, non_blocking=True)
+        next_obs_t = torch.from_numpy(next_obs_np).to(self.device, non_blocking=True)
+
+        batch_obs = {d: obs_t[i] for i, d in enumerate(self.department_names)}
+        batch_actions = {d: act_t[i] for i, d in enumerate(self.department_names)}
+        batch_next_obs = {d: next_obs_t[i] for i, d in enumerate(self.department_names)}
 
         # Concatenate all observations and actions, zero-padded to max 14 agents
         obs_parts = [batch_obs[d] for d in self.department_names]
@@ -437,8 +611,8 @@ class MADDPGAgent:
         # Pad to _max_agents width so critic input dimension is always the same
         pad_count = self._max_agents - len(self.department_names)
         if pad_count > 0:
-            zero_obs = torch.zeros(self.batch_size, self.obs_dim, device=self.device)
-            zero_act = torch.zeros(self.batch_size, self.action_dim, device=self.device)
+            zero_obs = torch.zeros(bsz, self.obs_dim, device=self.device)
+            zero_act = torch.zeros(bsz, self.action_dim, device=self.device)
             obs_parts.extend([zero_obs] * pad_count)
             act_parts.extend([zero_act] * pad_count)
             next_obs_parts.extend([zero_obs] * pad_count)
@@ -447,16 +621,16 @@ class MADDPGAgent:
         all_actions = torch.cat(act_parts, dim=-1)
         all_next_obs = torch.cat(next_obs_parts, dim=-1)
 
-        # Target actions for next state
+        # Target actions for next state — one batched pass over every
+        # target actor rather than n_agents separate forwards.
         with torch.no_grad():
-            target_next_actions = []
-            for dept in self.department_names:
-                target_next_actions.append(
-                    self.target_actors[dept](batch_next_obs[dept])
-                )
+            tgt = batched_actor_forward(
+                [self.target_actors[d] for d in self.department_names], next_obs_t,
+            )
+            target_next_actions = [tgt[i] for i in range(n_dep)]
             # Pad target actions too
             if pad_count > 0:
-                target_next_actions.extend([torch.zeros(self.batch_size, self.action_dim, device=self.device)] * pad_count)
+                target_next_actions.extend([torch.zeros(bsz, self.action_dim, device=self.device)] * pad_count)
             all_target_next_actions = torch.cat(target_next_actions, dim=-1)
 
         # --- Update critic ---
@@ -482,33 +656,60 @@ class MADDPGAgent:
         critic_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
         self.critic_optimizer.step()
-        losses["critic_loss"] = critic_loss.item()
 
         # --- Update actors ---
-        for dept in self.department_names:
-            # Compute actions with current policy for this agent
-            current_dept_actions = self.actors[dept](batch_obs[dept])
+        #
+        # One critic pass for all agents instead of n_agents passes.
+        #
+        # The per-agent loss is -Q(s, (a_i = pi_i(o_i), a_{-i} = replay)),
+        # so each agent needs its own joint-action vector. Those vectors are
+        # stacked into a single (n_agents * batch) frame and pushed through
+        # the critic once. Because each actor's parameters appear in exactly
+        # one block, the gradient of the summed loss with respect to actor i
+        # is identical to the gradient of loss i alone — the maths is
+        # unchanged, but 14 forward+backward passes over the critic become
+        # one, and 14 small kernels become one large one. This is where the
+        # GPU time was going: the nets are small enough that per-launch
+        # overhead dominated the arithmetic.
+        obs_rep = all_obs.detach().repeat(n_dep, 1)
 
-            # Replace this department's actions in the joint action (padded to max agents)
-            all_current_actions_list = []
-            for d in self.department_names:
-                if d == dept:
-                    all_current_actions_list.append(current_dept_actions)
-                else:
-                    all_current_actions_list.append(batch_actions[d].detach())
-            # Pad to max agents
-            pad_needed = self._max_agents - len(self.department_names)
-            if pad_needed > 0:
-                all_current_actions_list.extend([torch.zeros(self.batch_size, self.action_dim, device=self.device)] * pad_needed)
-            all_current_actions = torch.cat(all_current_actions_list, dim=-1)
+        cur_stacked = batched_actor_forward(
+            [self.actors[d] for d in self.department_names], obs_t,
+        )
+        cur_actions = [cur_stacked[i] for i in range(n_dep)]
+        # Off-agent slots carry the *replay buffer* actions, as canonical
+        # MADDPG requires — not the other actors' current outputs.
+        buf_actions = [batch_actions[d].detach() for d in self.department_names]
 
-            actor_loss = -self.critic(all_obs.detach(), all_current_actions).mean()
+        blocks = []
+        for i in range(n_dep):
+            parts = [cur_actions[i] if j == i else buf_actions[j] for j in range(n_dep)]
+            if pad_count > 0:
+                parts.extend([zero_act] * pad_count)
+            blocks.append(torch.cat(parts, dim=-1))
+        all_current_actions = torch.cat(blocks, dim=0)
 
-            self.actor_optimizers[dept].zero_grad()
-            actor_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.actors[dept].parameters(), 0.5)
-            self.actor_optimizers[dept].step()
-            losses[f"actor_loss_{dept}"] = actor_loss.item()
+        q = self.critic(obs_rep, all_current_actions)
+        # Mean within each agent's block, then sum across agents, so every
+        # actor sees exactly the gradient scale it saw when updated alone.
+        per_agent_loss = -q.view(n_dep, bsz).mean(dim=1)
+        actor_loss_total = per_agent_loss.sum()
+
+        actor_list = [self.actors[d] for d in self.department_names]
+        self._actor_optimizer.zero_grad(set_to_none=True)
+        actor_loss_total.backward()
+        clip_grads_per_actor(actor_list, 0.5)
+        self._actor_optimizer.step()
+        # The critic accumulated gradients from the actor backward. It is
+        # zeroed at the top of the next critic update, but clear it here too
+        # so a caller that inspects critic grads never sees actor leakage.
+        self.critic_optimizer.zero_grad(set_to_none=True)
+
+        if return_losses:
+            losses["critic_loss"] = critic_loss.item()
+            per_agent_cpu = per_agent_loss.detach().cpu()
+            for i, dept in enumerate(self.department_names):
+                losses[f"actor_loss_{dept}"] = float(per_agent_cpu[i])
 
         # Soft target updates
         self._soft_update()
@@ -517,23 +718,32 @@ class MADDPGAgent:
         return losses
 
     def _soft_update(self) -> None:
-        """Soft update target networks."""
+        """Soft update target networks.
+
+        Uses the fused multi-tensor ops. The parameter-at-a-time version
+        issued three kernels per tensor across every actor and the critic —
+        roughly 90 launches per update on a 14-agent stage, each moving a
+        few kilobytes. ``_foreach_*`` performs the same arithmetic
+        (``target = tau * param + (1 - tau) * target``) over the whole list
+        in a handful of launches.
+        """
+        params: List[torch.Tensor] = []
+        targets: List[torch.Tensor] = []
         for dept in self.department_names:
-            for target_param, param in zip(
+            for t_p, p in zip(
                 self.target_actors[dept].parameters(),
                 self.actors[dept].parameters(),
             ):
-                target_param.data.copy_(
-                    self.tau * param.data + (1 - self.tau) * target_param.data
-                )
+                targets.append(t_p.data)
+                params.append(p.data)
+        for t_p, p in zip(self.target_critic.parameters(), self.critic.parameters()):
+            targets.append(t_p.data)
+            params.append(p.data)
 
-        for target_param, param in zip(
-            self.target_critic.parameters(),
-            self.critic.parameters(),
-        ):
-            target_param.data.copy_(
-                self.tau * param.data + (1 - self.tau) * target_param.data
-            )
+        if not targets:
+            return
+        torch._foreach_mul_(targets, 1.0 - self.tau)
+        torch._foreach_add_(targets, params, alpha=self.tau)
 
     def reset_noise(self) -> None:
         """Reset all OU noise processes (call at episode start)."""
@@ -553,10 +763,22 @@ class MADDPGAgent:
             "target_actors": {},
             "actor_optimizers": {},
         }
+        # Actor optimizer state now lives in one fused optimizer, but the
+        # on-disk format is per-actor. Split it back out so checkpoints stay
+        # readable by anything expecting the original layout.
+        fused = self._actor_optimizer
         for dept in self.department_names:
             checkpoint["actors"][dept] = self.actors[dept].state_dict()
             checkpoint["target_actors"][dept] = self.target_actors[dept].state_dict()
-            checkpoint["actor_optimizers"][dept] = self.actor_optimizers[dept].state_dict()
+            params = list(self.actors[dept].parameters())
+            checkpoint["actor_optimizers"][dept] = {
+                "state": {
+                    i: fused.state[p] for i, p in enumerate(params) if p in fused.state
+                },
+                "param_groups": [{
+                    k: v for k, v in fused.param_groups[0].items() if k != "params"
+                } | {"params": list(range(len(params)))}],
+            }
 
         torch.save(checkpoint, path)
         logger.info(f"Checkpoint saved to {path}")
@@ -576,7 +798,32 @@ class MADDPGAgent:
             if dept in checkpoint["actors"]:
                 self.actors[dept].load_state_dict(checkpoint["actors"][dept])
                 self.target_actors[dept].load_state_dict(checkpoint["target_actors"][dept])
-                self.actor_optimizers[dept].load_state_dict(checkpoint["actor_optimizers"][dept])
+
+        # Rebuild the fused optimizer against the freshly loaded parameters,
+        # then re-attach each actor's saved Adam moments by position. Missing
+        # or malformed per-actor state is skipped rather than fatal — a
+        # checkpoint is still useful for inference without optimizer moments.
+        self._rebuild_actor_optimizer()
+        saved_opt = checkpoint.get("actor_optimizers") or {}
+        restored = 0
+        for dept in self.department_names:
+            entry = saved_opt.get(dept)
+            if not entry or "state" not in entry:
+                continue
+            params = list(self.actors[dept].parameters())
+            for idx, st in entry["state"].items():
+                i = int(idx)
+                if i < len(params):
+                    self._actor_optimizer.state[params[i]] = {
+                        k: (v.to(self.device) if isinstance(v, torch.Tensor) else v)
+                        for k, v in st.items()
+                    }
+                    restored += 1
+        if saved_opt and not restored:
+            logger.warning(
+                "Checkpoint %s carried no usable actor optimizer state; "
+                "actors will train from fresh Adam moments.", path,
+            )
 
         logger.info(f"Checkpoint loaded from {path} (step={self.training_step})")
 
@@ -601,6 +848,11 @@ class MADDPGAgent:
 
         self.department_names = list(departments)
         self.n_agents = len(departments)
+
+        # The fused actor optimizer covers exactly the active departments,
+        # so it has to be rebuilt whenever the stage changes. Adam moments
+        # for departments that were already training are carried across.
+        self._rebuild_actor_optimizer()
 
         # Reset noise for exploration in new stage
         for dept in departments:

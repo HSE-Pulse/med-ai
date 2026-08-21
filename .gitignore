@@ -16,6 +16,12 @@ venv/
 # Data & Models (too large for git)
 datasets/
 models/
+# ...but app_NN/backend/models/ holds source, not artifacts: training
+# scripts, model wrappers and evaluation harnesses. The bare "models/"
+# pattern matched those directories too, so that code was silently
+# untracked — app_03's train.py had never been committed. Weights are
+# still excluded by the *.pt / *.joblib / *.npz rules below.
+!app_*/backend/models/
 *.parquet
 *.npz
 *.pt

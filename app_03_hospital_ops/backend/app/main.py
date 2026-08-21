@@ -304,6 +304,8 @@ _load_marl_agent()
 _real_census: Dict[str, int] = {}               # department → patient count
 _last_census_digest: Dict[str, str] = {}         # Bug #4 — idempotency fingerprint
 _capacity_alerts: list = []                       # recent capacity alerts
+_last_occupancy: Dict[str, float] = {}            # sim department → last known occupancy
+_clinical_escalations: list = []                  # recent NEWS2/PEWS/IMEWS escalations
 _discharge_predictions: Dict[str, Dict] = {}      # hadm_id → prediction
 _staffing_recommendations: Dict[str, Dict] = {}   # department → {doctors, nurses}
 _pet_risk_events: list = []                       # Bug #8 — PET breach alerts pushed from ED Flow
@@ -1485,11 +1487,37 @@ async def notify_capacity_alert(data: dict) -> BaseResponse:
     to respond to capacity pressure.
     """
     department = data.get("department", "")
-    occupancy = data.get("occupancy", 0)
     urgency = data.get("urgency", "amber")
 
     sim_dept = _IRISH_TO_SIM_DEPT.get(department, "Medicine")
     actions_taken = []
+
+    # ``occupancy`` is the whole point of a *capacity* alert, but callers
+    # have shipped payloads without it — app_20_deterioration used to post
+    # clinical NEWS2 escalations here with only {department, urgency,
+    # reason}. Defaulting the missing value to 0 produced the nonsensical
+    # "CAPACITY AMBER: Surgery at 0%" log line, and worse, fed 0.0 into the
+    # bottleneck test and the action log. Reconstruct it where we can and
+    # fall back to this department's last known value rather than inventing
+    # an empty ward. Clinical escalations now have their own endpoint
+    # (/notify-clinical-escalation) and should not arrive here at all.
+    occupancy = data.get("occupancy")
+    if occupancy is None:
+        census, capacity = data.get("current_census"), data.get("capacity")
+        try:
+            if census is not None and capacity:
+                occupancy = float(census) / float(capacity)
+        except (TypeError, ValueError, ZeroDivisionError):
+            occupancy = None
+    if occupancy is None:
+        occupancy = _last_occupancy.get(sim_dept, 0.0)
+        logger.warning(
+            "capacity_alert_missing_occupancy dept=%s urgency=%s reason=%s "
+            "— using last known %.3f",
+            department, urgency, data.get("reason"), occupancy,
+        )
+    occupancy = float(occupancy)
+    _last_occupancy[sim_dept] = occupancy
 
     _capacity_alerts.append({
         "department": department, "sim_department": sim_dept,
@@ -1729,6 +1757,82 @@ async def notify_capacity_alert(data: dict) -> BaseResponse:
     })
 
 
+@app.post("/notify-clinical-escalation", response_model=BaseResponse, tags=["integration"])
+async def notify_clinical_escalation(data: dict) -> BaseResponse:
+    """Receive a NEWS2 / PEWS / IMEWS escalation from the Deterioration service.
+
+    This exists because those escalations used to be posted to
+    ``/notify-capacity-alert``. They are not capacity events, and routing
+    them through that endpoint did three concrete kinds of damage:
+
+    1. The payload carries no ``occupancy``, so a ward at 31% was logged and
+       action-logged as "AMBER at 0%".
+    2. The capacity handler resets the department to its ERP baseline before
+       applying an action. A single deteriorating patient therefore wiped the
+       staffing that had been built up in response to genuine capacity
+       pressure on that ward.
+    3. The publish throttle in the capacity handler suppresses repeats within
+       a band and always publishes on a band *change*. Two independent
+       sources writing different urgencies for the same department made the
+       band flap (HDU: black from bed_management, amber from here), which
+       defeated the throttle entirely — measured at ~104 capacity_alert
+       events per 10 min, of which the large majority were this flapping.
+
+    Deliberately does **not** adjust staffing. ``/notify-census`` runs
+    ``_apply_global_marl_sweep`` every tick, which resets every department to
+    its ERP baseline and re-derives staffing from the live observation. Any
+    delta applied here would either be erased within seconds, or — if we
+    skipped the reset to make it stick — compound without bound across
+    escalations. Recording the escalation and letting the authoritative sweep
+    own staffing is the honest behaviour. The clinical response itself is
+    already carried by the ``deterioration_critical`` bus topic and the
+    bed-priority escalation the Deterioration service raises directly.
+    """
+    escalation = {
+        "hadm_id": data.get("hadm_id"),
+        "subject_id": data.get("subject_id"),
+        "department": data.get("department", ""),
+        "scoring_system": data.get("scoring_system"),
+        "score": data.get("score"),
+        "urgency": data.get("urgency", "amber"),
+        "reason": data.get("reason"),
+        "received_at": time.time(),
+    }
+    _clinical_escalations.append(escalation)
+    if len(_clinical_escalations) > 200:
+        del _clinical_escalations[:100]
+
+    sim_dept = _IRISH_TO_SIM_DEPT.get(escalation["department"], "Medicine")
+    _log_action(
+        action_type="clinical_escalation",
+        source="deterioration",
+        target="hospital_ops",
+        department=escalation["department"],
+        details=escalation,
+        observation={
+            "sim_department": sim_dept,
+            "recent_escalations": len(_clinical_escalations),
+            "staffing_owner": "global_marl_sweep",
+        },
+    )
+    logger.info(
+        "CLINICAL ESCALATION: %s %s in %s (score=%s) — recorded, staffing "
+        "left to census sweep",
+        escalation["scoring_system"], escalation["urgency"],
+        escalation["department"] or "unknown", escalation["score"],
+    )
+
+    return BaseResponse(data={
+        "handled": True,
+        "department": escalation["department"],
+        "sim_department": sim_dept,
+        "urgency": escalation["urgency"],
+        "recent_escalations": len(_clinical_escalations),
+        "staffing_adjusted": False,
+        "staffing_owner": "global_marl_sweep",
+    })
+
+
 @app.post("/notify-discharge-prediction", response_model=BaseResponse, tags=["integration"])
 async def notify_discharge_prediction(data: dict) -> BaseResponse:
     """Receive discharge prediction from Bed Management.
@@ -1899,6 +2003,8 @@ async def get_integration_status() -> BaseResponse:
         "real_census": dict(_real_census),
         "capacity_alerts_count": len(_capacity_alerts),
         "recent_alerts": _capacity_alerts[-5:] if _capacity_alerts else [],
+        "clinical_escalations_count": len(_clinical_escalations),
+        "recent_clinical_escalations": _clinical_escalations[-5:] if _clinical_escalations else [],
         "discharge_predictions_count": len(_discharge_predictions),
         "staffing_recommendations": dict(_staffing_recommendations),
         "active_session": bool(_sessions),
@@ -2142,6 +2248,8 @@ async def reset_integration() -> BaseResponse:
     _real_census.clear()
     _last_census_digest.clear()
     _capacity_alerts.clear()
+    _last_occupancy.clear()
+    _clinical_escalations.clear()
     _discharge_predictions.clear()
     _staffing_recommendations.clear()
     _action_log.clear()

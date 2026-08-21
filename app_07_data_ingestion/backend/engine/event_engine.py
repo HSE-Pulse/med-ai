@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import sys
+import time as _time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -545,8 +546,32 @@ class HospitalEventEngine:
 
     async def _admit_next_patient(self) -> None:
         """Pull the next MIMIC patient, remap times to sim clock, schedule events."""
-        adm = self.generator.next_patient()
+        # Never admit somebody who is already admitted. ``active_patients``
+        # is the authoritative in-flight set (rehydrated on restart and
+        # pruned by the discharge handler), so it is the right exclusion
+        # source — see PatientGenerator.next_patient for why the pool
+        # otherwise hands back a still-admitted subject.
+        active_subjects = {
+            str(p.get("subject_id"))
+            for p in self.active_patients.values()
+            if p.get("subject_id") is not None
+        }
+        adm = self.generator.next_patient(exclude_subjects=active_subjects)
         if adm is None:
+            # Either the pool is empty or every admission in it belongs to
+            # a currently-admitted subject. Skip this arrival tick — the
+            # next discharge frees one up. Logged at most once a minute so
+            # a saturated pool is visible without flooding.
+            last_warn = getattr(self, "_last_pool_exhausted_warn", 0.0)
+            wall_now = _time.monotonic()
+            if wall_now - last_warn > 60.0:
+                self._last_pool_exhausted_warn = wall_now
+                logger.warning(
+                    "arrival skipped: no admissible patient in pool "
+                    "(pool=%d, active_subjects=%d) — consider raising the "
+                    "admission pool limit",
+                    self.generator.pool_size, len(active_subjects),
+                )
             return
 
         sid = adm.get("subject_id")

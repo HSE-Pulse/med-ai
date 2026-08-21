@@ -161,6 +161,9 @@ services:
     environment:
       <<: *svc-env
       MODEL_DIR: /models/bed_management
+      # Holds metadata.json -> feature_columns, which the discharge/LOS
+      # XGBoost models need to select and order their input columns.
+      DATASET_DIR: /datasets/bed_management
     ports: ["100.118.170.33:8208:8208"]
 
   waiting_list:

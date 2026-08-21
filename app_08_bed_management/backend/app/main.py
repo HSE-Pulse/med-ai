@@ -32,7 +32,7 @@ import os
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -55,8 +55,15 @@ from shared.integration.idempotency import (
 from shared.integration.persistent_state import PersistentState
 from shared.integration.service_client import ServiceClient
 
-MODEL_DIR = Path(os.getenv("MODEL_DIR", "/home/hari/hse/models/bed_management"))
-DATASET_DIR = Path(os.getenv("DATASET_DIR", "/home/hari/hse/datasets/bed_management"))
+# Defaults are repo-relative, not absolute host paths. The previous
+# "/home/hari/hse/..." defaults do not exist inside the service container,
+# which only bind-mounts ./models and ./datasets. MODEL_DIR was overridden in
+# compose so the models loaded; DATASET_DIR was not, so metadata.json was
+# silently unreadable, ``feature_names`` stayed empty, and every discharge
+# prediction failed XGBoost's feature_names check and fell back to rules —
+# 251 occurrences in a 5-minute window at the 2026-08-21 audit.
+MODEL_DIR = Path(os.getenv("MODEL_DIR") or Path(_PROJECT_ROOT) / "models" / "bed_management")
+DATASET_DIR = Path(os.getenv("DATASET_DIR") or Path(_PROJECT_ROOT) / "datasets" / "bed_management")
 
 from app_08_bed_management.backend.app.schemas import (
     IRISH_DEPARTMENTS,
@@ -234,13 +241,34 @@ async def lifespan(application: FastAPI):
     except FileNotFoundError:
         logger.warning("No CapacityForecaster found; using rule-based fallback.")
 
-    # Load feature names from training metadata
+    # Load feature names from training metadata.
+    #
+    # This is not optional when the models are present: _build_ml_features
+    # uses it to select and *order* the columns XGBoost was trained on, and
+    # XGBoost rejects any frame whose feature names don't match exactly. A
+    # missing file therefore disables ML prediction entirely — so say so at
+    # WARNING rather than leaving a silent per-request fallback.
     meta_path = DATASET_DIR / "metadata.json"
     if meta_path.exists():
         import json
         with open(meta_path) as f:
             ds_meta = json.load(f)
         state["feature_names"] = ds_meta.get("feature_columns", [])
+        logger.info(
+            "Loaded %d training feature columns from %s",
+            len(state["feature_names"]), meta_path,
+        )
+    if not state.get("feature_names"):
+        if state.get("discharge_model") is not None or state.get("los_model") is not None:
+            logger.warning(
+                "No training feature columns at %s — ML discharge/LOS models "
+                "are loaded but will be bypassed (rule-based fallback on every "
+                "request). Set DATASET_DIR to the directory holding "
+                "metadata.json.",
+                meta_path,
+            )
+        else:
+            logger.info("No training feature columns at %s.", meta_path)
 
     # Subscribe to simulation events for real-time bed state sync
     bus = state["event_bus"]
@@ -412,6 +440,19 @@ async def lifespan(application: FastAPI):
                         moved += 1
                         del current[hadm]
 
+                # Pass 1b: enforce one bed per person. The hadm-keyed passes
+                # above cannot see this: concurrent admissions for the same
+                # subject each carry a distinct hadm, so every one of them
+                # looks like a separate patient entitled to a separate bed.
+                # Sweeping here (rather than only guarding acquisition) also
+                # drains duplicates that pre-date the fix and any that a
+                # future upstream regression reintroduces.
+                deduped = _dedupe_subject_beds(beds)
+                for subject, bed_id in deduped:
+                    logger.warning(
+                        "duplicate_bed_released subject=%s bed=%s", subject, bed_id,
+                    )
+
                 # Pass 2: allocate beds for admitted hadms without one.
                 # Rebuild ``current`` from a fresh bed scan first — between
                 # the original snapshot above and this point, another path
@@ -424,14 +465,32 @@ async def lifespan(application: FastAPI):
                     for bid, b in beds.items()
                     if b.status == "occupied" and b.hadm_id
                 }
+                # Subjects who already hold a bed under some *other* hadm.
+                # Without this the loop below would immediately re-create
+                # the duplicates Pass 1b just released, every 10 s.
+                bedded_subjects = {
+                    str(b.patient_id)
+                    for b in beds.values()
+                    if b.status == "occupied" and b.patient_id is not None
+                }
+                skipped_dupes = 0
                 from shared.integration.sim_clock import get_sim_time as _now_sim_clock
                 for hadm, info in target.items():
                     if hadm in current:
+                        continue
+                    subject = info.get("subject_id")
+                    if subject is not None and str(subject) in bedded_subjects:
+                        # This person is already in a bed under an earlier
+                        # admission. Leave this hadm un-bedded; it drains
+                        # when its own discharge event fires.
+                        skipped_dupes += 1
                         continue
                     wanted = info["dept"]
                     for bed in beds.values():
                         if bed.department != wanted or bed.status != "available":
                             continue
+                        if subject is not None:
+                            bedded_subjects.add(str(subject))
                         bed.status = "occupied"
                         bed.hadm_id = hadm
                         bed.patient_id = info.get("subject_id")
@@ -459,11 +518,13 @@ async def lifespan(application: FastAPI):
                         allocated += 1
                         break
 
-                if released or moved or allocated:
+                if released or moved or allocated or deduped or skipped_dupes:
                     logger.info(
                         "sim_reconciler synced: released=%d moved=%d allocated=%d "
+                        "dupes_released=%d dupes_skipped=%d "
                         "(target=%d patients across %d depts)",
-                        released, moved, allocated, len(target),
+                        released, moved, allocated, len(deduped), skipped_dupes,
+                        len(target),
                         len({v["dept"] for v in target.values()}),
                     )
             except asyncio.CancelledError:
@@ -494,6 +555,121 @@ async def lifespan(application: FastAPI):
     if state["mongo"]:
         state["mongo"].close()
     logger.info("Bed Management service shut down.")
+
+
+# ---------------------------------------------------------------------------
+# One-bed-per-person invariant
+# ---------------------------------------------------------------------------
+# The bed registry is keyed on hadm_id everywhere, which is correct for a real
+# hospital: one admission, one bed. It stops being sufficient when the
+# simulator issues several concurrent admissions for the same person — each
+# gets a distinct ``SIM-<hadm>-<epoch>`` id, so every hadm-keyed guard sees a
+# new patient and hands out another bed. The 2026-08-21 audit measured 14
+# subjects across 21 surplus beds, which is what pinned HDU at 100%/black.
+#
+# data_ingestion no longer creates those concurrent admissions
+# (PatientGenerator.next_patient), but bed_management must not depend on an
+# upstream service behaving: a person occupies exactly one bed, and that
+# invariant is enforced here on every acquisition path and swept by the
+# simulator reconciler.
+
+_LOUNGE_DEPT = "Discharge_Lounge"
+
+
+def _admit_sort_value(bed: BedState) -> Optional[float]:
+    """Comparable admission timestamp, or None when unusable.
+
+    ``admission_time`` is written by four different paths and arrives both
+    tz-aware ("...Z" from MIMIC_SIM) and naive (sim-clock fallback), so a
+    plain ``sorted(key=...)`` over the raw values raises TypeError on the
+    mixed comparison. Normalise to naive-UTC epoch seconds.
+    """
+    at = getattr(bed, "admission_time", None)
+    if at is None:
+        return None
+    try:
+        from datetime import timezone as _tz
+        if at.tzinfo is not None:
+            at = at.astimezone(_tz.utc).replace(tzinfo=None)
+        return at.timestamp()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _release_bed(bed: BedState) -> None:
+    """Clear every occupancy field on a bed. Mirrors the discharge path."""
+    bed.status = "available"
+    bed.patient_id = None
+    bed.hadm_id = None
+    bed.acuity = None
+    bed.admission_time = None
+    bed.predicted_discharge = None
+    bed.discharge_readiness_score = 0
+
+
+def _bed_held_by_subject(
+    beds: Dict[str, BedState],
+    subject_id: Any,
+    exclude_bed_id: Optional[str] = None,
+) -> Optional[BedState]:
+    """Return the occupied bed this person already holds, if any."""
+    if subject_id is None:
+        return None
+    key = str(subject_id)
+    for bed_id, bed in beds.items():
+        if bed_id == exclude_bed_id:
+            continue
+        if bed.status == "occupied" and bed.patient_id is not None \
+                and str(bed.patient_id) == key:
+            return bed
+    return None
+
+
+def _pick_bed_to_keep(beds: Dict[str, BedState], bed_ids: List[str]) -> str:
+    """Choose which of a person's several beds is the real one.
+
+    A patient sitting in the Discharge Lounge is on their way out, and
+    ``_lounge_reconciler`` re-acquires lounge beds every 30 s from the
+    lounge service's canonical occupant list. Releasing the lounge bed and
+    keeping the ward bed would therefore just be undone 30 s later, so the
+    lounge bed wins. Otherwise the earliest admission is the genuine stay
+    and the later ones are the duplicates; undated beds sort last, and
+    bed_id breaks ties so the choice is stable across ticks.
+    """
+    lounge = sorted(b for b in bed_ids if beds[b].department == _LOUNGE_DEPT)
+    if lounge:
+        return lounge[0]
+
+    def _key(bid: str):
+        val = _admit_sort_value(beds[bid])
+        return (val is None, val if val is not None else 0.0, bid)
+
+    return sorted(bed_ids, key=_key)[0]
+
+
+def _dedupe_subject_beds(beds: Dict[str, BedState]) -> List[Tuple[str, str]]:
+    """Release every bed beyond one per person.
+
+    Returns the ``(subject_id, released_bed_id)`` pairs so the caller can
+    log them. Idempotent — a converged registry releases nothing.
+    """
+    by_subject: Dict[str, List[str]] = {}
+    for bed_id, bed in beds.items():
+        if bed.status != "occupied" or bed.patient_id is None:
+            continue
+        by_subject.setdefault(str(bed.patient_id), []).append(bed_id)
+
+    released: List[Tuple[str, str]] = []
+    for subject, bed_ids in by_subject.items():
+        if len(bed_ids) < 2:
+            continue
+        keep = _pick_bed_to_keep(beds, bed_ids)
+        for bed_id in bed_ids:
+            if bed_id == keep:
+                continue
+            _release_bed(beds[bed_id])
+            released.append((subject, bed_id))
+    return released
 
 
 def _reconcile_bed_inventory(beds: Dict[str, BedState]) -> Dict[str, BedState]:
@@ -688,6 +864,62 @@ async def get_beds_summary() -> BaseResponse:
     return BaseResponse(data=[s.model_dump() for s in summaries])
 
 
+# ---------------------------------------------------------------------------
+# Capacity-alert hysteresis
+# ---------------------------------------------------------------------------
+_ACTIONABLE_BANDS = ("amber", "red", "black")
+
+# How long an unchanged amber/red/black band waits before it is re-sent.
+# Hospital Ops does real work per alert (MARL inference, a DES step, safety
+# floor enforcement), so re-posting the same standing band on every
+# /beds/summary poll — 5+ services poll it every few seconds — was pure
+# repeated work. A heartbeat still refreshes standing pressure so a Hospital
+# Ops restart re-learns it within 30 s.
+_ALERT_HEARTBEAT_S = 30.0
+
+
+def _alerts_to_send(summaries, gate: Dict[str, Dict[str, Any]]):
+    """Pick which department summaries actually warrant a capacity alert.
+
+    ``gate`` is mutated in place: department → {band, ts of last send}.
+
+    Three rules, in order:
+
+    * **Band change always sends.** That includes the amber+ → green
+      transition, which nothing used to send at all: alerts were filtered to
+      amber-and-worse, so Hospital Ops received no signal when a ward
+      recovered and its ``bottleneck_detected`` gate stayed latched on the
+      last bad band indefinitely.
+    * **A standing amber+ band re-sends on a heartbeat**, not on every poll.
+    * **A department that has always been green sends nothing.**
+    """
+    import time as _t
+    now_ts = _t.time()
+    out = []
+    for s in summaries:
+        prev = gate.get(s.department)
+        band = s.alert_level
+        send = False
+        if prev is None:
+            send = band in _ACTIONABLE_BANDS
+        elif band != prev["band"]:
+            send = True
+        elif band in _ACTIONABLE_BANDS:
+            send = (now_ts - prev["ts"]) >= _ALERT_HEARTBEAT_S
+
+        if send:
+            out.append(s)
+            gate[s.department] = {"band": band, "ts": now_ts}
+        elif prev is None:
+            # First sight of a green department: record the band without
+            # sending, so its first transition into amber+ still registers
+            # as a change rather than as a first sighting.
+            gate[s.department] = {"band": band, "ts": 0.0}
+        # Remaining case: band unchanged and inside the heartbeat window —
+        # nothing to record, the stored entry is already correct.
+    return out
+
+
 async def _push_capacity_notifications(client, summaries, debouncer):
     """Send capacity + census notifications to Hospital Ops in the background.
 
@@ -733,7 +965,7 @@ async def _push_capacity_notifications(client, summaries, debouncer):
                 },
             )
 
-    alerts = [s for s in summaries if s.alert_level in ("amber", "red", "black")]
+    alerts = _alerts_to_send(summaries, state.setdefault("alert_gate", {}))
     if alerts:
         await asyncio.gather(*[_notify(s) for s in alerts], return_exceptions=True)
 
@@ -884,7 +1116,10 @@ async def predict_discharge(req: DischargePredictionRequest) -> BaseResponse:
     base_los = _estimate_department_los(req.department)
 
     ml_success = False
-    if discharge_model is not None and los_model is not None:
+    # Without the training feature list the frame below can only ever be
+    # rejected by XGBoost, so don't pay for a build-and-raise on every
+    # request — the startup warning already explains why ML is off.
+    if discharge_model is not None and los_model is not None and state.get("feature_names"):
         try:
             features = _build_ml_features(req, los_hours)
             features.pop("icd_category", None)
@@ -1182,6 +1417,31 @@ async def allocate_bed(req: BedAllocationRequest) -> BaseResponse:
                 priority_score=1.0,
                 wait_time_estimate_minutes=0,
                 allocation_reason=f"Existing bed: {existing.department} ({existing.bed_type})",
+            ).model_dump())
+
+    # Same guard one level up, keyed on the *person* rather than the
+    # admission. The hadm guard above cannot catch a duplicate when the
+    # upstream simulator mints a fresh ``SIM-<hadm>-<epoch>`` id for a
+    # subject who is still admitted under an earlier one — every id is
+    # unique, so every id looks new. A person occupies exactly one bed, so
+    # hand back the bed they are already in.
+    if req.patient_id is not None:
+        held = _bed_held_by_subject(beds, req.patient_id)
+        if held is not None:
+            logger.warning(
+                "duplicate_allocation_blocked patient=%s hadm=%s already in %s",
+                req.patient_id, getattr(req, "hadm_id", None), held.bed_id,
+            )
+            return BaseResponse(data=BedAllocation(
+                patient_id=req.patient_id,
+                recommended_bed=held.bed_id,
+                recommended_department=held.department,
+                priority_score=1.0,
+                wait_time_estimate_minutes=0,
+                allocation_reason=(
+                    f"Patient already occupies {held.bed_id} "
+                    f"({held.department}) — duplicate allocation refused"
+                ),
             ).model_dump())
 
     available_beds = [b for b in beds.values() if b.status == "available"]
@@ -1513,12 +1773,30 @@ async def notify_transfer(data: dict) -> BaseResponse:
     for bed in beds.values():
         bed_hadm = str(bed.hadm_id) if bed.hadm_id else ""
         if bed_hadm == search and bed.status == "occupied":
-            bed.status = "available"
-            bed.patient_id = None
-            bed.hadm_id = None
-            bed.acuity = None
+            _release_bed(bed)
             logger.info("Bed %s freed on transfer (hadm=%s)", bed.bed_id, hadm_id)
             break
+
+    # One bed per person. The free-then-allocate above is keyed on hadm_id,
+    # so a transfer under hadm B hands the subject a second bed whenever
+    # they are still bedded under an earlier hadm A. This was the path that
+    # kept re-creating duplicates after the sim reconciler swept them —
+    # measured as a steady ~2-3 dupes per 10 s reconcile tick.
+    if subject_id is not None:
+        held = _bed_held_by_subject(beds, subject_id)
+        if held is not None:
+            logger.warning(
+                "duplicate_transfer_blocked subject=%s hadm=%s already in %s",
+                subject_id, hadm_id, held.bed_id,
+            )
+            return BaseResponse(data={
+                "transferred": False,
+                "new_bed": None,
+                "hadm_id": hadm_id,
+                "existing_bed": held.bed_id,
+                "existing_department": held.department,
+                "reason": "patient already occupies a bed under another admission",
+            })
 
     # Allocate target bed (map MIMIC dept name to Irish config). Always
     # stamp ``admission_time`` so dashboards / LOS calculations don't see

@@ -78,6 +78,7 @@ class HospitalEnv(gym.Env):
         active_departments: Optional[List[str]] = None,
         config: Optional[DESConfig] = None,
         seed: int = 42,
+        staff_cost_weight: float = 0.0,
     ) -> None:
         super().__init__()
 
@@ -86,6 +87,17 @@ class HospitalEnv(gym.Env):
         self.max_steps = max_steps
         self.active_departments = active_departments or list(DEPARTMENTS)
         self._seed = seed
+        # Per-headcount penalty applied to staffing above the ERP baseline.
+        #
+        # Default 0.0 preserves the original reward exactly. With no cost
+        # term the reward is monotonically improved by adding staff, so the
+        # optimal policy is "always spend the whole action budget" and the
+        # learned agent cannot do better than a constant max-staffing rule —
+        # measured on the 2026-08-21 evaluation, max staffing reaches
+        # 15.13 h mean wait against 17.52 h for no action, and nothing that
+        # allocates *selectively* can beat it. A non-zero weight is what
+        # makes selective allocation the optimum and the agent worth having.
+        self.staff_cost_weight = float(staff_cost_weight)
 
         # Initialize DES engine. Training must use internal Poisson
         # arrivals — without this the env runs empty and the agent
@@ -205,8 +217,18 @@ class HospitalEnv(gym.Env):
             throughput = 0.1 * min(new_served, 30)
             self._prev_throughput[dept_name] = dept.total_served
 
+            # Staffing cost — only for headcount above the ERP baseline, so
+            # a department staffed to establishment pays nothing and the
+            # term prices the *decision*, not the ward. Zero by default.
+            staff_cost = 0.0
+            if self.staff_cost_weight:
+                from shared.constants.hospital import STAFF_DEFAULTS
+                baseline = STAFF_DEFAULTS.get(dept_name, {"doctors": 2, "nurses": 6})
+                excess = max(0, dept.staff.total - (baseline["doctors"] + baseline["nurses"]))
+                staff_cost = -self.staff_cost_weight * excess
+
             dept_rewards[dept_name] = float(np.clip(
-                wait_penalty + queue_penalty + occ_penalty + throughput,
+                wait_penalty + queue_penalty + occ_penalty + throughput + staff_cost,
                 -10.0, 5.0,
             ))
 

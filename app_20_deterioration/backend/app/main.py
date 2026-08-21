@@ -682,8 +682,19 @@ async def _escalate_internal(hadm_id: str, snapshot: Dict[str, Any]) -> Dict[str
 
     try:
         urgency = "red" if total >= 7 or score.get("any_pink") else "amber"
-        await client.hospital_ops.post("/notify-capacity-alert", {
+        # Clinical escalation, NOT a capacity alert. This used to post to
+        # /notify-capacity-alert with no ``occupancy`` field, which made
+        # Hospital Ops log the ward at 0%, reset its staffing to the ERP
+        # baseline, and flap the per-department urgency band against
+        # bed_management's own alerts — defeating the publish throttle and
+        # flooding the event bus. /notify-clinical-escalation records the
+        # escalation without touching staffing; the census sweep owns that.
+        await client.hospital_ops.post("/notify-clinical-escalation", {
+            "hadm_id": hadm_id,
+            "subject_id": snapshot.get("subject_id"),
             "department": snapshot.get("department", "ALL"),
+            "scoring_system": system,
+            "score": total,
             "urgency": urgency,
             "reason": f"{system}_deterioration",
         })

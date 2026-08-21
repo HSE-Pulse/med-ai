@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 # Ensure project root is importable
 _PROJECT_ROOT = str(Path(__file__).resolve().parents[3])
@@ -73,19 +73,46 @@ class PatientGenerator:
     def pool_size(self) -> int:
         return len(self._admission_pool)
 
-    def next_patient(self) -> Optional[Dict[str, Any]]:
+    def next_patient(
+        self,
+        exclude_subjects: Optional[Set[str]] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Return the next MIMIC patient admission to replay.
 
         Loops around to the beginning when the pool is exhausted.
-        Returns ``None`` only if the pool is empty.
+
+        ``exclude_subjects`` holds the ``subject_id``s that are currently
+        admitted (as strings). Admissions for those subjects are skipped.
+        The pool is small (500 by default) relative to the number of
+        admissions replayed — this deployment had wrapped it ~148 times —
+        so without this filter the cursor re-admits a person who is still
+        occupying a bed from their previous turn through the pool. A
+        2026-08-21 audit found 14 subjects holding 2-4 concurrent beds
+        (21 of 129 occupied beds, and 3 of HDU's 8), which pinned HDU at a
+        permanent 100%/black. One person cannot be in two beds at once, so
+        the concurrent re-admission is the defect, not the bed accounting
+        downstream of it.
+
+        Returns ``None`` when the pool is empty, or when every admission in
+        it belongs to an already-admitted subject (caller should skip this
+        arrival tick rather than force a duplicate).
         """
         if not self._admission_pool:
             return None
-        if self._cursor_pos >= len(self._admission_pool):
-            self._cursor_pos = 0  # wrap around
-        adm = self._admission_pool[self._cursor_pos]
-        self._cursor_pos += 1
-        return adm
+
+        exclude = exclude_subjects or set()
+        # Bounded by one full pass over the pool so an all-excluded pool
+        # can never spin. The cursor still advances over skipped entries,
+        # so they come back around on the next wrap once discharged.
+        for _ in range(len(self._admission_pool)):
+            if self._cursor_pos >= len(self._admission_pool):
+                self._cursor_pos = 0  # wrap around
+            adm = self._admission_pool[self._cursor_pos]
+            self._cursor_pos += 1
+            if exclude and str(adm.get("subject_id")) in exclude:
+                continue
+            return adm
+        return None
 
     # ------------------------------------------------------------------
     # Full journey fetch

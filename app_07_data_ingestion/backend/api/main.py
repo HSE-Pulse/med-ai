@@ -932,6 +932,28 @@ async def disable_dt_module(name: str):
 # ── start / stop / speed / reset ─────────────────────────────────────
 
 
+async def _discharge_now(sim_hadm: str, subject_id) -> None:
+    """Discharge one active admission immediately, off the LOS schedule.
+
+    Mirrors what the scheduled ``discharge`` event does in
+    ``EventEngine._fire_event``: propagate to the Digital Twin (which is what
+    releases the bed in bed_management), drop it from the active set, mark the
+    admission discharged in MIMIC_SIM, and bump the counter.
+    """
+    await engine._propagate_to_digital_twin("discharge", {
+        "hadm_id": sim_hadm,
+        "subject_id": subject_id,
+        "discharge_location": "HOME",
+        "hospital_expire_flag": 0,
+    })
+    engine.active_patients.pop(sim_hadm, None)
+    engine.sim_db["admissions"].update_one(
+        {"hadm_id": sim_hadm},
+        {"$set": {"status": "discharged", "sim_dischtime": engine.clock.now().isoformat()}},
+    )
+    engine.stats["total_discharges"] += 1
+
+
 @app.post("/sim/force-discharge")
 async def force_discharge(count: int = 1):
     """Manually discharge up to N active patients — skips the MIMIC-native
@@ -943,20 +965,8 @@ async def force_discharge(count: int = 1):
     active = list(engine.active_patients.items())[: max(1, min(count, 50))]
     dispatched = []
     for sim_hadm, patient in active:
-        sid = patient.get("subject_id")
         try:
-            await engine._propagate_to_digital_twin("discharge", {
-                "hadm_id": sim_hadm,
-                "subject_id": sid,
-                "discharge_location": "HOME",
-                "hospital_expire_flag": 0,
-            })
-            engine.active_patients.pop(sim_hadm, None)
-            engine.sim_db["admissions"].update_one(
-                {"hadm_id": sim_hadm},
-                {"$set": {"status": "discharged", "sim_dischtime": engine.clock.now().isoformat()}},
-            )
-            engine.stats["total_discharges"] += 1
+            await _discharge_now(sim_hadm, patient.get("subject_id"))
             dispatched.append(sim_hadm)
         except Exception as exc:  # noqa: BLE001
             dispatched.append({"hadm_id": sim_hadm, "error": str(exc)})
@@ -965,6 +975,75 @@ async def force_discharge(count: int = 1):
         "data": {
             "discharged": dispatched,
             "stats_after": engine.stats,
+        },
+    }
+
+
+@app.post("/sim/dedupe-admissions")
+async def dedupe_admissions(apply: bool = False):
+    """Discharge concurrent duplicate admissions for the same person.
+
+    One person cannot be admitted twice at once. The admission pool wraps
+    (500 admissions, ~148 wraps on this deployment) and used to re-admit a
+    subject who was still occupying a bed from their previous turn through
+    it; ``PatientGenerator.next_patient`` now refuses to, but admissions
+    created before that fix are still in flight. Each of them holds an
+    ``active_patients`` slot and is refused a bed by bed_management's
+    one-bed-per-person guard, so they linger as bedless ghosts until their
+    own LOS elapses.
+
+    Keeps the earliest admission per subject and discharges the rest.
+    Defaults to a dry run — pass ``apply=true`` to actually discharge.
+    """
+    if engine is None or not engine.running:
+        return {"status": "error", "error": "sim not running"}
+
+    by_subject: dict = {}
+    for sim_hadm, patient in engine.active_patients.items():
+        sid = patient.get("subject_id")
+        if sid is None:
+            continue
+        by_subject.setdefault(str(sid), []).append((sim_hadm, patient))
+
+    surplus = []
+    for sid, admissions in by_subject.items():
+        if len(admissions) < 2:
+            continue
+        # Earliest sim_admittime is the genuine stay. Undated entries sort
+        # last; sim_hadm breaks ties so repeated calls agree.
+        ordered = sorted(
+            admissions,
+            key=lambda kv: (kv[1].get("sim_admittime") is None,
+                            kv[1].get("sim_admittime") or "",
+                            kv[0]),
+        )
+        for sim_hadm, patient in ordered[1:]:
+            surplus.append({
+                "subject_id": sid,
+                "hadm_id": sim_hadm,
+                "sim_admittime": patient.get("sim_admittime"),
+                "kept": ordered[0][0],
+            })
+
+    discharged, errors = [], []
+    if apply:
+        for item in surplus:
+            try:
+                await _discharge_now(item["hadm_id"], item["subject_id"])
+                discharged.append(item["hadm_id"])
+            except Exception as exc:  # noqa: BLE001
+                errors.append({"hadm_id": item["hadm_id"], "error": str(exc)})
+
+    return {
+        "status": "ok",
+        "data": {
+            "applied": apply,
+            "subjects_with_duplicates": sum(1 for v in by_subject.values() if len(v) > 1),
+            "surplus_admissions": len(surplus),
+            "detail": surplus,
+            "discharged": discharged,
+            "errors": errors,
+            "active_after": len(engine.active_patients),
         },
     }
 

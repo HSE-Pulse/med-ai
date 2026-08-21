@@ -1,0 +1,25 @@
+# Training image for the hospital-ops MARL policy.
+#
+# The per-service runtime images deliberately exclude gymnasium — see the
+# note at the top of app_03_hospital_ops/backend/simulation/observation.py:
+# environment.py needs it, main.py must not, and importing the env from the
+# service crashes hospital_ops on startup. Training does need the env, so it
+# gets its own image rather than bloating (and destabilising) the runtime one.
+#
+# Build:
+#   docker build -f docker/Dockerfile.train -t hse-train:latest .
+# Run (CPU — the nets are 64-unit MLPs, a GPU buys nothing and this box's
+# GPU is owned by Ollama):
+#   docker run --rm -v "$PWD/models:/models" hse-train:latest \
+#     python -m app_03_hospital_ops.backend.models.train \
+#       --episodes 2000 --checkpoint-dir /models/hospital_ops
+ARG BASE_IMAGE=hse-base:latest
+FROM ${BASE_IMAGE}
+
+RUN pip install --no-cache-dir gymnasium
+
+COPY app_03_hospital_ops/ ./app_03_hospital_ops/
+
+ENV MARL_CHECKPOINT_DIR=/models/hospital_ops
+
+CMD ["python", "-m", "app_03_hospital_ops.backend.models.train", "--help"]
