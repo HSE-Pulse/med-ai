@@ -50,6 +50,49 @@ from typing import Annotated, Any, Dict, List, Optional, TypedDict
 
 logger = logging.getLogger(__name__)
 
+# ── Langfuse tracing (optional; safe no-op if SDK/keys absent) ──────────────
+_LF_HANDLER = None
+def _lf_config(session_id: str = "default", name: str = "clinical_chat") -> dict:
+    """RunnableConfig that streams this LangGraph run to Langfuse. Returns {}
+    (a harmless no-op for .with_config) when the SDK or keys are unavailable so
+    the chat never breaks on tracing."""
+    global _LF_HANDLER
+    if _LF_HANDLER is None:
+        try:
+            import os, base64
+            pk = os.environ.get("LANGFUSE_PUBLIC_KEY")
+            sk = os.environ.get("LANGFUSE_SECRET_KEY")
+            host = (os.environ.get("LANGFUSE_HOST") or "").rstrip("/")
+            if pk and sk and host:
+                # Dedicated OTel provider -> Langfuse OTLP endpoint. The app already
+                # installs a GLOBAL OTel provider exporting to otel-collector/Jaeger;
+                # without an isolated provider the langfuse CallbackHandler spans get
+                # routed there instead of to Langfuse. Creating a Langfuse client bound
+                # to this provider makes the handler export to Langfuse.
+                from opentelemetry.sdk.trace import TracerProvider
+                from opentelemetry.sdk.trace.export import BatchSpanProcessor
+                from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+                from langfuse import Langfuse
+                from langfuse.langchain import CallbackHandler
+                _auth = base64.b64encode(f"{pk}:{sk}".encode()).decode()
+                _exp = OTLPSpanExporter(endpoint=host + "/api/public/otel/v1/traces",
+                                        headers={"Authorization": "Basic " + _auth})
+                _prov = TracerProvider()
+                _prov.add_span_processor(BatchSpanProcessor(_exp))
+                Langfuse(public_key=pk, secret_key=sk, host=host, tracer_provider=_prov)
+                _LF_HANDLER = CallbackHandler()
+                logger.info("Langfuse tracing enabled -> %s (dedicated OTLP exporter)", host)
+            else:
+                _LF_HANDLER = False
+        except Exception as _e:  # noqa: BLE001
+            logger.warning("Langfuse tracing disabled: %s", _e)
+            _LF_HANDLER = False
+    if not _LF_HANDLER:
+        return {}
+    return {"callbacks": [_LF_HANDLER], "run_name": name,
+            "metadata": {"langfuse_session_id": session_id}}
+
+
 KNOWLEDGE_INTENTS = {"general_clinical"}
 
 # Deterministic floor. The planner is a 3B model and occasionally returns an
@@ -509,7 +552,13 @@ class ClinicalGraph:
                         "Respond naturally. Reference specific values from the data."},
         ]
         prev = eng.model
-        eng.model = eng.MODEL_ROUTING.get("clinical_response", eng.model)
+        # Route synthesis BY INTENT: structured intents (triage/risk/labs/vitals/
+        # meds/lookup/sofa) -> fast clinical_summary model (llama3.2:3b, ~2-3s on
+        # GPU); only open-ended reasoning (pathway/knowledge) -> heavy deepseek-r1
+        # CoT. Hardcoding clinical_response forced deepseek-r1:8b for everything,
+        # which on the 8GB GPU spills to CPU and read-timeouts.
+        _task = eng.INTENT_MODEL_MAP.get(state.get("intent") or "", "clinical_response")
+        eng.model = eng.MODEL_ROUTING.get(_task, eng.model)
         try:
             answer = await eng._call_ollama(messages) or ""
         finally:
@@ -639,7 +688,7 @@ class ClinicalGraph:
     async def run(self, message: str, session_id: str = "default",
                   history: Optional[list] = None,
                   params: Optional[dict] = None) -> ChatState:
-        graph = self.build()
+        graph = self.build().with_config(_lf_config(session_id))
         return await graph.ainvoke({
             "message": message,
             "session_id": session_id,
@@ -681,7 +730,34 @@ class ClinicalGraph:
         state: ChatState = dict(init)
         emitted = 0
 
-        async for chunk in self.build_retrieval().astream(init):
+        # ── Langfuse trace for the STREAMING path (this is what the UI calls
+        # via POST /chat/stream). run()/stream() are traced elsewhere but the
+        # dashboard never calls them, so without this streamed queries never
+        # showed up in Langfuse. Build one trace explicitly (no reliance on
+        # OTel current-context across the async-generator yields): a root span,
+        # the retrieval sub-graph nested under it via CallbackHandler, then a
+        # generation for the streamed synthesis and a span for verification. ──
+        _lf = _root = _cb = _syn = None
+        try:
+            _cfg = _lf_config(session_id)
+            if _cfg.get("callbacks"):
+                from langfuse import get_client
+                from langfuse.types import TraceContext
+                from langfuse.langchain import CallbackHandler as _CH
+                _lf = get_client()
+                _root = _lf.start_observation(
+                    name="clinical_chat", as_type="span",
+                    input={"message": message})
+                _cb = _CH(trace_context=TraceContext(
+                    trace_id=_root.trace_id, parent_span_id=_root.id))
+        except Exception as _e:  # noqa: BLE001
+            logger.warning("Langfuse stream trace disabled: %s", _e)
+            _lf = _root = _cb = None
+        _retr_cfg = ({"callbacks": [_cb], "run_name": "clinical_chat",
+                      "metadata": {"langfuse_session_id": session_id}}
+                     if _cb is not None else {})
+
+        async for chunk in self.build_retrieval().astream(init, config=_retr_cfg):
             for node, update in chunk.items():
                 if not isinstance(update, dict):
                     continue
@@ -723,7 +799,21 @@ class ClinicalGraph:
 
         parts: List[str] = []
         prev = eng.model
-        eng.model = eng.MODEL_ROUTING.get("clinical_response", eng.model)
+        # Route synthesis BY INTENT: structured intents (triage/risk/labs/vitals/
+        # meds/lookup/sofa) -> fast clinical_summary model (llama3.2:3b, ~2-3s on
+        # GPU); only open-ended reasoning (pathway/knowledge) -> heavy deepseek-r1
+        # CoT. Hardcoding clinical_response forced deepseek-r1:8b for everything,
+        # which on the 8GB GPU spills to CPU and read-timeouts.
+        _task = eng.INTENT_MODEL_MAP.get(state.get("intent") or "", "clinical_response")
+        eng.model = eng.MODEL_ROUTING.get(_task, eng.model)
+        if _root is not None:
+            try:
+                _syn = _root.start_observation(
+                    name="synthesize", as_type="generation",
+                    model=eng.model, input=messages,
+                    metadata={"intent": state.get("intent"), "task": _task})
+            except Exception:  # noqa: BLE001
+                _syn = None
         try:
             async for kind, text in eng._call_ollama_stream(messages):
                 if kind == "reasoning":
@@ -735,10 +825,23 @@ class ClinicalGraph:
             eng.model = prev
         answer = "".join(parts)
         state["answer"] = answer
+        if _syn is not None:
+            try:
+                _syn.update(output=answer)
+                _syn.end()
+            except Exception:  # noqa: BLE001
+                pass
 
         # ── verification on the finished text ────────────────────────
         verdict_update = await self.verify(state)
         verdict = verdict_update.get("verdict") or {}
+        if _root is not None:
+            try:
+                _root.start_observation(
+                    name="verify", as_type="span",
+                    input={"answer": answer}, output=verdict).end()
+            except Exception:  # noqa: BLE001
+                pass
         for note in verdict_update.get("reasoning") or []:
             emitted += 1
             yield "thinking", f"Step {emitted}: {note}"
@@ -753,6 +856,18 @@ class ClinicalGraph:
             )
             answer += correction
             yield "token", correction
+
+        if _root is not None:
+            try:
+                _root.update(output=answer, metadata={
+                    "intent": state.get("intent"),
+                    "verified": verdict.get("ok"),
+                    "sources": sorted(data.keys())})
+                _root.end()
+                if _lf is not None:
+                    _lf.flush()
+            except Exception:  # noqa: BLE001
+                pass
 
         yield "final", {
             "response": answer,
@@ -771,7 +886,7 @@ class ClinicalGraph:
                      params: Optional[dict] = None):
         """Yield (node_name, partial_state) as each node completes, so the UI
         can show the plan and the verification instead of a spinner."""
-        graph = self.build()
+        graph = self.build().with_config(_lf_config(session_id))
         async for chunk in graph.astream({
             "message": message,
             "session_id": session_id,

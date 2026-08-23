@@ -79,6 +79,8 @@ class HospitalEnv(gym.Env):
         config: Optional[DESConfig] = None,
         seed: int = 42,
         staff_cost_weight: float = 0.0,
+        wait_penalty_cap: float = 5.0,
+        queue_penalty_cap: float = 2.5,
     ) -> None:
         super().__init__()
 
@@ -98,6 +100,13 @@ class HospitalEnv(gym.Env):
         # allocates *selectively* can beat it. A non-zero weight is what
         # makes selective allocation the optimum and the agent worth having.
         self.staff_cost_weight = float(staff_cost_weight)
+        # Penalty ceilings. The defaults reproduce the shipped reward, but
+        # both terms saturate under the load this environment generates: with
+        # mean waits near 17 h against a 5 h cap, the wait penalty is pinned
+        # at its floor across most of the state space and carries no gradient
+        # there. Raising the caps restores a slope for the agent to descend.
+        self.wait_penalty_cap = float(wait_penalty_cap)
+        self.queue_penalty_cap = float(queue_penalty_cap)
 
         # Initialize DES engine. Training must use internal Poisson
         # arrivals — without this the env runs empty and the agent
@@ -197,12 +206,12 @@ class HospitalEnv(gym.Env):
             # Wait penalty: always on, capped at -5 so a single outlier
             # patient (20+h wait) can't dominate the gradient signal.
             wait_h = dept.avg_wait_time if dept.total_served > 0 else 0.0
-            wait_penalty = -min(wait_h, 5.0)
+            wait_penalty = -min(wait_h, self.wait_penalty_cap)
 
             # Queue depth — the direct early-warning signal. Linear up to
             # 50 patients, clipped at -2.5 beyond that.
             queue_len = len(dept.queue)
-            queue_penalty = -0.05 * min(queue_len, 50)
+            queue_penalty = -min(0.05 * queue_len, self.queue_penalty_cap)
 
             # Overcrowding: starts biting at 80 % rather than 100 % so the
             # agent learns to add capacity *before* the dept tips over.
@@ -227,9 +236,12 @@ class HospitalEnv(gym.Env):
                 excess = max(0, dept.staff.total - (baseline["doctors"] + baseline["nurses"]))
                 staff_cost = -self.staff_cost_weight * excess
 
+            # Lower clip tracks the penalty ceilings; with the defaults this
+            # is the original [-10, 5] band.
+            lo = min(-10.0, -(self.wait_penalty_cap + self.queue_penalty_cap + 2.5))
             dept_rewards[dept_name] = float(np.clip(
                 wait_penalty + queue_penalty + occ_penalty + throughput + staff_cost,
-                -10.0, 5.0,
+                lo, 5.0,
             ))
 
         if self.mode == "multi_agent":

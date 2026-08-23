@@ -16,6 +16,7 @@ import logging
 import os
 import sys
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,9 +58,15 @@ from app_10_clinical_scribe.backend.app.schemas import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s - %(message)s")
 logger = logging.getLogger("clinical_scribe.api")
 
+# Hot-cache bound. Startup warms the cache with this many notes, and the
+# runtime holds to the same ceiling: the service generates a note every few
+# seconds indefinitely, so an unbounded dict grew to 3.2 GB RSS over four days
+# uptime. Mongo is the source of truth; a miss here is refilled from it.
+NOTE_CACHE_MAX = int(os.getenv("NOTE_CACHE_MAX", "1000"))
+
 state: Dict[str, Any] = {
     "mongo": None,
-    "notes": {},  # note_id → ClinicalNote
+    "notes": OrderedDict(),  # note_id → ClinicalNote (LRU, capped at NOTE_CACHE_MAX)
     "service_client": None,
     "event_bus": None,
 }
@@ -137,14 +144,15 @@ async def lifespan(application: FastAPI):
         col.create_index([("hadm_id", 1), ("generated_at", -1)])
         col.create_index([("patient_id", 1), ("generated_at", -1)])
         col.create_index("note_id", unique=True)
-        # Warm cache with last 1000 notes (keeps /note/{id} fast)
-        cur = col.find({}, sort=[("generated_at", -1)], limit=1000)
+        # Warm cache with the newest notes, up to the same bound the runtime
+        # holds to (keeps /note/{id} fast).
+        cur = col.find({}, sort=[("generated_at", -1)], limit=NOTE_CACHE_MAX)
         restored = 0
         for doc in cur:
             doc.pop("_id", None)
             nid = doc.get("note_id")
             if nid:
-                state["notes"][nid] = doc
+                _cache_note(nid, doc)
                 restored += 1
         logger.info("Clinical Scribe restored %d notes from Mongo on startup", restored)
     except Exception as exc:  # noqa: BLE001
@@ -154,6 +162,39 @@ async def lifespan(application: FastAPI):
     yield
     if state["mongo"]:
         state["mongo"].close()
+
+
+def _cache_note(note_id: str, note_dict: Dict[str, Any]) -> None:
+    """Insert a note into the bounded LRU hot cache, evicting the coldest."""
+    notes = state["notes"]
+    notes[note_id] = note_dict
+    notes.move_to_end(note_id)
+    while len(notes) > NOTE_CACHE_MAX:
+        notes.popitem(last=False)
+
+
+def _get_note(note_id: str) -> Optional[Dict[str, Any]]:
+    """Return a note from the hot cache, falling back to Mongo on a miss.
+
+    Eviction is invisible to callers: anything the cache has dropped is still
+    durable in the notes collection, so an id that resolved before the bound
+    was added still resolves now.
+    """
+    notes = state["notes"]
+    note = notes.get(note_id)
+    if note is not None:
+        notes.move_to_end(note_id)
+        return note
+    try:
+        doc = state["mongo"].client["clinical_scribe"]["notes"].find_one({"note_id": note_id})
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("scribe_note_lookup_failed id=%s: %s", note_id, exc)
+        return None
+    if not doc:
+        return None
+    doc.pop("_id", None)
+    _cache_note(note_id, doc)
+    return doc
 
 
 def _persist_note(note_dict: Dict[str, Any]) -> None:
@@ -267,7 +308,7 @@ async def generate_note(req: GenerateNoteRequest) -> BaseResponse:
     )
 
     note_dump = note.model_dump(mode="json")
-    state["notes"][note_id] = note_dump
+    _cache_note(note_id, note_dump)
     _persist_note(note_dump)
 
     bus = state.get("event_bus")
@@ -360,10 +401,51 @@ async def notes_by_patient(
     return BaseResponse(data=docs)
 
 
+@app.get("/notes/recent", response_model=BaseResponse, tags=["note-generation"])
+async def notes_recent(limit: int = 20) -> BaseResponse:
+    """Recent patients with generated notes, most-recent activity first.
+
+    Powers the Clinical Scribe "Patient Notes" tab: a clickable list of
+    patient IDs; clicking one loads that patient's notes via
+    /notes/by-patient/{subject_id}. Bounded scan (top 3000 recent notes) so
+    the aggregation stays fast and memory-safe on the large collection.
+    """
+    col = state["mongo"].client["clinical_scribe"]["notes"]
+    # NB: generated_at is a sim/chart timestamp (not write time) and is not
+    # monotonic, so sorting by it freezes this list. _id is an ObjectId whose
+    # embedded time IS the insertion time, so it reflects live recency.
+    pipeline = [
+        {"$sort": {"_id": -1}},
+        {"$limit": 3000},
+        {"$group": {
+            "_id": "$patient_id",
+            "note_count": {"$sum": 1},
+            "latest_generated_at": {"$first": "$generated_at"},
+            "latest_note_type": {"$first": "$note_type"},
+            "latest_hadm_id": {"$first": "$hadm_id"},
+            "order": {"$first": "$_id"},
+        }},
+        {"$match": {"_id": {"$ne": None}}},
+        {"$sort": {"order": -1}},
+        {"$limit": max(1, min(limit, 100))},
+    ]
+    rows = [
+        {
+            "patient_id": d["_id"],
+            "note_count": d.get("note_count", 0),
+            "latest_note_type": d.get("latest_note_type"),
+            "latest_generated_at": d.get("latest_generated_at"),
+            "latest_hadm_id": d.get("latest_hadm_id"),
+        }
+        for d in col.aggregate(pipeline)
+    ]
+    return BaseResponse(data=rows)
+
+
 @app.get("/note/{note_id}", response_model=BaseResponse, tags=["note-generation"])
 async def get_note(note_id: str) -> BaseResponse:
     """Retrieve a generated note by ID."""
-    note = state["notes"].get(note_id)
+    note = _get_note(note_id)
     if not note:
         raise HTTPException(status_code=404, detail=f"Note {note_id} not found")
     return BaseResponse(data=note)
@@ -372,7 +454,7 @@ async def get_note(note_id: str) -> BaseResponse:
 @app.post("/note/{note_id}/approve", response_model=BaseResponse, tags=["note-generation"])
 async def approve_note(note_id: str, req: NoteApprovalRequest) -> BaseResponse:
     """Record clinician approval of a generated note (audit trail)."""
-    note = state["notes"].get(note_id)
+    note = _get_note(note_id)
     if not note:
         raise HTTPException(status_code=404, detail=f"Note {note_id} not found")
 
@@ -422,7 +504,7 @@ async def extract_entities(req: EntityExtractionRequest) -> BaseResponse:
 @app.get("/quality/{note_id}", response_model=BaseResponse, tags=["quality"])
 async def get_quality(note_id: str) -> BaseResponse:
     """Return quality metrics for a generated note."""
-    note = state["notes"].get(note_id)
+    note = _get_note(note_id)
     if not note:
         raise HTTPException(status_code=404, detail=f"Note {note_id} not found")
 
@@ -438,15 +520,35 @@ async def get_quality(note_id: str) -> BaseResponse:
 
 @app.get("/metrics/documentation-time", response_model=BaseResponse, tags=["quality"])
 async def documentation_time_metrics() -> BaseResponse:
-    """Return aggregate documentation time savings metrics."""
-    notes = state["notes"]
+    """Return aggregate documentation time savings metrics.
+
+    Aggregated in Mongo rather than over the hot cache: the cache is a bounded
+    LRU window, so counting it would under-report every total to at most
+    NOTE_CACHE_MAX once the service has been up for more than a few hours.
+    """
+    try:
+        col = state["mongo"].client["clinical_scribe"]["notes"]
+        row = next(iter(col.aggregate([{"$group": {
+            "_id": None,
+            "total": {"$sum": 1},
+            "approved": {"$sum": {"$cond": [{"$eq": ["$status", "approved"]}, 1, 0]}},
+            "avg_quality": {"$avg": "$quality_score"},
+        }}])), None)
+        total = (row or {}).get("total", 0)
+        approved = (row or {}).get("approved", 0)
+        avg_quality = (row or {}).get("avg_quality") or 0
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("scribe_metrics_aggregate_failed: %s", exc)
+        notes = state["notes"]
+        total = len(notes)
+        approved = sum(1 for n in notes.values() if n.get("status") == "approved")
+        avg_quality = sum(n.get("quality_score", 0) for n in notes.values()) / max(total, 1)
+
     return BaseResponse(data={
-        "total_notes_generated": len(notes),
-        "approved_notes": sum(1 for n in notes.values() if n.get("status") == "approved"),
-        "avg_quality_score": round(
-            sum(n.get("quality_score", 0) for n in notes.values()) / max(len(notes), 1), 2
-        ),
-        "estimated_time_saved_hours": round(len(notes) * 8 / 60, 1),
+        "total_notes_generated": total,
+        "approved_notes": approved,
+        "avg_quality_score": round(avg_quality, 2),
+        "estimated_time_saved_hours": round(total * 8 / 60, 1),
     })
 
 
@@ -695,7 +797,9 @@ def _compute_quality_score(soap: SOAPNote, source_text: str) -> float:
 # Digital Twin integration (Rule 3 cascade + Integration 7)
 # ---------------------------------------------------------------------------
 
-_vital_buffer: Dict[str, List[Dict[str, Any]]] = {}
+VITAL_BUFFER_MAX_ADMISSIONS = int(os.getenv("VITAL_BUFFER_MAX_ADMISSIONS", "500"))
+
+_vital_buffer: "OrderedDict[str, List[Dict[str, Any]]]" = OrderedDict()
 
 
 @app.post("/update-vitals", response_model=BaseResponse, tags=["integration"])
@@ -711,16 +815,26 @@ async def update_vitals(data: dict) -> BaseResponse:
     if len(buf) > 200:
         del buf[:100]
 
+    # Each admission adds a key that is never removed, so evict the coldest
+    # once the buffer covers more admissions than could plausibly be live.
+    # Mark this admission hottest first, so it is never the one evicted.
+    _vital_buffer.move_to_end(hadm_id)
+    while len(_vital_buffer) > VITAL_BUFFER_MAX_ADMISSIONS:
+        _vital_buffer.popitem(last=False)
+
     # If we have an in-flight draft for this admission, attach the vital.
     for note in state.get("notes", {}).values():
         if str(note.get("hadm_id")) == hadm_id and note.get("status") == "draft":
-            note.setdefault("live_vitals", []).append(dict(data))
+            lv = note.setdefault("live_vitals", [])
+            lv.append(dict(data))
+            if len(lv) > 200:
+                del lv[:100]
     return BaseResponse(data={"buffered": len(buf), "hadm_id": hadm_id})
 
 
 @app.post("/reset", response_model=BaseResponse, tags=["system"])
 async def reset_scribe() -> BaseResponse:
-    state["notes"] = {}
+    state["notes"] = OrderedDict()
     _vital_buffer.clear()
     return BaseResponse(data={"reset": True})
 

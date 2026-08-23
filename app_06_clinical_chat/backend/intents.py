@@ -41,6 +41,14 @@ INTENT_PATTERNS = {
         r"(ed|a\&e|icu|hdu|mau|amau|sau|cdu|ward|hospital|department)"
         r"|(ed|icu|hdu|mau|hospital)\s+(census|status|occupancy|load)"
         r"|nedocs|crowding\s+level|how\s+full"
+        # "active patient list" matched nothing here and fell through to
+        # general_clinical, which fetches nothing and leaves the model to
+        # invent numbers — it answered 143 patients while the simulation
+        # actually held 3.
+        r"|\bpatient\s+list\b|\blist\s+of\s+patients\b"
+        r"|\b(active|admitted|inpatient)\s+patients?\s+list\b"
+        r"|\b(active|admitted|inpatient)\s+patients\b"
+        r"|\bwho\s+(is|are)\s+(currently\s+)?admitted\b"
     ),
     "trolley_watch": (
         r"inmo|trolley\s*gar|trolleygar|trolley|daily\s+snapshot"
@@ -85,6 +93,8 @@ def detect_intent(message: str) -> dict:
         r"\binmo\b", r"trolley", r"\btoday\b", r"\bcurrent(ly)?\b",
         r"\bright\s+now\b", r"\blatest\b", r"\bnow\b", r"daily\s+snapshot",
         r"how\s+many\s+patients", r"\bcensus\b", r"how\s+busy", r"how\s+full",
+        r"patient\s+list", r"list\s+of\s+patients",
+        r"\b(active|admitted|inpatient)\s+patients?\b",
     ]
     wants_live = any(re.search(p, message_lower) for p in LIVE_DATA_PATTERNS)
 

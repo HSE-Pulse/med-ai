@@ -64,6 +64,9 @@ class TrainingConfig:
         seed: int = 42,
         device: str = "cpu",
         staff_cost_weight: float = 0.0,
+        per_agent_critic: bool = False,
+        wait_penalty_cap: float = 5.0,
+        queue_penalty_cap: float = 2.5,
     ) -> None:
         self.total_episodes = total_episodes
         self.max_steps_per_episode = max_steps_per_episode
@@ -85,6 +88,9 @@ class TrainingConfig:
         self.seed = seed
         self.device = device
         self.staff_cost_weight = staff_cost_weight
+        self.per_agent_critic = per_agent_critic
+        self.wait_penalty_cap = wait_penalty_cap
+        self.queue_penalty_cap = queue_penalty_cap
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +187,8 @@ def run_evaluation(
             active_departments=active_depts,
             seed=config.seed + 10000 + ep,
             staff_cost_weight=config.staff_cost_weight,
+            wait_penalty_cap=config.wait_penalty_cap,
+            queue_penalty_cap=config.queue_penalty_cap,
         )
 
         obs, info = env.reset()
@@ -253,6 +261,7 @@ def train(config: Optional[TrainingConfig] = None) -> TrainingMetrics:
         batch_size=config.batch_size,
         buffer_capacity=config.buffer_capacity,
         device=config.device,
+        per_agent_critic=config.per_agent_critic,
     )
 
     # Initialize environment
@@ -263,6 +272,8 @@ def train(config: Optional[TrainingConfig] = None) -> TrainingMetrics:
         active_departments=active_depts,
         seed=config.seed,
         staff_cost_weight=config.staff_cost_weight,
+        wait_penalty_cap=config.wait_penalty_cap,
+        queue_penalty_cap=config.queue_penalty_cap,
     )
 
     logger.info(f"Starting training: {config.total_episodes} episodes")
@@ -404,6 +415,8 @@ def train(config: Optional[TrainingConfig] = None) -> TrainingMetrics:
                     active_departments=active_depts,
                     seed=config.seed,
                     staff_cost_weight=config.staff_cost_weight,
+                    wait_penalty_cap=config.wait_penalty_cap,
+                    queue_penalty_cap=config.queue_penalty_cap,
                 )
 
     # Final save
@@ -440,6 +453,17 @@ def main() -> None:
               "baseline. 0.0 (default) reproduces the original reward, whose "
               "optimum is simply to spend the whole action budget every step."),
     )
+    parser.add_argument(
+        "--per-agent-critic", action="store_true",
+        help=("Give the critic one Q head per department, each regressed on "
+              "that department's own reward. Without it the critic predicts "
+              "the mean reward across departments, which dilutes any single "
+              "agent's contribution by 1/n and is why actors did not learn."),
+    )
+    parser.add_argument("--wait-penalty-cap", type=float, default=5.0,
+                        help="Ceiling on the per-step wait penalty (hours).")
+    parser.add_argument("--queue-penalty-cap", type=float, default=2.5,
+                        help="Ceiling on the per-step queue-depth penalty.")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -460,6 +484,9 @@ def main() -> None:
         seed=args.seed,
         device=args.device,
         staff_cost_weight=args.staff_cost_weight,
+        per_agent_critic=args.per_agent_critic,
+        wait_penalty_cap=args.wait_penalty_cap,
+        queue_penalty_cap=args.queue_penalty_cap,
     )
 
     metrics = train(cfg)

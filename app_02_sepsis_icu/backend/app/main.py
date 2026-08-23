@@ -18,6 +18,7 @@ import os
 import random
 import sys
 import time
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -706,7 +707,12 @@ async def metrics():
 # ---------------------------------------------------------------------------
 
 _recent_screens: list = []
-_admitted_patients: Dict[str, Dict[str, Any]] = {}
+
+# One entry per ICU/HDU handoff, keyed by hadm_id and never removed on
+# discharge, so this grew for the life of the process. Bounded to a recent
+# window like ``_recent_screens`` above.
+ADMITTED_PATIENTS_MAX = int(os.getenv("ADMITTED_PATIENTS_MAX", "1000"))
+_admitted_patients: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 
 
 def _screen_to_alert_level(risk: float) -> str:
@@ -784,6 +790,9 @@ async def admit_patient(payload: dict):
     """Bug #2 / Rule 4 — accept a transfer handoff when destination is ICU/HDU."""
     hadm_id = str(payload.get("hadm_id", "unknown"))
     _admitted_patients[hadm_id] = dict(payload)
+    _admitted_patients.move_to_end(hadm_id)
+    while len(_admitted_patients) > ADMITTED_PATIENTS_MAX:
+        _admitted_patients.popitem(last=False)
     # Immediate screen so dashboards surface the risk right away
     result = await sepsis_screen(payload)
     return {"status": "ok", "data": {"admitted": True, "initial_screen": result["data"]}}

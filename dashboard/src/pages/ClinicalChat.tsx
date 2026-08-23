@@ -736,11 +736,21 @@ function AnimatedDots() {
 /* ─── Suggestion Chips ─── */
 
 const SUGGESTIONS = [
-  "Triage patient with HR 120, SpO2 88",
+  // Acute deterioration & triage (ML acuity + real-time sickest-patient)
+  "Triage a 72yo: HR 132, SpO2 84%, BP 76/48, RR 30, Temp 39.2",
+  "Which patient is deteriorating fastest right now?",
+  "Calculate the SOFA score for the most critical ICU patient",
+  // Oncology (risk model -> pathway -> cohort analytics)
+  "Assess cancer risk: 68M, Stage 3 NSCLC, 40 pack-years",
+  "Recommend a treatment pathway for Stage 2 colorectal cancer",
+  "Analyze the oncology cohort - risk & survival distribution",
+  // Patient-specific, over live EHR data
   "Look up patient 10312052",
-  "Analyze oncology cohort",
-  "What is SOFA score?",
-  "Assess cancer risk for 65M Stage 3 Lung",
+  "Vitals trend for patient 10312052, admission 28141610",
+  "Interpret labs for patient 10312052, admission 22873205 - AKI or sepsis?",
+  "Review meds for patient 10312052, admission 22873205 - interactions & renal dosing",
+  // Clinical knowledge (complex comparison)
+  "Compare qSOFA vs SOFA vs NEWS2 for early sepsis detection",
 ];
 
 /* ─── Models ─── */

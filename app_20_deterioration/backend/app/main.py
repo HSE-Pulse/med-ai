@@ -289,6 +289,23 @@ async def lifespan(application: FastAPI):
         ]
         for eid in stale_esc:
             _state["escalations"].pop(eid, None)
+        # ``history`` holds up to 250 snapshots per admission and used to be
+        # left out of both purge paths, so every hadm_id ever screened stayed
+        # resident: 21.8k admissions over four days uptime put the process at
+        # 4.6 GB RSS. The trend window only ever reads the *current* admission,
+        # so a discharged patient's snapshots are dead weight in memory —
+        # deterioration_history in Mongo remains the durable record.
+        stale_hist = [
+            hid for hid in list(_state["history"].keys())
+            if hid not in active_hadms
+        ]
+        for hid in stale_hist:
+            _state["history"].pop(hid, None)
+        if stale_hist:
+            logger.info(
+                "purge dropped history for %d discharged admissions (%d retained)",
+                len(stale_hist), len(_state["history"]),
+            )
         try:
             db[COLL_ACTIVE].delete_many({"hadm_id": {"$nin": list(active_hadms)}})
             db[COLL_ESC].update_many(
@@ -350,6 +367,10 @@ async def lifespan(application: FastAPI):
                 if hid in _state["active_alerts"]:
                     _state["active_alerts"].pop(hid, None)
                     removed = True
+                # Snapshots for a discharged patient are never read again;
+                # dropping them here is what keeps ``history`` bounded between
+                # the 60s reconcile passes.
+                _state["history"].pop(hid, None)
                 # Drop any open escalations for this hadm so the
                 # ``unacknowledged_escalations`` counter doesn't carry
                 # stale rows for discharged patients.

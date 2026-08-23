@@ -121,6 +121,8 @@ def evaluate_policy(
     seed: int,
     agent: Optional[MADDPGAgent] = None,
     staff_cost_weight: float = 0.0,
+    wait_penalty_cap: float = 5.0,
+    queue_penalty_cap: float = 2.5,
 ) -> Dict[str, Any]:
     """Run ``episodes`` episodes under ``policy`` and summarise the outcome."""
     waits: List[float] = []
@@ -133,7 +135,9 @@ def evaluate_policy(
 
     for ep in range(episodes):
         env = HospitalEnv(mode="multi_agent", max_steps=max_steps, seed=seed + ep,
-                          staff_cost_weight=staff_cost_weight)
+                          staff_cost_weight=staff_cost_weight,
+                          wait_penalty_cap=wait_penalty_cap,
+                          queue_penalty_cap=queue_penalty_cap)
         obs, _ = env.reset(seed=seed + ep)
         ep_reward = 0.0
 
@@ -190,6 +194,8 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--policies", type=str, default=",".join(POLICIES))
     parser.add_argument("--json-out", type=str, default=None)
+    parser.add_argument("--wait-penalty-cap", type=float, default=5.0)
+    parser.add_argument("--queue-penalty-cap", type=float, default=2.5)
     parser.add_argument(
         "--staff-cost-weight", type=float, default=0.0,
         help=("Match the weight a checkpoint was trained with so its reward "
@@ -213,7 +219,9 @@ def main() -> None:
     results = []
     for policy in wanted:
         res = evaluate_policy(policy, args.episodes, args.max_steps, args.seed, agent,
-                              staff_cost_weight=args.staff_cost_weight)
+                              staff_cost_weight=args.staff_cost_weight,
+                              wait_penalty_cap=args.wait_penalty_cap,
+                              queue_penalty_cap=args.queue_penalty_cap)
         results.append(res)
         print(json.dumps(res), flush=True)
 

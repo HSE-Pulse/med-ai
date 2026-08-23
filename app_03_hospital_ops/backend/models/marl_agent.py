@@ -164,9 +164,22 @@ def clip_grads_per_actor(
 
 
 class CriticNetwork(nn.Module):
-    """Centralized critic: maps all agents' observations and actions to Q-value.
+    """Centralized critic over the joint state-action.
 
-    Architecture: (obs_dim*N + action_dim*N) -> 128 -> 64 -> 1
+    Architecture: (obs_dim*N + action_dim*N) -> 128 -> 64 -> n_heads
+
+    ``n_heads=1`` is the original shared-value critic. ``n_heads=n_agents``
+    gives each department its own Q head over the same joint input, which is
+    what makes per-agent credit assignment possible: head i is trained
+    against department i's own reward, so actor i's loss reflects what it
+    did to its own ward rather than to a 14-way average.
+
+    The shared-value form was measurably unlearnable here. Its target was the
+    *mean* reward across departments, so one agent's staffing decision moved
+    the signal by ~1/14 and was swamped by the other thirteen; the
+    2026-08-21 evaluation found actors saturating at the action bounds with
+    no improvement across 600 episodes of any curriculum stage, and a
+    retrained policy still worse than taking no action at all.
     """
 
     def __init__(
@@ -175,14 +188,16 @@ class CriticNetwork(nn.Module):
         obs_dim: int = 12,
         action_dim: int = 4,
         hidden_dim: int = 128,
+        n_heads: int = 1,
     ) -> None:
         super().__init__()
         input_dim = n_agents * (obs_dim + action_dim)
+        self.n_heads = n_heads
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.ln1 = nn.LayerNorm(hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim // 2)
         self.ln2 = nn.LayerNorm(hidden_dim // 2)
-        self.fc3 = nn.Linear(hidden_dim // 2, 1)
+        self.fc3 = nn.Linear(hidden_dim // 2, n_heads)
 
         self._init_weights()
 
@@ -398,6 +413,7 @@ class MADDPGAgent:
         batch_size: int = 64,
         buffer_capacity: int = 100_000,
         device: str = "cpu",
+        per_agent_critic: bool = False,
     ) -> None:
         self.department_names = list(department_names)
         self.n_agents = len(department_names)
@@ -438,7 +454,13 @@ class MADDPGAgent:
         # Critic network (shared, centralized) — always sized for max 14 agents
         # so it doesn't need rebuilding during curriculum stage transitions
         self._max_agents = 14
-        self.critic = CriticNetwork(self._max_agents, obs_dim, action_dim).to(self.device)
+        # One Q head per department when per-agent credit assignment is on;
+        # a single shared head reproduces the original behaviour.
+        self.per_agent_critic = per_agent_critic
+        n_heads = self._max_agents if per_agent_critic else 1
+        self.critic = CriticNetwork(
+            self._max_agents, obs_dim, action_dim, n_heads=n_heads,
+        ).to(self.device)
         self.target_critic = copy.deepcopy(self.critic)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=critic_lr)
 
@@ -637,20 +659,37 @@ class MADDPGAgent:
         with torch.no_grad():
             target_q = self.target_critic(all_next_obs, all_target_next_actions)
 
-        # Use mean reward across departments as the shared reward signal
-        batch_rewards = torch.FloatTensor([
-            np.mean([exp.rewards.get(d, 0.0) for d in self.department_names])
-            for exp in batch
-        ]).unsqueeze(1).to(self.device)
-
         batch_dones = torch.FloatTensor([
             float(any(exp.dones.get(d, False) for d in self.department_names))
             for exp in batch
         ]).unsqueeze(1).to(self.device)
 
-        target_value = batch_rewards + self.gamma * (1 - batch_dones) * target_q
-        current_q = self.critic(all_obs, all_actions)
-        critic_loss = F.mse_loss(current_q, target_value)
+        if self.per_agent_critic:
+            # Each head is regressed on its *own* department's reward, so the
+            # gradient reaching actor i is about ward i rather than a 14-way
+            # average that its own contribution barely moves.
+            rew_np = np.zeros((bsz, self._max_agents), dtype=np.float32)
+            for i, dept in enumerate(self.department_names):
+                for j, exp in enumerate(batch):
+                    rew_np[j, i] = exp.rewards.get(dept, 0.0)
+            batch_rewards = torch.from_numpy(rew_np).to(self.device)
+            target_value = batch_rewards + self.gamma * (1 - batch_dones) * target_q
+            current_q = self.critic(all_obs, all_actions)
+            # Padded heads carry no department, so they must not contribute
+            # to the loss or they drag the shared trunk toward zero.
+            mask = torch.zeros(self._max_agents, device=self.device)
+            mask[:n_dep] = 1.0
+            critic_loss = (((current_q - target_value) ** 2) * mask).sum() / (bsz * n_dep)
+        else:
+            # Original behaviour: one shared value regressed on the mean
+            # reward across departments.
+            batch_rewards = torch.FloatTensor([
+                np.mean([exp.rewards.get(d, 0.0) for d in self.department_names])
+                for exp in batch
+            ]).unsqueeze(1).to(self.device)
+            target_value = batch_rewards + self.gamma * (1 - batch_dones) * target_q
+            current_q = self.critic(all_obs, all_actions)
+            critic_loss = F.mse_loss(current_q, target_value)
 
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
@@ -690,9 +729,17 @@ class MADDPGAgent:
         all_current_actions = torch.cat(blocks, dim=0)
 
         q = self.critic(obs_rep, all_current_actions)
+        if self.per_agent_critic:
+            # Block i holds agent i's joint action; take agent i's own head
+            # from it, i.e. the diagonal over (block, head).
+            q = q.view(n_dep, bsz, self._max_agents)
+            ar = torch.arange(n_dep, device=q.device)
+            own_q = q[ar, :, ar]                      # (n_dep, bsz)
+        else:
+            own_q = q.view(n_dep, bsz)
         # Mean within each agent's block, then sum across agents, so every
         # actor sees exactly the gradient scale it saw when updated alone.
-        per_agent_loss = -q.view(n_dep, bsz).mean(dim=1)
+        per_agent_loss = -own_q.mean(dim=1)
         actor_loss_total = per_agent_loss.sum()
 
         actor_list = [self.actors[d] for d in self.department_names]
@@ -756,6 +803,7 @@ class MADDPGAgent:
             "department_names": self.department_names,
             "training_step": self.training_step,
             "episodes_completed": self.episodes_completed,
+            "per_agent_critic": self.per_agent_critic,
             "critic_state": self.critic.state_dict(),
             "target_critic_state": self.target_critic.state_dict(),
             "critic_optimizer_state": self.critic_optimizer.state_dict(),
@@ -790,9 +838,38 @@ class MADDPGAgent:
         self.training_step = checkpoint["training_step"]
         self.episodes_completed = checkpoint["episodes_completed"]
 
-        self.critic.load_state_dict(checkpoint["critic_state"])
-        self.target_critic.load_state_dict(checkpoint["target_critic_state"])
-        self.critic_optimizer.load_state_dict(checkpoint["critic_optimizer_state"])
+        # A checkpoint records which critic form it was trained with. Adopt
+        # it, so a caller that constructed the agent with the default (shared
+        # value) can still load a per-agent-critic checkpoint and vice versa
+        # — the live service builds the agent without knowing either way.
+        saved_per_agent = bool(checkpoint.get("per_agent_critic", False))
+        if saved_per_agent != self.per_agent_critic:
+            logger.info(
+                "Checkpoint uses %s critic; rebuilding to match.",
+                "per-agent" if saved_per_agent else "shared-value",
+            )
+            self.per_agent_critic = saved_per_agent
+            n_heads = self._max_agents if saved_per_agent else 1
+            self.critic = CriticNetwork(
+                self._max_agents, self.obs_dim, self.action_dim, n_heads=n_heads,
+            ).to(self.device)
+            self.target_critic = copy.deepcopy(self.critic)
+            self.critic_optimizer = optim.Adam(
+                self.critic.parameters(), lr=self.critic_optimizer.param_groups[0]["lr"],
+            )
+
+        # Critic state is only needed to resume training; inference uses the
+        # actors alone. Never let a critic mismatch stop the actors loading.
+        try:
+            self.critic.load_state_dict(checkpoint["critic_state"])
+            self.target_critic.load_state_dict(checkpoint["target_critic_state"])
+            self.critic_optimizer.load_state_dict(checkpoint["critic_optimizer_state"])
+        except (RuntimeError, ValueError, KeyError) as exc:
+            logger.warning(
+                "Could not restore critic from %s (%s); actors still load, but "
+                "resuming training from this checkpoint would restart the critic.",
+                path, exc,
+            )
 
         for dept in self.department_names:
             if dept in checkpoint["actors"]:

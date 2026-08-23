@@ -1,7 +1,7 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import {
   FileText, Code, Search, Sparkles, Loader2, Send,
-  CheckCircle, AlertCircle,
+  CheckCircle, AlertCircle, Users, User, Clock, RefreshCw, ChevronRight,
 } from "lucide-react";
 
 /* ---------- types ---------- */
@@ -17,6 +17,16 @@ interface EntityResult {
   medications: Array<{ drug: string }>; diagnoses: Array<{ term: string; icd_code: string }>;
   symptoms: Array<{ symptom: string }>;
 }
+interface RecentPatient {
+  patient_id: string | number; note_count: number;
+  latest_note_type?: string; latest_generated_at?: string; latest_hadm_id?: string | number;
+}
+interface PatientNote {
+  note_id: string; note_type: string; generated_at?: string; hadm_id?: string | number;
+  quality_score?: number; status?: string; model_used?: string;
+  soap?: { subjective: string; objective: string; assessment: string; plan: string };
+  icd_codes?: Array<{ code: string; description?: string; confidence: number; is_primary: boolean }>;
+}
 
 const SOAP_SECTIONS = [
   { key: "subjective", label: "S - Subjective", color: "blue" },
@@ -26,7 +36,60 @@ const SOAP_SECTIONS = [
 ] as const;
 
 export default function ClinicalScribe() {
-  const [tab, setTab] = useState<"note" | "code" | "ner">("note");
+  const [tab, setTab] = useState<"patient" | "note" | "code" | "ner">("patient");
+
+  // ---- Patient Notes (click a patient ID -> view their recent notes) ----
+  const [recentPatients, setRecentPatients] = useState<RecentPatient[]>([]);
+  const [recentLoading, setRecentLoading] = useState(false);
+  const [patientInput, setPatientInput] = useState("");
+  const [selectedPatient, setSelectedPatient] = useState<string | null>(null);
+  const [patientNotes, setPatientNotes] = useState<PatientNote[] | null>(null);
+  const [notesLoading, setNotesLoading] = useState(false);
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [noteTypeFilter, setNoteTypeFilter] = useState<string>("all");
+
+  const loadRecentPatients = async (silent = false) => {
+    if (!silent) setRecentLoading(true);
+    try {
+      const r = await fetch("/api/scribe/notes/recent?limit=20", { cache: "no-store" });
+      const d = await r.json();
+      if (d.status === "ok") setRecentPatients(d.data || []);
+    } catch (e) { if (!silent) setError(e instanceof Error ? e.message : "Could not load recent patients"); }
+    if (!silent) setRecentLoading(false);
+  };
+
+  const loadPatientNotes = async (id: string | number) => {
+    const pid = String(id).trim();
+    if (!pid) return;
+    setSelectedPatient(pid);
+    setNotesLoading(true);
+    setPatientNotes(null);
+    setExpanded(null);
+    setNoteTypeFilter("all");
+    try {
+      const r = await fetch(`/api/scribe/notes/by-patient/${encodeURIComponent(pid)}?limit=50`, { cache: "no-store" });
+      const d = await r.json();
+      setPatientNotes(d.status === "ok" ? (d.data || []) : []);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not load notes");
+      setPatientNotes([]);
+    }
+    setNotesLoading(false);
+  };
+
+  useEffect(() => {
+    if (tab === "patient" && recentPatients.length === 0) loadRecentPatients();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab]);
+
+  // Auto-refresh the recent-patients list every 15s while the tab is open
+  // (quiet background refresh — no spinner flicker).
+  useEffect(() => {
+    if (tab !== "patient") return;
+    const iv = setInterval(() => loadRecentPatients(true), 15000);
+    return () => clearInterval(iv);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab]);
 
   const [noteText, setNoteText] = useState("");
   const [noteType, setNoteType] = useState("progress_note");
@@ -82,6 +145,7 @@ export default function ClinicalScribe() {
   };
 
   const tabs = [
+    { id: "patient" as const, label: "Patient Notes", icon: Users },
     { id: "note" as const, label: "Note Generation", icon: FileText },
     { id: "code" as const, label: "ICD Coding", icon: Code },
     { id: "ner"  as const, label: "Entity Extraction", icon: Search },
@@ -106,6 +170,164 @@ export default function ClinicalScribe() {
           </button>
         ))}
       </div>
+
+      {/* ───── Patient Notes ───── */}
+      {tab === "patient" && (
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          {/* Left: recent patients + lookup */}
+          <div className="bg-bg-card rounded-xl border border-border p-4 lg:col-span-1">
+            <div className="flex items-center justify-between mb-3">
+              <h2 className="text-sm font-semibold text-text-primary flex items-center gap-2">
+                <Users className="w-4 h-4 text-blue-400" /> Recent Patients
+              </h2>
+              <button onClick={() => loadRecentPatients()} title="Refresh" aria-label="Refresh recent patients"
+                className="text-slate-400 hover:text-slate-200">
+                <RefreshCw className={`w-3.5 h-3.5 ${recentLoading ? "animate-spin" : ""}`} />
+              </button>
+            </div>
+            <form onSubmit={(e) => { e.preventDefault(); loadPatientNotes(patientInput); }}
+              className="flex gap-2 mb-3">
+              <label htmlFor="scribe-patient-id" className="sr-only">Patient ID</label>
+              <input id="scribe-patient-id" value={patientInput} onChange={e => setPatientInput(e.target.value)}
+                placeholder="Enter patient ID..."
+                className="flex-1 min-w-0 bg-bg-input border border-border rounded px-2 py-1.5 text-sm text-text-primary placeholder-slate-600 focus:border-blue-500 focus:outline-none font-mono-clinical" />
+              <button type="submit" disabled={!patientInput.trim()}
+                className="px-3 py-1.5 rounded bg-blue-600 hover:bg-blue-500 disabled:bg-blue-800 text-white text-sm shrink-0">
+                View
+              </button>
+            </form>
+            <div className="space-y-1 max-h-[520px] overflow-y-auto">
+              {recentLoading && recentPatients.length === 0 ? (
+                <div className="flex items-center justify-center py-10 text-text-muted text-[11px]">
+                  <Loader2 className="w-4 h-4 animate-spin mr-2" /> Loading...
+                </div>
+              ) : recentPatients.length === 0 ? (
+                <div className="text-text-muted text-[11px] py-8 text-center">No recent notes</div>
+              ) : recentPatients.map((p) => {
+                const pid = String(p.patient_id);
+                const active = selectedPatient === pid;
+                return (
+                  <button key={pid} onClick={() => { setPatientInput(pid); loadPatientNotes(pid); }}
+                    className={`w-full text-left flex items-center gap-2 px-2.5 py-2 rounded-lg transition-colors group ${
+                      active ? "bg-blue-500/10 text-blue-400" : "text-slate-300 hover:bg-slate-700/50"
+                    }`}>
+                    <User className="w-4 h-4 shrink-0 text-slate-400" aria-hidden="true" />
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm font-mono-clinical truncate">#{pid}</div>
+                      <div className="text-[10px] text-text-muted truncate">
+                        {p.note_count} note{p.note_count === 1 ? "" : "s"}
+                        {p.latest_note_type ? ` · ${p.latest_note_type.replace(/_/g, " ")}` : ""}
+                      </div>
+                    </div>
+                    <ChevronRight className="w-4 h-4 shrink-0 text-slate-500 group-hover:text-slate-300" aria-hidden="true" />
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Right: selected patient's notes */}
+          <div className="bg-bg-card rounded-xl border border-border p-4 lg:col-span-2">
+            <h2 className="text-sm font-semibold text-text-primary mb-3 flex items-center gap-2">
+              <FileText className="w-4 h-4 text-blue-400" />
+              {selectedPatient
+                ? <>Notes for patient <span className="font-mono-clinical text-blue-400">#{selectedPatient}</span></>
+                : "Patient Notes"}
+            </h2>
+            {!selectedPatient ? (
+              <div className="flex flex-col items-center justify-center py-20 text-text-muted text-[11px] gap-2">
+                <Users className="w-8 h-8 text-slate-600" aria-hidden="true" />
+                Select a patient to view their recent notes
+              </div>
+            ) : notesLoading ? (
+              <div className="flex items-center justify-center py-20 text-text-muted text-[11px]">
+                <Loader2 className="w-4 h-4 animate-spin mr-2" /> Loading notes...
+              </div>
+            ) : !patientNotes || patientNotes.length === 0 ? (
+              <div className="text-text-muted text-[11px] py-16 text-center">No notes found for this patient</div>
+            ) : (
+              <>
+              {(() => {
+                const counts: Record<string, number> = {};
+                patientNotes.forEach((n) => { const t = n.note_type || "note"; counts[t] = (counts[t] || 0) + 1; });
+                const types = Object.keys(counts).sort((a, b) => counts[b] - counts[a]);
+                if (types.length < 2) return null;
+                const chip = (active: boolean) =>
+                  `px-2.5 py-1 rounded-full text-[11px] border transition-colors ${active ? "bg-blue-500/15 text-blue-400 border-blue-500/30" : "text-slate-400 border-border hover:text-slate-200"}`;
+                return (
+                  <div className="flex flex-wrap gap-1.5 mb-3">
+                    <button onClick={() => setNoteTypeFilter("all")} className={chip(noteTypeFilter === "all")}>
+                      All ({patientNotes.length})
+                    </button>
+                    {types.map((t) => (
+                      <button key={t} onClick={() => setNoteTypeFilter(t)} className={chip(noteTypeFilter === t)}>
+                        {t.replace(/_/g, " ")} ({counts[t]})
+                      </button>
+                    ))}
+                  </div>
+                );
+              })()}
+              <div className="space-y-2 max-h-[520px] overflow-y-auto pr-1">
+                {patientNotes
+                  .filter((n) => noteTypeFilter === "all" || (n.note_type || "note") === noteTypeFilter)
+                  .map((n) => {
+                  const open = expanded === n.note_id;
+                  const when = n.generated_at
+                    ? new Date(n.generated_at).toLocaleString("en-IE", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" })
+                    : "";
+                  const preview = n.soap?.assessment && !/pending/i.test(n.soap.assessment)
+                    ? n.soap.assessment : (n.soap?.subjective || "");
+                  return (
+                    <div key={n.note_id} className="bg-bg-primary rounded-lg border border-border/40">
+                      <button onClick={() => setExpanded(open ? null : n.note_id)}
+                        aria-expanded={open}
+                        className="w-full flex items-center gap-3 px-3 py-2.5 text-left">
+                        <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-medium bg-blue-500/15 text-blue-400 border border-blue-500/30 shrink-0">
+                          {(n.note_type || "note").replace(/_/g, " ")}
+                        </span>
+                        <span className="flex items-center gap-1 text-[11px] text-text-muted shrink-0">
+                          <Clock className="w-3 h-3" aria-hidden="true" /> {when}
+                        </span>
+                        <span className="flex-1 min-w-0 text-[11px] text-text-secondary truncate">{preview}</span>
+                        <ChevronRight className={`w-4 h-4 shrink-0 text-slate-500 transition-transform ${open ? "rotate-90" : ""}`} aria-hidden="true" />
+                      </button>
+                      {open && (
+                        <div className="px-3 pb-3 space-y-2">
+                          {n.soap && SOAP_SECTIONS.map(({ key, label, color }) => {
+                            const v = (n.soap as Record<string, string>)[key] ?? "";
+                            return (
+                              <div key={key} className={`bg-${color}-500/10 border border-${color}-500/20 rounded-lg p-2.5`}>
+                                <div className={`text-[10px] font-bold text-${color}-400 mb-0.5`}>{label}</div>
+                                <div className="text-[11px] text-text-secondary leading-relaxed">{v || "—"}</div>
+                              </div>
+                            );
+                          })}
+                          {n.icd_codes && n.icd_codes.length > 0 && (
+                            <div className="flex flex-wrap gap-1.5 pt-1">
+                              {n.icd_codes.map((c, i) => (
+                                <span key={i} className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full bg-bg-input text-text-secondary border border-border">
+                                  <span className="font-mono-clinical">{c.code}</span>
+                                  {c.description ? <span className="opacity-70 truncate max-w-[160px]">{c.description}</span> : null}
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                          <div className="text-[10px] text-text-muted flex items-center gap-2 flex-wrap pt-0.5">
+                            <span>Encounter: <span className="font-mono-clinical">{String(n.hadm_id ?? "—")}</span></span>
+                            <span>· Model: <span className="font-mono-clinical">{n.model_used || "—"}</span></span>
+                            <span>· {n.status || "draft"}</span>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* ───── Note Generation ───── */}
       {tab === "note" && (

@@ -11,7 +11,9 @@ Port: 8205
 
 from __future__ import annotations
 
+import os
 import sys
+from collections import OrderedDict as _OrderedDict
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -566,8 +568,25 @@ async def get_metrics(
 # Digital Twin integration (Integrations 2 + 6, Rule 5 step 3)
 # ---------------------------------------------------------------------------
 
-_journey_finalized: Dict[str, Dict[str, Any]] = {}
-_high_risk_flags: Dict[str, Dict[str, Any]] = {}
+# Both dicts are hot windows over Mongo-backed collections, not archives:
+# ``completed_simulations`` and ``risk_flags`` are upserted on every write and
+# are the durable record. Keyed by hadm_id with no eviction they grew for the
+# life of the process — ~22k admissions per four days of sim — so they are
+# bounded here. Mongo remains authoritative for anything evicted.
+JOURNEY_FINALIZED_MAX = int(os.getenv("JOURNEY_FINALIZED_MAX", "1000"))
+HIGH_RISK_FLAGS_MAX = int(os.getenv("HIGH_RISK_FLAGS_MAX", "2000"))
+
+_journey_finalized: "_OrderedDict[str, Dict[str, Any]]" = _OrderedDict()
+_high_risk_flags: "_OrderedDict[str, Dict[str, Any]]" = _OrderedDict()
+
+
+def _bounded_put(store: "_OrderedDict[str, Dict[str, Any]]", key: str,
+                 value: Dict[str, Any], cap: int) -> None:
+    """Insert into a bounded most-recent-first store, evicting the coldest."""
+    store[key] = value
+    store.move_to_end(key)
+    while len(store) > cap:
+        store.popitem(last=False)
 
 
 @app.post("/journey/finalize/{hadm_id}")
@@ -583,7 +602,7 @@ async def finalize_journey(hadm_id: str, data: dict):
     record = dict(data)
     record["hadm_id"] = hadm_id
     record["finalized_at"] = _sim_now().isoformat()
-    _journey_finalized[hadm_id] = record
+    _bounded_put(_journey_finalized, hadm_id, record, JOURNEY_FINALIZED_MAX)
     try:
         mongo.client["patient_journey"]["completed_simulations"].update_one(
             {"hadm_id": hadm_id}, {"$set": record}, upsert=True,
@@ -610,7 +629,7 @@ async def flag_high_risk(data: dict):
         "readmission_risk": data.get("readmission_risk"),
         "flagged_at": _sim_now().isoformat(),
     }
-    _high_risk_flags[hadm_id] = flag
+    _bounded_put(_high_risk_flags, hadm_id, flag, HIGH_RISK_FLAGS_MAX)
     try:
         mongo.client["patient_journey"]["risk_flags"].update_one(
             {"hadm_id": hadm_id}, {"$set": flag}, upsert=True,

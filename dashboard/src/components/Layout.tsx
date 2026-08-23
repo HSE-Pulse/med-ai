@@ -28,12 +28,12 @@ import {
   Menu,
   X,
   Route,
-  Waves,
 } from "lucide-react";
 import AlertCenter from "./AlertCenter";
 
 const navItems = [
   { path: "/", label: "Dashboard", icon: LayoutDashboard },
+  { path: "/chat", label: "Clinical Chat", icon: MessageCircle },
   { path: "/ed-triage", label: "ED Triage", icon: Stethoscope },
   { path: "/ed-flow", label: "ED Flow", icon: Workflow },
   { path: "/sepsis", label: "Sepsis & ICU", icon: HeartPulse },
@@ -43,10 +43,8 @@ const navItems = [
   { path: "/waiting-list", label: "Waiting List", icon: ClipboardList },
   { path: "/patient-journey", label: "Patient Journey", icon: GitBranch },
   { path: "/voyage", label: "Patient Voyage", icon: Route },
-  { path: "/patient-flow", label: "Patient Flow", icon: Waves },
   { path: "/clinical-scribe", label: "Clinical Scribe", icon: FileText },
   { path: "/simulation", label: "Simulation", icon: Radio },
-  { path: "/chat", label: "Clinical Chat", icon: MessageCircle },
   { path: "/erp", label: "Hospital ERP", icon: Database },
   { path: "---", label: "divider", icon: LayoutDashboard },
   // Uplift: 6 new services (8216–8221)
@@ -263,50 +261,46 @@ export default function Layout() {
           </button>
         </div>
 
-        {/* Navigation — internal scroll with subtle gradient cue so the
-            user can tell there's more content when items overflow. */}
-        <div className="relative flex-1 min-h-0">
-          <nav
-            aria-label="Main"
-            className="absolute inset-0 py-3 space-y-1 px-2 overflow-y-auto"
-          >
+        {/* Nav + footer controls share ONE scroll column so the footer hugs
+            the nav list directly. Previously the nav was flex-1 and the footer
+            pinned to the viewport bottom, which left a dead gap in the middle of
+            the sidebar on tall screens. Now content stacks from the top and
+            overflows scroll together on short screens. */}
+        <div className="flex-1 min-h-0 overflow-y-auto flex flex-col">
+          <nav aria-label="Main" className="py-3 space-y-1 px-2">
             {renderNavItems()}
           </nav>
-          <div
-            aria-hidden="true"
-            className="pointer-events-none absolute inset-x-0 bottom-0 h-6 bg-gradient-to-t from-bg-card to-transparent"
-          />
-        </div>
 
-        {/* Theme Toggle */}
-        <div className="border-t border-border py-2">
-          <ThemeToggle collapsed={collapsed} />
-        </div>
+          {/* Theme Toggle */}
+          <div className="mt-1 border-t border-border py-2">
+            <ThemeToggle collapsed={collapsed} />
+          </div>
 
-        {/* Collapse toggle (desktop only — mobile uses drawer X) */}
-        <button
-          type="button"
-          onClick={() => setCollapsed(!collapsed)}
-          aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-          aria-expanded={!collapsed}
-          className="hidden lg:flex items-center justify-center py-3 border-t border-border text-slate-500 hover:text-slate-300 transition-colors"
-        >
-          {collapsed ? (
-            <ChevronRight className="w-4 h-4" aria-hidden="true" />
-          ) : (
-            <ChevronLeft className="w-4 h-4" aria-hidden="true" />
-          )}
-        </button>
+          {/* Collapse toggle (desktop only — mobile uses drawer X) */}
+          <button
+            type="button"
+            onClick={() => setCollapsed(!collapsed)}
+            aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+            aria-expanded={!collapsed}
+            className="hidden lg:flex items-center justify-center py-3 border-t border-border text-slate-500 hover:text-slate-300 transition-colors"
+          >
+            {collapsed ? (
+              <ChevronRight className="w-4 h-4" aria-hidden="true" />
+            ) : (
+              <ChevronLeft className="w-4 h-4" aria-hidden="true" />
+            )}
+          </button>
 
-        {/* Branding */}
-        <div className="px-4 py-3 border-t border-border">
-          {!collapsed ? (
-            <p className="text-[11px] text-slate-500 text-center uppercase tracking-wider">
-              Harishankar Somasundaram
-            </p>
-          ) : (
-            <p className="text-[11px] text-slate-500 text-center">HS</p>
-          )}
+          {/* Branding */}
+          <div className="px-4 py-3 border-t border-border">
+            {!collapsed ? (
+              <p className="text-[11px] text-slate-500 text-center uppercase tracking-wider">
+                Harishankar Somasundaram
+              </p>
+            ) : (
+              <p className="text-[11px] text-slate-500 text-center">HS</p>
+            )}
+          </div>
         </div>
       </aside>
 
