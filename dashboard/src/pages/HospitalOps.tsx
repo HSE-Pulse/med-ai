@@ -556,7 +556,10 @@ export default function HospitalOps() {
   // Distinct patients discharged — the real "patients served" count.
   const patientsDischarged = lastHistSample?.total_discharged ?? liveMetrics?.total_discharged ?? 0;
   const simHours = lastHistSample?.sim_time_h ?? liveMetrics?.simulation_time_hours ?? 0;
-  const dischargeRate = simHours > 0
+  // Rate needs at least an hour of engine time behind it: the engine clock
+  // is re-anchored on sim speed changes / resets while the discharge count
+  // is not, so a fresh clock turns 136 discharges into "503.7/hr".
+  const dischargeRate = simHours >= 1
     ? Math.round((patientsDischarged / simHours) * 10) / 10
     : 0;
   // Department visits — the figure the tile used to headline, kept as context.
