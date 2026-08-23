@@ -41,6 +41,7 @@ from .schemas import (
     WSMessageType,
 )
 from ..simulation.des_engine import DESConfig, DESEngine
+from shared.db.mongo import MongoManager
 
 from shared.constants.hospital import DEPARTMENTS
 STATE_DIM = 12
@@ -142,19 +143,19 @@ async def _hops_startup():
         # of the stack (ED triage, sepsis_icu, data_ingestion) instead of
         # only mirroring bed_management's census.
         async def _on_admission(topic, payload):
-            _cross_service_events.append({"topic": topic, "hadm_id": payload.get("hadm_id"), "at": _now_iso_safe()})
+            _record_cross_service_event(topic, payload)
             try:
                 _mirror_admission_to_engines(payload)
             except Exception as exc:  # noqa: BLE001
                 logger.debug("on_admission_mirror_failed: %s", exc)
         async def _on_discharge(topic, payload):
-            _cross_service_events.append({"topic": topic, "hadm_id": payload.get("hadm_id"), "at": _now_iso_safe()})
+            _record_cross_service_event(topic, payload)
             try:
                 _mirror_discharge_to_engines(payload)
             except Exception as exc:  # noqa: BLE001
                 logger.debug("on_discharge_mirror_failed: %s", exc)
         async def _on_transfer(topic, payload):
-            _cross_service_events.append({"topic": topic, "hadm_id": payload.get("hadm_id"), "at": _now_iso_safe()})
+            _record_cross_service_event(topic, payload)
             try:
                 _mirror_transfer_to_engines(payload)
             except Exception as exc:  # noqa: BLE001
@@ -182,36 +183,7 @@ async def _hops_startup():
     except Exception as exc:  # noqa: BLE001
         logger.warning("sim_clock_attach_remote_failed: %s", exc)
 
-    # One-shot resync from MIMIC_SIM at boot — closes the active-patient
-    # gap between this DES engine and bed_management. Without this, every
-    # service restart resets the engine to zero and the dashboard's
-    # Hospital Ops occupancy / wait time diverges from bed_management's
-    # ground truth (e.g. ICU 100% in bed_mgmt vs 50% in this engine).
-    # We pull every non-discharged admission and inject it via the same
-    # path Kafka admissions take, so wait/throughput accounting works
-    # identically.
-    try:
-        sim_db = mongo.client["MIMIC_SIM"]
-        active = list(sim_db["admissions"].find(
-            {"status": {"$ne": "discharged"}},
-            {"_id": 0, "hadm_id": 1, "subject_id": 1, "admission_type": 1, "sim_admittime": 1},
-        ))
-        n = 0
-        for adm in active:
-            try:
-                _mirror_admission_to_engines({
-                    "hadm_id": adm.get("hadm_id"),
-                    "subject_id": adm.get("subject_id"),
-                    "admission_type": adm.get("admission_type", "EMERGENCY"),
-                    "department": "ED",  # initial dept; transfers will route to actual ward
-                    "acuity": 3,
-                })
-                n += 1
-            except Exception:
-                continue
-        logger.info("startup_resync: injected %d active admissions from MIMIC_SIM", n)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("startup_resync_failed: %s", exc)
+    _resync_from_mimic_sim("startup")
 
     # Keep the dashboard's Wait/Throughput ("MADDPG vs Baseline") charts live
     # even when no external admission stream (Kafka / bed_management census) is
@@ -227,6 +199,25 @@ async def _hops_startup():
 
 # Ring buffer for observed cross-service Kafka events (visible via /kafka-events)
 _cross_service_events: List[Dict[str, Any]] = []
+CROSS_EVENT_RING_MAX = 1000
+
+
+def _record_cross_service_event(topic: str, payload: Dict[str, Any]) -> None:
+    """Append to the cross-service ring buffer, holding it to its bound.
+
+    Despite the "ring buffer" label this list was never trimmed, so it grew
+    for the life of the process on three high-rate topics; only the readers
+    bounded it, via a trailing slice. Every other accumulator in this module
+    caps itself, so this was an oversight rather than a deliberate archive.
+    """
+    _cross_service_events.append({
+        "topic": topic,
+        "hadm_id": payload.get("hadm_id") if isinstance(payload, dict) else None,
+        "at": _now_iso_safe(),
+    })
+    if len(_cross_service_events) > CROSS_EVENT_RING_MAX:
+        del _cross_service_events[: CROSS_EVENT_RING_MAX // 2]
+
 
 def _now_iso_safe() -> str:
     try:
@@ -664,6 +655,8 @@ async def get_metrics(simulation_id: Optional[str] = None) -> PerformanceMetrics
         dept_metrics.append(DepartmentMetrics(
             name=name,
             avg_wait_time_hours=dm.get("avg_wait_time", 0.0),
+            avg_queue_wait_hours=dm.get("avg_queue_wait", 0.0),
+            avg_dwell_time_hours=dm.get("avg_dwell_time", dm.get("avg_service_time", 0.0)),
             avg_service_time_hours=dm.get("avg_service_time", 0.0),
             occupancy_ratio=dm.get("occupancy_ratio", 0.0),
             throughput=dm.get("throughput", 0),
@@ -675,7 +668,9 @@ async def get_metrics(simulation_id: Optional[str] = None) -> PerformanceMetrics
         simulation_time_hours=metrics.get("simulation_time", 0.0),
         simulation_time_iso=_engine_to_iso(metrics.get("simulation_time", 0.0)),
         total_discharged=metrics.get("total_discharged", 0),
+        total_diverted=metrics.get("total_diverted", 0),
         mean_total_wait_hours=metrics.get("mean_total_wait", 0.0),
+        mean_total_queue_wait_hours=metrics.get("mean_total_queue_wait", 0.0),
         mean_los_hours=metrics.get("mean_los", 0.0),
         active_patients=metrics.get("active_patients", 0),
         departments=dept_metrics,
@@ -817,7 +812,7 @@ def _get_baseline_engine() -> DESEngine:
     """
     eng: Optional[DESEngine] = _baseline_session.get("engine")
     if eng is None:
-        eng = DESEngine(DESConfig(internal_arrivals=False))
+        eng = DESEngine(_external_feed_config())
         eng.initialize()
         _baseline_session["engine"] = eng
         _baseline_session["created_at"] = time.time()
@@ -997,6 +992,172 @@ def _apply_global_marl_sweep(engine: DESEngine) -> Dict[str, Dict[str, int]]:
     return applied
 
 
+def _resync_from_mimic_sim(reason: str = "startup") -> int:
+    """Inject every non-discharged MIMIC_SIM admission into the DES engines,
+    each placed in its real ward. Runs at boot and again after ``/reset`` —
+    a reset (fanned out by data_ingestion on restart / speed change) wipes
+    ``_sessions``, and without a re-run the engine stays empty until the
+    next container restart (seen 2026-08-23 14:40 UTC)."""
+    mongo = MongoManager()
+    # One-shot resync from MIMIC_SIM at boot — closes the active-patient
+    # gap between this DES engine and bed_management. Without this, every
+    # service restart resets the engine to zero and the dashboard's
+    # Hospital Ops occupancy / wait time diverges from bed_management's
+    # ground truth (e.g. ICU 100% in bed_mgmt vs 50% in this engine).
+    # We pull every non-discharged admission and inject it via the same
+    # path Kafka admissions take, so wait/throughput accounting works
+    # identically.
+    n = 0
+    try:
+        sim_db = mongo.client["MIMIC_SIM"]
+        active = list(sim_db["admissions"].find(
+            {"status": {"$ne": "discharged"}},
+            {"_id": 0, "hadm_id": 1, "subject_id": 1, "admission_type": 1, "sim_admittime": 1},
+        ))
+        # Ground-truth ward per hadm_id from bed_management's last snapshot.
+        # Injecting everyone at ED (the previous behaviour) built a phantom
+        # ED queue of ~50 patients that the DES, the MARL sweep and the wait
+        # chart all reacted to, while the real ED held 3-7 patients.
+        ward_by_hadm = _bed_management_ward_map(sim_db)
+        n = 0
+        placed = 0
+        for adm in active:
+            try:
+                loc = ward_by_hadm.get(str(adm.get("hadm_id")))
+                if loc:
+                    placed += 1
+                _mirror_admission_to_engines({
+                    "hadm_id": adm.get("hadm_id"),
+                    "subject_id": adm.get("subject_id"),
+                    "admission_type": adm.get("admission_type", "EMERGENCY"),
+                    "department": (loc or {}).get("department") or "ED",
+                    "acuity": (loc or {}).get("acuity") or 3,
+                    "_resync_direct": True,
+                })
+                n += 1
+            except Exception:
+                continue
+        logger.info("%s_resync: injected %d active admissions from MIMIC_SIM (%d placed in real ward, %d defaulted to ED)",
+                    reason,
+                    n, placed, n - placed)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("%s_resync_failed: %s", reason, exc)
+    return n
+
+
+_bm_capacities_cache: Dict[str, int] = {}
+
+
+def _reconcile_locations_from_bed_management() -> int:
+    """Move DES patients to the ward bed_management currently has them in.
+
+    bed_management's ``sim_reconciler`` relocates patients (mostly ED -> ward)
+    straight from MIMIC_SIM transfers on every tick *without* publishing a
+    ``patient_transferred`` event, so hospital_ops only saw a fraction of the
+    moves (audit 2026-08-23: DES ED 9 vs real 2 with identical totals).
+    Applies the same ground truth to both the live and baseline engines via
+    ``relocate_patient_by_hadm`` (which records any queue wait and stamps
+    the departure). Returns the number of patients moved in the live engine.
+    """
+    if not _sessions:
+        return 0
+    try:
+        ward_by_hadm = _bed_management_ward_map(MongoManager().client["MIMIC_SIM"])
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("reconcile_ward_map_failed: %s", exc)
+        return 0
+    if not ward_by_hadm:
+        return 0
+    moved = 0
+    for engine, is_live in ((list(_sessions.values())[-1]["engine"], True), (_baseline_session.get("engine"), False)):
+        if engine is None:
+            continue
+        for p in list(engine.patients.values()):
+            hadm = p.timestamps.get("external_hadm_id")
+            if hadm is None:
+                continue
+            loc = ward_by_hadm.get(str(hadm))
+            if not loc:
+                continue
+            target = loc.get("department")
+            if not target or target == p.current_department or target not in engine.departments:
+                continue
+            if engine.relocate_patient_by_hadm(hadm, target) and is_live:
+                moved += 1
+    if moved:
+        logger.info("reconcile_locations_from_bed_management: moved=%d", moved)
+    return moved
+
+
+def _bed_management_capacities() -> Dict[str, int]:
+    """Department -> bed count from bed_management's persisted snapshot.
+
+    The static ``CAPACITIES`` table (ICU 12, Medicine 40, Surgery 36) is far
+    below the beds bed_management actually runs (ICU 64, Medicine 96,
+    Surgery 96), so the DES showed wards "full" with queues that did not
+    exist in the real hospital — and the MARL sweep staffed against them.
+    Falls back to the static table for any department not in the snapshot.
+    Cached after the first successful read (bed counts are static)."""
+    global _bm_capacities_cache
+    if _bm_capacities_cache:
+        return dict(_bm_capacities_cache)
+    from shared.constants.hospital import CAPACITIES as _STATIC
+    caps = dict(_STATIC)
+    try:
+        doc = MongoManager().client["MIMIC_SIM"]["bed_management_state"].find_one({"service_id": "bed_management"})
+        state = (doc or {}).get("state")
+        if isinstance(state, str):
+            import ast as _ast, json as _json
+            try:
+                state = _ast.literal_eval(state)
+            except Exception:
+                state = _json.loads(state)
+        counts: Dict[str, int] = {}
+        for bed in ((state or {}).get("beds") or {}).values():
+            d = bed.get("department")
+            if d:
+                counts[d] = counts.get(d, 0) + 1
+        if counts:
+            caps.update(counts)
+            _bm_capacities_cache = dict(caps)
+            logger.info("des_capacities_from_bed_management: %s", counts)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("bed_management_capacities_failed: %s — using static CAPACITIES", exc)
+    return caps
+
+
+def _external_feed_config() -> DESConfig:
+    """DESConfig for the live mirrored-admission engines."""
+    return DESConfig(internal_arrivals=False, capacities=_bed_management_capacities())
+
+
+def _bed_management_ward_map(sim_db: Any) -> Dict[str, Dict[str, Any]]:
+    """hadm_id -> {department, acuity} from bed_management's persisted
+    state snapshot (MIMIC_SIM.bed_management_state). Empty dict on any
+    failure so the caller falls back to ED."""
+    out: Dict[str, Dict[str, Any]] = {}
+    try:
+        doc = sim_db["bed_management_state"].find_one({"service_id": "bed_management"})
+        if not doc:
+            return out
+        state = doc.get("state")
+        if isinstance(state, str):
+            import ast as _ast, json as _json
+            try:
+                state = _ast.literal_eval(state)
+            except Exception:
+                state = _json.loads(state)
+        beds = (state or {}).get("beds") or {}
+        for bed in beds.values():
+            hadm = bed.get("hadm_id")
+            if hadm is None or not bed.get("department"):
+                continue
+            out[str(hadm)] = {"department": bed["department"], "acuity": bed.get("acuity")}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("bed_management_ward_map_failed: %s", exc)
+    return out
+
+
 def _mirror_admission_to_engines(payload: Dict[str, Any]) -> None:
     """Inject a cross-module admission into the live MARL engine + baseline.
 
@@ -1014,7 +1175,7 @@ def _mirror_admission_to_engines(payload: Dict[str, Any]) -> None:
         return
 
     if not _sessions:
-        engine = DESEngine(DESConfig(internal_arrivals=False))
+        engine = DESEngine(_external_feed_config())
         engine.initialize()
         sim_id = str(uuid.uuid4())[:8]
         _sessions[sim_id] = {
@@ -1037,12 +1198,16 @@ def _mirror_admission_to_engines(payload: Dict[str, Any]) -> None:
     if entry_dept not in engine.departments:
         entry_dept = "ED"
 
+    direct_pathway = [entry_dept] if payload.get("_resync_direct") else None
+    logger.info("mirror_admission hadm=%s dept=%s requested=%s resync=%s", hadm_id, entry_dept,
+                payload.get("department") or payload.get("entry_dept"), bool(payload.get("_resync_direct")))
     engine.inject_admission(
         hadm_id=str(hadm_id) if hadm_id is not None else None,
         subject_id=subject_id,
         entry_dept=entry_dept,
         acuity=acuity,
         admission_type=admission_type,
+        pathway=direct_pathway,
     )
     if entry_dept in baseline_engine.departments:
         baseline_engine.inject_admission(
@@ -1051,6 +1216,7 @@ def _mirror_admission_to_engines(payload: Dict[str, Any]) -> None:
             entry_dept=entry_dept,
             acuity=acuity,
             admission_type=admission_type,
+            pathway=direct_pathway,
         )
     _remember_injection(hadm_id)
 
@@ -1118,18 +1284,36 @@ def _all_engines() -> List[DESEngine]:
 
 def _summarize_engine(engine: DESEngine) -> Tuple[float, int, int]:
     """Compute (avg_wait_min_weighted, total_throughput, total_queue) for an engine."""
+    avg_wait, total_thrpt, total_queue, _, _ = _summarize_engine_split(engine)
+    return avg_wait, total_thrpt, total_queue
+
+
+def _summarize_engine_split(engine: DESEngine) -> Tuple[float, int, int, float, float]:
+    """Like ``_summarize_engine`` but also splits the blended wait into
+    (queue-only wait, dwell) — returns
+    (avg_wait_min, total_throughput, total_queue, avg_queue_wait_min, avg_dwell_min).
+    Queue wait is the only component staffing can move; dwell is the
+    MIMIC-sourced time-in-department."""
     m = engine.get_metrics()
     depts = m.get("departments", {})
     wait_min_weighted = 0.0
+    qwait_min_weighted = 0.0
+    dwell_min_weighted = 0.0
     total_thrpt = 0
     total_queue = 0
     for dm in depts.values():
         tp = int(dm.get("throughput", 0))
-        wait_min_weighted += dm.get("avg_wait_time", 0.0) * 60 * max(tp, 1)
+        w = max(tp, 1)
+        wait_min_weighted += dm.get("avg_wait_time", 0.0) * 60 * w
+        qwait_min_weighted += dm.get("avg_queue_wait", 0.0) * 60 * w
+        dwell_min_weighted += dm.get("avg_dwell_time", dm.get("avg_service_time", 0.0)) * 60 * w
         total_thrpt += tp
         total_queue += int(dm.get("queue_length", 0))
-    avg_wait = wait_min_weighted / max(total_thrpt, 1)
-    return avg_wait, total_thrpt, total_queue
+    denom = max(total_thrpt, 1)
+    return (
+        wait_min_weighted / denom, total_thrpt, total_queue,
+        qwait_min_weighted / denom, dwell_min_weighted / denom,
+    )
 
 
 def _record_metrics_sample() -> None:
@@ -1140,15 +1324,15 @@ def _record_metrics_sample() -> None:
         engine: DESEngine = list(_sessions.values())[-1]["engine"]
         m = engine.get_metrics()
         depts = m.get("departments", {})
-        avg_wait, total_thrpt, total_queue = _summarize_engine(engine)
+        avg_wait, total_thrpt, total_queue, avg_qwait, avg_dwell = _summarize_engine_split(engine)
         # Pull the matching counterfactual from the shadow baseline engine so
         # the dashboard plots both series as real, comparable measurements
         # rather than synthesising one from the other.
         baseline_engine = _baseline_session.get("engine")
         if baseline_engine is not None:
-            base_wait, base_thrpt, _ = _summarize_engine(baseline_engine)
+            base_wait, base_thrpt, _, base_qwait, base_dwell = _summarize_engine_split(baseline_engine)
         else:
-            base_wait, base_thrpt = 0.0, 0
+            base_wait, base_thrpt, base_qwait, base_dwell = 0.0, 0, 0.0, 0.0
         sample = {
             "sim_time_h": round(m.get("simulation_time", 0.0), 2),
             "sim_time_iso": _engine_to_iso(m.get("simulation_time", 0.0)),
@@ -1156,9 +1340,17 @@ def _record_metrics_sample() -> None:
             "total_throughput": total_thrpt,
             "baseline_wait_avg_min": round(base_wait, 1),
             "baseline_throughput": base_thrpt,
+            # Split components (see _summarize_engine_split). The chart plots
+            # the queue-wait series; dwell is shown as LOS context.
+            "total_queue_wait_avg_min": round(avg_qwait, 2),
+            "baseline_queue_wait_avg_min": round(base_qwait, 2),
+            "total_dwell_avg_min": round(avg_dwell, 1),
+            "baseline_dwell_avg_min": round(base_dwell, 1),
+            "mean_total_queue_wait_hours": round(m.get("mean_total_queue_wait", 0.0), 3),
             "total_queue": total_queue,
             "active_patients": m.get("active_patients", 0),
             "total_discharged": m.get("total_discharged", 0),
+            "total_diverted": m.get("total_diverted", 0),
         }
         _metrics_history.append(sample)
         if len(_metrics_history) > 1000:
@@ -1234,6 +1426,7 @@ async def _chart_demo_sampler_loop() -> None:
     # Let broker attach + startup resync settle so a real session exists.
     await asyncio.sleep(5)
     cleared = False
+    tick = 0
     while True:
         try:
             await asyncio.sleep(_CHART_SAMPLER_INTERVAL_S)
@@ -1241,6 +1434,16 @@ async def _chart_demo_sampler_loop() -> None:
                 continue  # no real session yet — nothing to sample
             live = list(_sessions.values())[-1]["engine"]
             base = _get_baseline_engine()
+            tick += 1
+            if tick % 6 == 0:
+                # ~30 s: pull ward locations from bed_management's snapshot
+                # (covers reconciler moves that never hit Kafka).
+                _align_engine_to_sim_clock(live)
+                _align_engine_to_sim_clock(base)
+                try:
+                    await asyncio.to_thread(_reconcile_locations_from_bed_management)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("reconcile_locations_failed: %s", exc)
             # One-time: drop the frozen boot-time zero samples (and any stale
             # history) so the chart starts from the real live state.
             if not cleared:
@@ -1404,7 +1607,7 @@ async def notify_census(data: dict) -> BaseResponse:
     # engine mirrors DT-driven admissions instead of generating Poisson
     # arrivals in parallel.
     if not _sessions:
-        des_config = DESConfig(internal_arrivals=False)
+        des_config = _external_feed_config()
         engine = DESEngine(des_config)
         engine.initialize()
         sim_id = str(uuid.uuid4())[:8]
@@ -2115,8 +2318,10 @@ async def list_patients(
             "discharge_dt": _engine_to_iso(discharge_t) if discharge_t is not None else None,
             "department_visits": visits,
             "total_wait_min": round(p.total_wait * 60, 1),
+            "total_queue_wait_min": round(p.total_queue_wait * 60, 1),
             "length_of_stay_hours": round(end_t - p.arrival_time, 2),
             "discharged": p.discharged,
+            "admit_status": p.admit_status,
         }
         return record
 
@@ -2134,12 +2339,17 @@ async def list_patients(
             if department is not None and p.current_department != department:
                 continue
             discharged.append(_serialize(p, include_active=False))
+        for p in reversed(engine.diverted_patients[-limit:]):
+            if department is not None and p.current_department != department:
+                continue
+            discharged.append(_serialize(p, include_active=False))
 
     return BaseResponse(data={
         "active": active,
         "discharged": discharged,
         "total_active": len(engine.patients),
         "total_discharged": len(engine.discharged_patients),
+        "total_diverted": len(engine.diverted_patients),
         "engine_epoch_dt": _engine_to_iso(0.0),
         "engine_now_dt": _engine_to_iso(engine.current_time),
         "engine_now_hours": round(engine.current_time, 2),
@@ -2156,8 +2366,7 @@ async def admit_patient(data: dict) -> BaseResponse:
     """
     # Auto-create DES session if none exists (external-feed mode)
     if not _sessions:
-        from app_03_hospital_ops.backend.simulation.des_engine import DESConfig as _DC
-        des_config = _DC(internal_arrivals=False)
+        des_config = _external_feed_config()
         engine = DESEngine(des_config)
         engine.initialize()
         sim_id = str(uuid.uuid4())[:8]
@@ -2178,6 +2387,7 @@ async def admit_patient(data: dict) -> BaseResponse:
     if entry_dept not in engine.departments:
         entry_dept = "ED"
 
+    logger.info("admit_patient_http hadm=%s dept=%s duplicate=%s", hadm_id, entry_dept, _already_injected(hadm_id))
     # Skip if Kafka already injected this admission (digital_twin emits both).
     if _already_injected(hadm_id):
         return BaseResponse(data={
@@ -2277,7 +2487,14 @@ async def reset_session() -> BaseResponse:
     global _engine_epoch_dt
     _engine_epoch_dt = None
     _injected_hadm_ids.clear()
-    return await reset_integration()
+    result = await reset_integration()
+    # Repopulate from ground truth so a reset does not leave the DES empty
+    # (and the MARL sweep / charts idle) until the next container restart.
+    try:
+        _resync_from_mimic_sim("post_reset")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("post_reset_resync_failed: %s", exc)
+    return result
 
 
 # ---------------------------------------------------------------------------

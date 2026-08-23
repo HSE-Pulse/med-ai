@@ -64,6 +64,7 @@ class Patient:
     wait_times: Dict[str, float] = field(default_factory=dict)
     service_start_times: Dict[str, float] = field(default_factory=dict)
     total_wait: float = 0.0
+    total_queue_wait: float = 0.0  # time spent in dept queues only (excludes dwell)
     discharged: bool = False
     admit_status: str = ""  # "service" | "queued" | "rejected" (set by Department.admit_patient)
 
@@ -141,6 +142,9 @@ class Department:
         self.total_served: int = 0
         self.total_arrivals: int = 0
         self.cumulative_wait: float = 0.0
+        self.cumulative_queue_wait: float = 0.0  # queue-only wait (try_dequeue path)
+        self.queued_served: int = 0  # patients who actually waited in the queue
+        self.queue_exits_external: int = 0  # left the queue via external transfer/discharge
         self.cumulative_service: float = 0.0
 
     @property
@@ -157,9 +161,20 @@ class Department:
 
     @property
     def avg_wait_time(self) -> float:
-        if self.total_served == 0:
+        n = self.total_served + self.queue_exits_external
+        if n == 0:
             return 0.0
-        return self.cumulative_wait / self.total_served
+        return self.cumulative_wait / n
+
+    @property
+    def avg_queue_wait(self) -> float:
+        """Mean *queue* wait per served patient (0 for patients admitted straight
+        to service). This is the metric staffing can influence; ``avg_wait_time``
+        blends it with dwell when no queue wait was tracked."""
+        n = self.total_served + self.queue_exits_external
+        if n == 0:
+            return 0.0
+        return self.cumulative_queue_wait / n
 
     @property
     def avg_service_time(self) -> float:
@@ -213,6 +228,30 @@ class Department:
         patient.admit_status = "queued"
         return False
 
+    def leave_queue(self, patient: "Patient", current_time: float) -> bool:
+        """Remove a *queued* patient because an external event (MIMIC
+        transfer / discharge) moved them before the DES could serve them.
+
+        Records the time they actually spent queued — previously this path
+        did a bare ``queue.remove`` and the wait vanished from every metric
+        (23/45 queue exits in the 2026-08-23 audit) — and stamps a departure
+        so the per-patient timeline has no dangling visit.
+        Returns False if the patient was not in the queue.
+        """
+        if patient not in self.queue:
+            return False
+        self.queue.remove(patient)
+        wait = max(0.0, current_time - patient.timestamps.get(f"{self.name}_arrival", current_time))
+        patient.wait_times[self.name] = wait
+        patient.total_wait += wait
+        patient.total_queue_wait += wait
+        self.cumulative_wait += wait
+        self.cumulative_queue_wait += wait
+        self.queued_served += 1
+        self.queue_exits_external += 1
+        patient.timestamps[f"{self.name}_departure"] = current_time
+        return True
+
     def can_admit(self) -> bool:
         """True when the department has room in service or queue."""
         if not self.is_full:
@@ -226,7 +265,10 @@ class Department:
             wait = current_time - patient.timestamps.get(f"{self.name}_arrival", current_time)
             patient.wait_times[self.name] = wait
             patient.total_wait += wait
+            patient.total_queue_wait += wait
             self.cumulative_wait += wait
+            self.cumulative_queue_wait += wait
+            self.queued_served += 1
             self.patients_in_service.append(patient)
             patient.service_start_times[self.name] = current_time
             return patient
@@ -253,10 +295,11 @@ class Department:
             service_start = patient.service_start_times.get(self.name, current_time)
             service_time = current_time - service_start
             self.cumulative_service += service_time
+            # Dwell is tracked in cumulative_service / avg_dwell_time only.
+            # It used to be written into wait_times as a fallback, which
+            # made "wait" a blend of queue wait and MIMIC length-of-stay.
             if self.name not in patient.wait_times:
-                patient.wait_times[self.name] = service_time
-                patient.total_wait += service_time
-                self.cumulative_wait += service_time
+                patient.wait_times[self.name] = 0.0
             self.total_served += 1
             patient.timestamps[f"{self.name}_departure"] = current_time
 
@@ -267,6 +310,9 @@ class Department:
         self.total_served = 0
         self.total_arrivals = 0
         self.cumulative_wait = 0.0
+        self.cumulative_queue_wait = 0.0
+        self.queued_served = 0
+        self.queue_exits_external = 0
         self.cumulative_service = 0.0
 
 
@@ -468,6 +514,10 @@ class DESEngine:
         self.current_time: float = 0.0
         self.patients: Dict[int, Patient] = {}
         self.discharged_patients: List[Patient] = []
+        # Patients removed by an external discharge while still *queued* —
+        # they left without ever being served, so they are excluded from
+        # discharged/served counts and reported separately.
+        self.diverted_patients: List[Patient] = []
         self._next_patient_id: int = 0
         self._initialized: bool = False
 
@@ -753,6 +803,27 @@ class DESEngine:
             self.event_queue = kept
             heapq.heapify(self.event_queue)
 
+    def _backfill_vacated_bed(self, dept: Optional["Department"]) -> None:
+        """Move the next queued patient into a bed freed by an external
+        (Kafka-driven) discharge/relocation and schedule its completion.
+
+        Without this, beds freed by ``discharge_patient_by_hadm`` /
+        ``relocate_patient_by_hadm`` stay empty while patients sit in the
+        queue until some *sampled* SERVICE_COMPLETE happens to fire."""
+        if dept is None:
+            return
+        while True:
+            dequeued = dept.try_dequeue(self.current_time)
+            if dequeued is None:
+                return
+            service_time = dept.sample_service_time(dequeued.acuity, self.rng)
+            heapq.heappush(self.event_queue, Event(
+                time=self.current_time + service_time,
+                event_type=EventType.SERVICE_COMPLETE,
+                department=dept.name,
+                patient=dequeued,
+            ))
+
     def relocate_patient_by_hadm(self, hadm_id: Any, target_dept: str) -> bool:
         """Move a patient to ``target_dept`` immediately.
 
@@ -776,10 +847,11 @@ class DESEngine:
         if current is not None:
             if patient in current.patients_in_service:
                 current.discharge_patient(patient, self.current_time)
-            elif patient in current.queue:
-                current.queue.remove(patient)
+            else:
+                current.leave_queue(patient, self.current_time)
         self._purge_patient_events(patient)
         self._transfer_patient(patient, target_dept)
+        self._backfill_vacated_bed(current)
         return True
 
     def discharge_patient_by_hadm(self, hadm_id: Any) -> bool:
@@ -793,13 +865,23 @@ class DESEngine:
         if patient is None:
             return False
         current = self.departments.get(patient.current_department) if patient.current_department else None
+        was_queued = False
         if current is not None:
             if patient in current.patients_in_service:
                 current.discharge_patient(patient, self.current_time)
-            elif patient in current.queue:
-                current.queue.remove(patient)
+            else:
+                was_queued = current.leave_queue(patient, self.current_time)
         self._purge_patient_events(patient)
-        self._discharge_patient(patient)
+        if was_queued:
+            # Never served here — divert rather than count as a discharge.
+            patient.discharged = True
+            patient.admit_status = "diverted"
+            patient.timestamps["discharge"] = self.current_time
+            self.diverted_patients.append(patient)
+            self.patients.pop(patient.patient_id, None)
+        else:
+            self._discharge_patient(patient)
+        self._backfill_vacated_bed(current)
         return True
 
     def _handle_discharge(self, event: Event) -> None:
@@ -968,7 +1050,11 @@ class DESEngine:
         for name, dept in self.departments.items():
             dept_metrics[name] = {
                 "avg_wait_time": dept.avg_wait_time,
+                "avg_queue_wait": dept.avg_queue_wait,
+                "avg_dwell_time": dept.avg_service_time,
                 "avg_service_time": dept.avg_service_time,
+                "queued_served": dept.queued_served,
+                "queue_exits_external": dept.queue_exits_external,
                 "occupancy_ratio": dept.occupancy_ratio,
                 "throughput": dept.total_served,
                 "queue_length": len(dept.queue),
@@ -978,6 +1064,9 @@ class DESEngine:
             "simulation_time": self.current_time,
             "total_discharged": n_discharged,
             "mean_total_wait": total_wait / max(1, n_discharged),
+            "mean_total_queue_wait": (
+                sum(p.total_queue_wait for p in self.discharged_patients) / max(1, n_discharged)
+            ),
             "mean_los": (
                 sum(
                     p.timestamps.get("discharge", 0) - p.arrival_time
@@ -985,5 +1074,6 @@ class DESEngine:
                 ) / max(1, n_discharged)
             ),
             "active_patients": len(self.patients),
+            "total_diverted": len(self.diverted_patients),
             "departments": dept_metrics,
         }

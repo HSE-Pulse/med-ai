@@ -368,6 +368,13 @@ class DigitalTwinOrchestrator:
             recommended_bed = results["bed_allocation"].get("recommended_bed")
             from shared.constants.hospital import LOS_PARAMS
             dept = patient.get("department", "Medicine")
+            # Where bed_management actually placed the patient. data_ingestion
+            # stamps every admission "ED", so without this hospital_ops' DES
+            # admitted everyone to ED while the real census had them on a
+            # ward (audit 2026-08-23: DES ED 11-16 vs real 0-5).
+            allocated_dept = results["bed_allocation"].get("recommended_department")
+            if allocated_dept:
+                self.patient_context[hadm_id]["current_department"] = allocated_dept
             etm = max(15, int(LOS_PARAMS.get(dept, {}).get("median_h", 24) * 10))
 
             fanout: List[Any] = [
@@ -395,7 +402,7 @@ class DigitalTwinOrchestrator:
                     "subject_id": patient.get("subject_id"),
                     "acuity": acuity,
                     "admission_type": patient.get("admission_type", "EMERGENCY"),
-                    "department": patient.get("department", "ED"),
+                    "department": allocated_dept or patient.get("department", "ED"),
                 }))
 
             import asyncio as _aio

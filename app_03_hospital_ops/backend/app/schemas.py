@@ -103,7 +103,9 @@ class StepResponse(BaseModel):
 class DepartmentMetrics(BaseModel):
     """Performance metrics for a single department."""
     name: str
-    avg_wait_time_hours: float = 0.0
+    avg_wait_time_hours: float = 0.0  # legacy: queue wait blended with dwell
+    avg_queue_wait_hours: float = 0.0  # queue-only wait (staffing-sensitive)
+    avg_dwell_time_hours: float = 0.0  # time in department (LOS segment)
     avg_service_time_hours: float = 0.0
     occupancy_ratio: float = 0.0
     throughput: int = 0
@@ -116,7 +118,9 @@ class PerformanceMetrics(BaseModel):
     simulation_time_hours: float
     simulation_time_iso: Optional[str] = None
     total_discharged: int
+    total_diverted: int = 0  # left a queue via external discharge, never served
     mean_total_wait_hours: float
+    mean_total_queue_wait_hours: float = 0.0
     mean_los_hours: float
     active_patients: int
     departments: List[DepartmentMetrics]

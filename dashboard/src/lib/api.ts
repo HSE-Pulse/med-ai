@@ -367,6 +367,13 @@ export interface HospitalOpsSample {
   // that don't emit it still parse cleanly.
   baseline_wait_avg_min?: number;
   baseline_throughput?: number;
+  // Split of the blended wait: queue-only wait (what staffing can move) and
+  // time-in-department dwell (MIMIC-sourced LOS segment). Optional for
+  // older backends.
+  total_queue_wait_avg_min?: number;
+  baseline_queue_wait_avg_min?: number;
+  total_dwell_avg_min?: number;
+  baseline_dwell_avg_min?: number;
   total_queue: number;
   active_patients: number;
   total_discharged: number;

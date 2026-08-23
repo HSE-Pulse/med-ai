@@ -32,7 +32,7 @@ import { DEPT_SERIES_COLORS as DEPT_COLORS } from "../lib/colors";
 import { PendingActionsPanel } from "../components/UpliftWidgets";
 import {
   hospitalOpsMetrics, hospitalOpsMetricsHistory, opsStaffingRecommendations,
-  type HospitalOpsSample,
+  type HospitalOpsSample, type HospitalOpsMetrics,
 } from "../lib/api";
 import { CAPACITIES } from "../lib/constants";
 
@@ -111,11 +111,14 @@ export default function HospitalOps() {
   const [departments, setDepartments] = useState<MockDepartment[]>([]);
   const [waitData, setWaitData] = useState<ChartPoint[]>([]);
   const [throughputData, setThroughputData] = useState<ChartPoint[]>([]);
+  // True once the backend emits the queue/dwell split (chart then shows queue wait only).
+  const [waitIsQueueOnly, setWaitIsQueueOnly] = useState(false);
   const [schedule, setSchedule] = useState<StaffSchedule | null>(null);
-  const [showSchedule, setShowSchedule] = useState(false);
-  const [algoResults, setAlgoResults] = useState<Record<string, { waitPct: number; thrptPct: number }>>({
-    Baseline: { waitPct: 0, thrptPct: 0 },
-  });
+  // Headline DES metrics, kept separately from the chart series. The charts
+  // plot per-department-visit rollups; the Performance Summary needs
+  // per-patient figures, which only these two carry.
+  const [liveMetrics, setLiveMetrics] = useState<HospitalOpsMetrics | null>(null);
+  const [lastHistSample, setLastHistSample] = useState<HospitalOpsSample | null>(null);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Policy benchmark — MADDPG (adaptive) vs static staffing on a fixed
@@ -200,6 +203,7 @@ export default function HospitalOps() {
       ]);
 
       if (cancelled) return;
+      setLiveMetrics(metrics);
 
       // The MARL/DES simulator on 8203 is a parallel scenario engine. It only
       // reflects meaningful tile state once the user clicks Start (sim_time_h
@@ -256,14 +260,37 @@ export default function HospitalOps() {
       // that mirrors every admission but never has MARL actions applied.
       // We prefer those measurements; the *1.15 / *0.88 fallback is only
       // used against older backends that don't yet emit the baseline fields.
-      if (history && history.length) {
-        const wData: ChartPoint[] = history.map((s: HospitalOpsSample) => ({
-          time: s.sim_time_h,
-          baseline: s.baseline_wait_avg_min != null
-            ? Math.round(s.baseline_wait_avg_min * 10) / 10
-            : Math.round(s.total_wait_avg_min * 1.15 * 10) / 10,
-          marl: Math.round(s.total_wait_avg_min * 10) / 10,
-        }));
+      // `history` is null ONLY when the fetch failed — keep whatever is on
+      // screen in that case. An empty array is a real answer: the service
+      // cleared its metrics buffer, which is precisely what a simulation
+      // reset does. The previous `history.length` guard treated the two
+      // alike, so after a reset the charts, the sim clock and the step
+      // counter went on showing pre-reset state until a new DES session
+      // happened to emit a sample — and never cleared at all while the sim
+      // stayed stopped, because with no session `_record_metrics_sample`
+      // early-returns and the buffer stays empty indefinitely.
+      if (history) {
+        // Prefer the queue-only wait series: the legacy ``total_wait_avg_min``
+        // blends queue wait with in-department dwell (MIMIC LOS), which no
+        // staffing policy can change and which only ever ratchets upward.
+        const hasSplit = history.some((s: HospitalOpsSample) => s.total_queue_wait_avg_min != null);
+        setWaitIsQueueOnly(hasSplit);
+        const wData: ChartPoint[] = history.map((s: HospitalOpsSample) => {
+          if (hasSplit) {
+            return {
+              time: s.sim_time_h,
+              baseline: Math.round((s.baseline_queue_wait_avg_min ?? s.total_queue_wait_avg_min ?? 0) * 100) / 100,
+              marl: Math.round((s.total_queue_wait_avg_min ?? 0) * 100) / 100,
+            };
+          }
+          return {
+            time: s.sim_time_h,
+            baseline: s.baseline_wait_avg_min != null
+              ? Math.round(s.baseline_wait_avg_min * 10) / 10
+              : Math.round(s.total_wait_avg_min * 1.15 * 10) / 10,
+            marl: Math.round(s.total_wait_avg_min * 10) / 10,
+          };
+        });
         const tData: ChartPoint[] = history.map((s: HospitalOpsSample) => ({
           time: s.sim_time_h,
           baseline: s.baseline_throughput != null
@@ -273,11 +300,16 @@ export default function HospitalOps() {
         }));
         setWaitData(wData);
         setThroughputData(tData);
-        // Mirror the backend sim-time into the page's local display clock
-        const lastSample = history[history.length - 1];
-        if (lastSample?.sim_time_h != null) {
-          setSimTime(Math.round(lastSample.sim_time_h * 3600));
-        }
+        // Mirror the backend sim-time into the page's local display clock.
+        // On an empty (post-reset) history this rewinds the clock and the
+        // step counter to zero instead of stranding them at the old values.
+        const lastSample = history.length ? history[history.length - 1] : null;
+        setLastHistSample(lastSample);
+        setSimTime(
+          lastSample?.sim_time_h != null
+            ? Math.round(lastSample.sim_time_h * 3600)
+            : 0,
+        );
       }
     };
 
@@ -439,7 +471,6 @@ export default function HospitalOps() {
     if (simTime >= SEVEN_DAYS_SECS && running) {
       setRunning(false);
       setSchedule(generateSchedule(departments));
-      setShowSchedule(true);
     }
   }, [simTime, running, departments, generateSchedule]);
 
@@ -471,8 +502,6 @@ export default function HospitalOps() {
     setWaitData([]);
     setThroughputData([]);
     setSchedule(null);
-    setShowSchedule(false);
-    setAlgoResults({});
     // Restore departments synchronously from the initial snapshot taken at
     // page load. Avoid re-fetching the live sim census — it would return the
     // backend simulator's current (non-reset) state and race with in-flight ticks.
@@ -498,12 +527,25 @@ export default function HospitalOps() {
     setRunning(false);
     if (departments.length > 0) {
       setSchedule(generateSchedule(departments));
-      setShowSchedule(true);
     }
   };
 
-  // Computed metrics — from live chart data (averaged over last 20 points)
-  const avgWait = waitData.length > 0
+  // ── Performance Summary metrics ───────────────────────────────────────
+  // These are deliberately NOT taken from the chart series. `total_throughput`
+  // and `total_wait_avg_min` are per-department-VISIT rollups: a patient going
+  // ED → Medicine → ICU is counted three times. Reading them as "patients
+  // served" overstated the count ~3.3x (18,162 vs 5,452 real discharges) and
+  // inflated the /hr rate by the same factor, and the wait was a
+  // throughput-weighted dept mean that ED dominates (57 min vs the engine's
+  // own 188 min per patient). The tiles report per-patient figures instead.
+
+  // Mean wait per discharged patient across their whole journey.
+  // Source: engine `mean_total_wait` = total_wait / n_discharged.
+  const journeyWaitMin = liveMetrics
+    ? Math.round(liveMetrics.mean_total_wait_hours * 60 * 10) / 10
+    : 0;
+  // Secondary line: the per-department-visit mean this tile used to show alone.
+  const visitWaitMin = waitData.length > 0
     ? Math.round(waitData.slice(-20).reduce((s, d) => s + d.marl, 0) / Math.min(20, waitData.length) * 10) / 10
     : 0;
   // Capacity-weighted occupancy — an unweighted dept mean lets small units skew the figure
@@ -511,48 +553,41 @@ export default function HospitalOps() {
   const avgUtil = totalCapacity > 0
     ? Math.round(departments.reduce((s, d) => s + d.patients, 0) / totalCapacity * 100)
     : 0;
-  // Backend throughput is dept.total_served — a cumulative count, not a rate
-  const lastThrptSample = throughputData.length > 0 ? throughputData[throughputData.length - 1] : null;
-  const patientsServed = lastThrptSample ? Math.round(lastThrptSample.marl) : 0;
-  const throughputRate = lastThrptSample && lastThrptSample.time > 0
-    ? Math.round((lastThrptSample.marl / lastThrptSample.time) * 10) / 10
+  // Distinct patients discharged — the real "patients served" count.
+  const patientsDischarged = lastHistSample?.total_discharged ?? liveMetrics?.total_discharged ?? 0;
+  const simHours = lastHistSample?.sim_time_h ?? liveMetrics?.simulation_time_hours ?? 0;
+  const dischargeRate = simHours > 0
+    ? Math.round((patientsDischarged / simHours) * 10) / 10
+    : 0;
+  // Department visits — the figure the tile used to headline, kept as context.
+  const deptVisits = throughputData.length > 0
+    ? Math.round(throughputData[throughputData.length - 1].marl)
     : 0;
 
-  // Improvement: compare last 10 MARL points vs baseline (real data, not hardcoded)
-  const waitImprovement = waitData.length >= 10
-    ? (() => {
-        const recent = waitData.slice(-10);
-        const marlAvg = recent.reduce((s, d) => s + d.marl, 0) / recent.length;
-        const baseAvg = recent.reduce((s, d) => s + d.baseline, 0) / recent.length;
-        return baseAvg > 0 ? Math.round(((marlAvg - baseAvg) / baseAvg) * 100) : 0;
-      })()
-    : 0;
-  const thrptImprovement = throughputData.length >= 10
-    ? (() => {
-        const recent = throughputData.slice(-10);
-        const marlAvg = recent.reduce((s, d) => s + d.marl, 0) / recent.length;
-        const baseAvg = recent.reduce((s, d) => s + d.baseline, 0) / recent.length;
-        return baseAvg > 0 ? Math.round(((marlAvg - baseAvg) / baseAvg) * 100) : 0;
-      })()
-    : 0;
-
-  // Store algorithm results when simulation completes (7 days reached)
-  useEffect(() => {
-    if (simTime >= SEVEN_DAYS_SECS) {
-      setAlgoResults((prev) => ({
-        ...prev,
-        [algorithm]: { waitPct: waitImprovement, thrptPct: thrptImprovement },
-      }));
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [simTime >= SEVEN_DAYS_SECS, algorithm, waitImprovement, thrptImprovement]);
-
-  // LOS bar chart data
-  const losDepts = Object.entries(mimicArrivals).map(([name, d]) => ({
-    name: name.length > 12 ? name.slice(0, 12) + "..." : name,
-    fullName: name,
-    los: d.los_median_h,
-  })).sort((a, b) => b.los - a.los);
+  // ── Length-of-stay bars ───────────────────────────────────────────────
+  // Sourced from the live DES (`avg_service_time_hours` = mean time spent in
+  // the department). This previously read the static `mimicArrivals` table,
+  // which is modelled rather than measured — 13 of its 14 values are exact
+  // 12/24h multiples — and, being static, survived a simulation reset: a
+  // freshly-reset, empty hospital still showed a full LOS profile topping out
+  // at 120h. The static table is now only the offline fallback.
+  const losSource = liveMetrics?.departments?.length ? liveMetrics.departments : null;
+  const losIsLive = losSource !== null;
+  const losDepts = (losSource
+    ? losSource.map((d) => ({
+        fullName: d.name,
+        los: Math.round(d.avg_service_time_hours * 10) / 10,
+      }))
+    : Object.entries(mimicArrivals).map(([name, d]) => ({
+        fullName: name,
+        los: d.los_median_h,
+      }))
+  )
+    .map((d) => ({
+      ...d,
+      name: d.fullName.length > 12 ? d.fullName.slice(0, 12) + "..." : d.fullName,
+    }))
+    .sort((a, b) => b.los - a.los);
 
   const losBarColor = (los: number): string => {
     if (los >= 120) return "#DC2626";
@@ -727,17 +762,33 @@ export default function HospitalOps() {
       {/* Charts row */}
       <div className="grid grid-cols-2 gap-4">
         <div className="bg-bg-card rounded-xl border border-border p-4">
-          <h3 className="text-xs font-semibold text-white mb-2">Wait Time Over Time</h3>
+          <div className="flex items-baseline justify-between mb-2">
+            <h3 className="text-xs font-semibold text-white">{waitIsQueueOnly ? "Queue Wait Time Over Time" : "Wait Time Over Time"}</h3>
+            {waitIsQueueOnly && lastHistSample?.total_dwell_avg_min != null && (
+              <span
+                className="text-[10px] text-slate-500"
+                title="Mean time-in-department per visit, sourced from MIMIC transfer intervals. Not affected by staffing; shown for context only."
+              >
+                LOS/dwell {Math.round(lastHistSample.total_dwell_avg_min)} min · excluded
+              </span>
+            )}
+          </div>
           <div style={{ height: 220, position: "relative" }}>
             <ResponsiveContainer width="100%" height="100%">
               <LineChart data={waitData} margin={{ top: 5, right: 10, bottom: 5, left: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="var(--color-segment-empty)" />
-                <XAxis dataKey="time" tick={{ fontSize: 9, fill: "#64748b" }} tickFormatter={(v) => `${v}h`} />
-                <YAxis tick={{ fontSize: 9, fill: "#64748b" }} width={30} domain={["auto", "auto"]} />
-                <Tooltip contentStyle={{ backgroundColor: "var(--color-tooltip-bg)", border: "1px solid var(--color-tooltip-border)", borderRadius: 8, fontSize: 11 }} formatter={(val: number) => `${val.toFixed(1)} min`} />
+                <XAxis dataKey="time" tick={{ fontSize: 9, fill: "#64748b" }} tickFormatter={(v) => `${Number(v).toFixed(2)}h`} />
+                <YAxis
+                  tick={{ fontSize: 9, fill: "#64748b" }}
+                  width={34}
+                  domain={[0, (max: number) => Math.max(1, Math.ceil(max * 1.1))]}
+                  tickCount={5}
+                  label={{ value: "min", angle: -90, position: "insideLeft", fontSize: 9, fill: "#64748b" }}
+                />
+                <Tooltip contentStyle={{ backgroundColor: "var(--color-tooltip-bg)", border: "1px solid var(--color-tooltip-border)", borderRadius: 8, fontSize: 11 }} formatter={(val: number) => `${val.toFixed(2)} min`} />
                 <Legend wrapperStyle={{ fontSize: 10 }} iconType="plainline" />
-                <Line type="monotone" dataKey="baseline" stroke="#64748b" strokeWidth={1.5} strokeDasharray="4 4" dot={false} name="Baseline" isAnimationActive={false} />
                 <Line type="monotone" dataKey="marl" stroke="#3B82F6" strokeWidth={2} dot={false} name={algorithm} isAnimationActive={false} />
+                <Line type="monotone" dataKey="baseline" stroke="#64748b" strokeWidth={1.5} strokeDasharray="4 4" dot={false} name="Baseline" isAnimationActive={false} />
               </LineChart>
             </ResponsiveContainer>
             {waitData.length === 0 && (
@@ -846,32 +897,28 @@ export default function HospitalOps() {
           <h3 className="text-xs font-semibold text-white mb-3">Performance Summary</h3>
           <div className="space-y-3">
             <div className="bg-bg-primary rounded-lg p-3">
-              <div className="flex items-center gap-2 mb-1"><Clock className="w-4 h-4 text-blue-400" /><span className="text-xs text-slate-400">Mean Wait Time</span></div>
-              <div className="flex items-baseline gap-2"><span className="font-mono-clinical text-2xl font-bold text-white">{avgWait}</span><span className="text-xs text-slate-500">minutes</span></div>
+              <div className="flex items-center gap-2 mb-1"><Clock className="w-4 h-4 text-blue-400" /><span className="text-xs text-slate-400">Mean Wait per Patient</span></div>
+              <div className="flex items-baseline gap-2"><span className="font-mono-clinical text-2xl font-bold text-white">{journeyWaitMin}</span><span className="text-xs text-slate-500">minutes · whole journey</span></div>
+              <div
+                className="text-[10px] text-slate-500 mt-0.5"
+                title="Throughput-weighted mean across department visits. Where a patient never queued, the DES records time-in-department as that segment's wait, so this blends queue wait with in-department dwell."
+              >
+                ≈{visitWaitMin} min per department visit
+              </div>
             </div>
             <div className="bg-bg-primary rounded-lg p-3">
-              <div className="flex items-center gap-2 mb-1"><Zap className="w-4 h-4 text-green-400" /><span className="text-xs text-slate-400">Patients Served</span></div>
-              <div className="flex items-baseline gap-2"><span className="font-mono-clinical text-2xl font-bold text-white">{patientsServed}</span><span className="text-xs text-slate-500">total{throughputRate > 0 ? ` · ≈${throughputRate}/hr` : ""}</span></div>
+              <div className="flex items-center gap-2 mb-1"><Zap className="w-4 h-4 text-green-400" /><span className="text-xs text-slate-400">Patients Discharged</span></div>
+              <div className="flex items-baseline gap-2"><span className="font-mono-clinical text-2xl font-bold text-white">{patientsDischarged.toLocaleString()}</span><span className="text-xs text-slate-500">distinct{dischargeRate > 0 ? ` · ≈${dischargeRate}/hr` : ""}</span></div>
+              <div
+                className="text-[10px] text-slate-500 mt-0.5"
+                title="Sum of per-department service counts — every ward-to-ward transfer is counted again, so this always exceeds the patient count."
+              >
+                {deptVisits.toLocaleString()} department visits
+              </div>
             </div>
             <div className="bg-bg-primary rounded-lg p-3">
               <div className="flex items-center gap-2 mb-1"><BedDouble className="w-4 h-4 text-purple-400" /><span className="text-xs text-slate-400">Bed Utilization</span></div>
               <div className="flex items-baseline gap-2"><span className="font-mono-clinical text-2xl font-bold text-white">{avgUtil}%</span></div>
-            </div>
-            <div className="bg-green-500/10 border border-green-500/20 rounded-lg p-3">
-              <div className="text-[10px] text-green-400 uppercase tracking-wider mb-1">{algorithm} vs Baseline</div>
-              {algorithm !== "Baseline" && (
-                <div className="text-[9px] text-green-400/80 mb-1">Live data from MADDPG model + simulation</div>
-              )}
-              <div className="grid grid-cols-2 gap-2 text-center">
-                <div>
-                  <div className={`font-mono-clinical text-lg font-bold ${waitImprovement <= 0 ? "text-green-400" : "text-red-400"}`}>{waitImprovement > 0 ? "+" : ""}{waitImprovement}%</div>
-                  <div className="text-[10px] text-slate-400">Wait Time</div>
-                </div>
-                <div>
-                  <div className={`font-mono-clinical text-lg font-bold ${thrptImprovement >= 0 ? "text-green-400" : "text-red-400"}`}>{thrptImprovement > 0 ? "+" : ""}{thrptImprovement}%</div>
-                  <div className="text-[10px] text-slate-400">Throughput</div>
-                </div>
-              </div>
             </div>
           </div>
         </div>
@@ -882,7 +929,19 @@ export default function HospitalOps() {
 
       {/* ════════ Department LOS Comparison ════════ */}
       <div className="bg-bg-card rounded-xl border border-border p-4">
-        <h3 className="text-sm font-semibold text-white mb-3">Median Length of Stay by Department</h3>
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="text-sm font-semibold text-white">
+            {losIsLive ? "Mean Length of Stay by Department" : "Median Length of Stay by Department"}
+          </h3>
+          {losIsLive ? (
+            <span className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-green-500/15 border border-green-500/30 text-[10px] text-green-400 font-semibold">
+              <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />
+              Live DES — mean time in department
+            </span>
+          ) : (
+            <span className="text-[10px] text-slate-500">Static Irish HSE baseline — service unreachable</span>
+          )}
+        </div>
         <div style={{ height: 420 }}>
           <ResponsiveContainer width="100%" height="100%">
             <BarChart data={losDepts} layout="vertical" margin={{ top: 5, right: 30, bottom: 5, left: 5 }}>
@@ -975,60 +1034,6 @@ export default function HospitalOps() {
           </table>
         </div>
       </div>
-
-      {/* ════════ Algorithm Comparison Panel ════════ */}
-      {showSchedule && (
-        <div className="bg-bg-card rounded-xl border border-border p-4">
-          <h3 className="text-sm font-semibold text-white mb-3">Algorithm Comparison (7-Day Simulation Results)</h3>
-          <div className="grid grid-cols-3 gap-4">
-            {["MADDPG", "MAPPO", "Baseline"].map((algo) => {
-              const result = algoResults[algo];
-              const hasData = !!result;
-              return (
-                <div
-                  key={algo}
-                  className={`rounded-lg border p-4 ${
-                    algo === algorithm
-                      ? "border-blue-500/40 bg-blue-500/5"
-                      : "border-border bg-bg-primary"
-                  } ${!hasData ? "opacity-50" : ""}`}
-                >
-                  <div className="flex items-center justify-between mb-3">
-                    <span className="text-xs font-semibold text-white">{algo}</span>
-                    {algo === algorithm && (
-                      <span className="text-[9px] bg-blue-500/20 text-blue-400 px-1.5 py-0.5 rounded">Current</span>
-                    )}
-                  </div>
-                  {hasData ? (
-                    <div className="space-y-3">
-                      <div>
-                        <div className="text-[10px] text-slate-400 mb-1">Wait Time</div>
-                        <div className={`font-mono-clinical text-lg font-bold ${result.waitPct <= 0 ? "text-green-400" : "text-red-400"}`}>
-                          {result.waitPct > 0 ? "+" : ""}{result.waitPct}%
-                        </div>
-                      </div>
-                      <div>
-                        <div className="text-[10px] text-slate-400 mb-1">Throughput</div>
-                        <div className={`font-mono-clinical text-lg font-bold ${result.thrptPct >= 0 ? "text-green-400" : "text-red-400"}`}>
-                          {result.thrptPct > 0 ? "+" : ""}{result.thrptPct}%
-                        </div>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="text-xs text-slate-500 italic">Run simulation with {algo} to see results</div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-          <div className="mt-3 text-[10px] text-slate-500">
-            Run the simulation with different algorithms and results will accumulate here for comparison.
-          </div>
-          <div className="mt-2 bg-green-500/10 border border-green-500/20 rounded-lg px-3 py-2">
-            <span className="text-[10px] text-green-400">MADDPG model deployed and active. Trained on 2000 episodes with 14 Irish HSE departments. Making live staffing decisions on capacity alerts via Hospital Ops integration.</span>
-          </div>
-        </div>
-      )}
 
       {/* Staff Schedule — ERP-based, always visible */}
       <ERPStaffScheduleGrid departments={departments} />
@@ -1148,6 +1153,11 @@ function LiveDeltaSvcRate() {
 function DynamicArrivalHeatmap() {
   const [patterns, setPatterns] = useState<Record<string, { hourly_profile: number[]; total_arrivals: number }>>({});
   const [totalEvents, setTotalEvents] = useState(0);
+  // Whether the grid is the static Irish-HSE baseline (service unreachable)
+  // as opposed to live data. "Live but empty" — what a simulation reset
+  // produces — is a third state and must not render the baseline.
+  const [isStatic, setIsStatic] = useState(false);
+  const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
     const fetchPatterns = async () => {
@@ -1156,9 +1166,17 @@ function DynamicArrivalHeatmap() {
         const simRes = await fetch("/api/sim/arrival-patterns").catch(() => null);
         if (simRes?.ok) {
           const d = await simRes.json();
-          if (d.departments && Object.keys(d.departments).length > 0) {
+          // A successful response is authoritative — INCLUDING an empty one,
+          // which is exactly what a simulation reset produces. The previous
+          // `length > 0` test fell through to the static baseline instead, so
+          // resetting the sim made this chart render all 14 departments and
+          // ~800k arrivals where a moment earlier it showed only the handful
+          // that were actually live.
+          if (d && typeof d.departments === "object" && d.departments !== null) {
             setPatterns(d.departments);
             setTotalEvents(d.total_events || 0);
+            setIsStatic(false);
+            setLoaded(true);
             return;
           }
         }
@@ -1172,6 +1190,8 @@ function DynamicArrivalHeatmap() {
         }
         setPatterns(staticData);
         setTotalEvents(0);
+        setIsStatic(true);
+        setLoaded(true);
       } catch { /* offline */ }
     };
     fetchPatterns();
@@ -1180,9 +1200,27 @@ function DynamicArrivalHeatmap() {
   }, []);
 
   const deptNames = Object.keys(patterns);
-  if (deptNames.length === 0) return null;
+  const isLive = !isStatic;
 
-  const isLive = totalEvents > 0;
+  // Hold the card back until the first fetch resolves so we don't flash the
+  // empty state on mount.
+  if (!loaded) return null;
+
+  // Live-but-empty: render an explicit cleared card instead of silently
+  // substituting the static baseline.
+  if (deptNames.length === 0) {
+    return (
+      <div className="bg-bg-card rounded-xl border border-border p-4">
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="text-sm font-semibold text-white">Arrival Patterns (24h Profile)</h3>
+          <span className="text-[10px] text-slate-500">No arrivals recorded yet</span>
+        </div>
+        <div className="text-xs text-slate-500 text-center py-8">
+          No department arrivals since the last simulation reset.
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="bg-bg-card rounded-xl border border-border p-4">
