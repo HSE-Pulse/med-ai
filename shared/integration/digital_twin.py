@@ -47,6 +47,25 @@ from shared.constants.mimic import VITAL_ITEMID_TO_NAME as _VITAL_ITEMID_MAP
 from shared.constants.mimic import LAB_ITEMID_TO_NAME as _LAB_ITEMID_MAP
 
 
+def _numeric_or_none(value: Any) -> Optional[float]:
+    """Coerce a lab/vital measurement to float, or None if it is not numeric.
+
+    MIMIC stores non-numeric results (e.g. troponin "<0.01") with an empty
+    ``valuenum``; storing "" in the patient context made every later
+    bed_management /predict-discharge call fail schema validation (422),
+    silently disabling discharge prediction for that patient.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if f != f:  # NaN
+        return None
+    return f
+
+
 class DigitalTwinOrchestrator:
     """Orchestrates data flow through all modules for each patient event.
 
@@ -649,7 +668,7 @@ class DigitalTwinOrchestrator:
     async def _process_vital_traced(self, vital: Dict[str, Any], hadm_id: str) -> Dict[str, Any]:
         sid = vital.get("subject_id", 0)
         vital_name = vital.get("vital_name") or _VITAL_ITEMID_MAP.get(vital.get("itemid"))
-        value = vital.get("valuenum")
+        value = _numeric_or_none(vital.get("valuenum"))
         results: Dict[str, Any] = {"hadm_id": hadm_id, "event": "vital"}
 
         # Discharged patients still receive vital_drift ticks from the
@@ -843,7 +862,7 @@ class DigitalTwinOrchestrator:
         hadm_id = str(lab.get("hadm_id", "unknown"))
         sid = lab.get("subject_id", 0)
         lab_name = lab.get("lab_name") or _LAB_ITEMID_MAP.get(lab.get("itemid"))
-        value = lab.get("valuenum")
+        value = _numeric_or_none(lab.get("valuenum"))
         results: Dict[str, Any] = {"hadm_id": hadm_id, "event": "lab"}
 
         # Accumulate in patient context
