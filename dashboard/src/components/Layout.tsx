@@ -296,9 +296,10 @@ export default function Layout() {
             {!collapsed ? (
               <p className="text-[11px] text-slate-500 text-center uppercase tracking-wider">
                 Harishankar Somasundaram
+                <span className="block normal-case tracking-normal text-slate-400">v{__APP_VERSION__}</span>
               </p>
             ) : (
-              <p className="text-[11px] text-slate-500 text-center">HS</p>
+              <p className="text-[11px] text-slate-500 text-center" title={`v${__APP_VERSION__}`}>HS</p>
             )}
           </div>
         </div>

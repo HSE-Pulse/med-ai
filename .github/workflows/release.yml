@@ -1,0 +1,78 @@
+name: release
+
+# Publishes a GitHub Release for every v* tag, with the matching CHANGELOG
+# section as the release notes. Can also be run by hand for a tag that
+# pre-dates this workflow (Actions -> release -> Run workflow -> tag).
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to publish a Release for (e.g. v0.2.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Resolve tag and version
+        id: meta
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Check VERSION matches the tag
+        # Tags created before VERSION existed are allowed through (manual runs).
+        run: |
+          if [ -f VERSION ]; then
+            FILE="$(tr -d '[:space:]' < VERSION)"
+            if [ "$FILE" != "${{ steps.meta.outputs.version }}" ]; then
+              echo "VERSION says $FILE but tag is ${{ steps.meta.outputs.tag }}"; exit 1
+            fi
+          fi
+
+      - name: Refuse to publish a tree containing API keys
+        run: |
+          if git grep -nE 'sk-lf-[0-9a-f]{8}|pk-lf-[0-9a-f]{8}|sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,}' -- . ':!CHANGELOG.md' ':!scripts/release.sh' ':!.github/workflows/release.yml'; then
+            echo "::error::tracked files contain what looks like an API key"; exit 1
+          fi
+
+      - name: Extract release notes from CHANGELOG.md
+        id: notes
+        run: |
+          V="${{ steps.meta.outputs.version }}"
+          if [ -f CHANGELOG.md ]; then
+            awk -v v="$V" '$0 ~ "^## \\["v"\\]"{f=1;next} /^## \[/{f=0} f' CHANGELOG.md > notes.md
+          fi
+          if [ ! -s notes.md ]; then
+            echo "No changelog entry for $V; see the commit history." > notes.md
+          fi
+          # Retroactive tags read the changelog from the default branch instead.
+          if [ ! -f CHANGELOG.md ]; then
+            git show origin/main:CHANGELOG.md 2>/dev/null | awk -v v="$V" '$0 ~ "^## \\["v"\\]"{f=1;next} /^## \[/{f=0} f' > notes.md || true
+            [ -s notes.md ] || echo "No changelog entry for $V; see the commit history." > notes.md
+          fi
+          cat notes.md
+
+      - name: Create or update the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          PRE=""
+          case "$TAG" in *-*) PRE="--prerelease";; esac
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "Med AI $TAG" --notes-file notes.md $PRE
+          else
+            gh release create "$TAG" --title "Med AI $TAG" --notes-file notes.md --verify-tag $PRE
+          fi

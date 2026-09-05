@@ -32,3 +32,20 @@ See [docs/DATA_ACCESS.md](docs/DATA_ACCESS.md).
 
 This is **research/educational software, not a medical device** — see
 [DISCLAIMER.md](DISCLAIMER.md). Please keep that framing in code, docs, and UI.
+
+## Releases
+
+Versions follow [Semantic Versioning](https://semver.org/) and are recorded in
+[CHANGELOG.md](CHANGELOG.md). Add a line under `## [Unreleased]` in the PR that
+introduces a user-visible change. Maintainers cut a release with
+
+```bash
+scripts/release.sh 0.4.0        # bumps VERSION + dashboard/package.json, stamps CHANGELOG, commits, tags
+git push public main && git push public v0.4.0
+```
+
+Pushing the `v*` tag runs `.github/workflows/release.yml`, which publishes the
+GitHub Release with that version's changelog section as the notes. The
+top-level `VERSION` file is the single source of truth: `pyproject.toml` reads
+it, `shared/version.py` exposes it as `__version__`, and the dashboard footer
+shows the mirrored `package.json` version.

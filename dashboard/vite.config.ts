@@ -1,6 +1,10 @@
 import { defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
+import { readFileSync } from "node:fs";
+
+// Release version, mirrored into package.json by scripts/release.sh.
+const pkg = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8"));
 
 // Each /api/* prefix → backend service. Defaults to the host-based
 // loopback ports so a developer can run `npm run dev` against
@@ -62,6 +66,7 @@ export default defineConfig(({ mode }) => {
 
   return {
     plugins: [react(), tailwindcss()],
+    define: { __APP_VERSION__: JSON.stringify(pkg.version) },
     server: {
       host: "0.0.0.0",
       port: 3010,
