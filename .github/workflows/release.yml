@@ -1,11 +1,17 @@
 name: release
 
 # Publishes a GitHub Release for every v* tag, with the matching CHANGELOG
-# section as the release notes. Can also be run by hand for a tag that
-# pre-dates this workflow (Actions -> release -> Run workflow -> tag).
+# section as the release notes.
+#
+#   tag push          -> "release" job for that tag
+#   workflow_dispatch -> "release" job for an existing tag
+#   push to main      -> "backfill" job: creates Releases for any v* tag that
+#                        has none (covers tags older than this workflow, and
+#                        lets a plain git push from a deploy key do the job)
 on:
   push:
     tags: ["v*.*.*"]
+    branches: [main]
   workflow_dispatch:
     inputs:
       tag:
@@ -15,8 +21,12 @@ on:
 permissions:
   contents: write
 
+env:
+  KEY_PATTERN: 'sk-lf-[0-9a-f]{8}|pk-lf-[0-9a-f]{8}|sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,}'
+
 jobs:
   release:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -43,7 +53,7 @@ jobs:
 
       - name: Refuse to publish a tree containing API keys
         run: |
-          if git grep -nE 'sk-lf-[0-9a-f]{8}|pk-lf-[0-9a-f]{8}|sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,}' -- . ':!CHANGELOG.md' ':!scripts/release.sh' ':!.github/workflows/release.yml'; then
+          if git grep -nE "$KEY_PATTERN" -- . ':!CHANGELOG.md' ':!scripts/release.sh' ':!.github/workflows/release.yml'; then
             echo "::error::tracked files contain what looks like an API key"; exit 1
           fi
 
@@ -51,17 +61,13 @@ jobs:
         id: notes
         run: |
           V="${{ steps.meta.outputs.version }}"
-          if [ -f CHANGELOG.md ]; then
-            awk -v v="$V" '$0 ~ "^## \\["v"\\]"{f=1;next} /^## \[/{f=0} f' CHANGELOG.md > notes.md
-          fi
-          if [ ! -s notes.md ]; then
-            echo "No changelog entry for $V; see the commit history." > notes.md
-          fi
-          # Retroactive tags read the changelog from the default branch instead.
-          if [ ! -f CHANGELOG.md ]; then
-            git show origin/main:CHANGELOG.md 2>/dev/null | awk -v v="$V" '$0 ~ "^## \\["v"\\]"{f=1;next} /^## \[/{f=0} f' > notes.md || true
-            [ -s notes.md ] || echo "No changelog entry for $V; see the commit history." > notes.md
-          fi
+          # Prefer the changelog at the tag; fall back to main for older tags.
+          for SRC in CHANGELOG.md "origin/main:CHANGELOG.md"; do
+            if [ -f "$SRC" ]; then cat "$SRC"; else git show "$SRC" 2>/dev/null; fi \
+              | awk -v v="$V" '$0 ~ "^## \\["v"\\]"{f=1;next} /^## \[/{f=0} f' > notes.md || true
+            [ -s notes.md ] && break
+          done
+          [ -s notes.md ] || echo "No changelog entry for $V; see the commit history." > notes.md
           cat notes.md
 
       - name: Create or update the GitHub Release
@@ -76,3 +82,36 @@ jobs:
           else
             gh release create "$TAG" --title "Med AI $TAG" --notes-file notes.md --verify-tag $PRE
           fi
+
+  backfill:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Refuse to publish a tree containing API keys
+        run: |
+          if git grep -nE "$KEY_PATTERN" -- . ':!CHANGELOG.md' ':!scripts/release.sh' ':!.github/workflows/release.yml'; then
+            echo "::error::tracked files contain what looks like an API key"; exit 1
+          fi
+
+      - name: Create Releases for tags that have none
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          EXISTING="$(gh release list --limit 200 --json tagName -q '.[].tagName')"
+          for TAG in $(git tag -l 'v*.*.*' | sort -V); do
+            if echo "$EXISTING" | grep -qx "$TAG"; then
+              echo "$TAG: release exists"; continue
+            fi
+            V="${TAG#v}"
+            awk -v v="$V" '$0 ~ "^## \\["v"\\]"{f=1;next} /^## \[/{f=0} f' CHANGELOG.md > notes.md || true
+            [ -s notes.md ] || echo "No changelog entry for $V; see the commit history." > notes.md
+            PRE=""; case "$TAG" in *-*) PRE="--prerelease";; esac
+            # --latest=false: a backfilled old tag must not displace the newest release.
+            gh release create "$TAG" --title "Med AI $TAG" --notes-file notes.md --verify-tag --latest=false $PRE
+            echo "$TAG: release created"
+          done
