@@ -112,8 +112,8 @@ INTENT_FLOOR: Dict[str, str] = {
     "medication_review": "medications",
     "cohort_stats": "api_search",
     "triage": "api_search",
-    "risk_assessment": "api_search",
-    "pathway": "api_search",
+    "risk_assessment": "oncology_risk",
+    "pathway": "treatment_pathway",
     "note_analysis": "api_search",
 }
 
@@ -149,6 +149,7 @@ class ChatState(TypedDict, total=False):
     session_id: str
     history: List[dict]
     params: Dict[str, Any]
+    user_model: Optional[str]   # dropdown override; None = routed default
     # working
     intent: Optional[str]
     plan: List[dict]
@@ -205,6 +206,51 @@ TOOLS: Dict[str, Dict[str, str]] = {
         "args": "patient_id, hadm_id",
         "needs": "patient_id",
     },
+    "oncology_risk": {
+        "desc": "Oncology ML model: 30-day readmission and mortality risk, risk "
+                "level, risk factors and recommendations for a cancer patient "
+                "described by age, sex, cancer type and stage. Use for ANY "
+                "cancer risk / prognosis question, including a described "
+                "patient with no ID (e.g. '68M, stage 3 NSCLC').",
+        "args": "age, gender, cancer_type, stage_proxy, charlson_score, ...",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "age": {"type": "integer"},
+                "gender": {"type": "string", "enum": ["M", "F"]},
+                "cancer_type": {"type": "string",
+                                "description": "Lung, Breast, Colorectal, Prostate, ..."},
+                "stage_proxy": {"type": "integer", "description": "Stage 1-4"},
+                "charlson_score": {"type": "integer",
+                                   "description": "Charlson comorbidity index, if given"},
+                "num_comorbidities": {"type": "integer"},
+                "num_prior_admissions": {"type": "integer"},
+                "has_chemotherapy": {"type": "integer", "enum": [0, 1]},
+                "has_radiation": {"type": "integer", "enum": [0, 1]},
+                "has_surgery": {"type": "integer", "enum": [0, 1]},
+            },
+            "required": ["age", "cancer_type", "stage_proxy"],
+        },
+    },
+    "treatment_pathway": {
+        "desc": "Oncology pathway engine: recommended treatment pathway for a "
+                "cancer patient (cancer type, stage, age, prior treatments). "
+                "Use for treatment plan / next steps / pathway questions.",
+        "args": "cancer_type, age, stage_proxy, charlson_score, has_prior_*",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "cancer_type": {"type": "string"},
+                "age": {"type": "integer"},
+                "stage_proxy": {"type": "integer", "description": "Stage 1-4"},
+                "charlson_score": {"type": "integer"},
+                "has_prior_chemo": {"type": "boolean"},
+                "has_prior_surgery": {"type": "boolean"},
+                "has_prior_radiation": {"type": "boolean"},
+            },
+            "required": ["cancer_type", "stage_proxy"],
+        },
+    },
     "api_search": {
         "desc": "Anything else the hospital systems track — waiting lists, "
                 "discharge lounge, ED flow, bed management, FHIR, ERP, "
@@ -257,23 +303,108 @@ class ClinicalGraph:
 
     # ── nodes ────────────────────────────────────────────────────────
     async def classify(self, state: ChatState) -> ChatState:
-        """Regex intent detection — fast, deterministic, already well tested.
+        """Intent routing by the reasoning model, regex only as a fallback.
 
-        The graph keeps it as a hint for the planner rather than as the sole
-        decision, which is the change: a wrong classification is no longer
-        fatal because the planner can still choose a different tool.
+        This used to be regex-only, so every question was routed on keyword
+        hits: "Assess cancer risk: 68M, Stage 3 NSCLC" scored one match for
+        `risk` and was treated like any other risk query. The model now reads
+        the question against a JSON schema (structured output, thinking off —
+        a routing decision, ~1-2 s on GPU). Regex still runs first because it
+        is free and extracts IDs/vitals reliably; its guess is passed in as a
+        hint and its params are kept.
         """
         from app_06_clinical_chat.backend.intents import detect_intent
 
         det = detect_intent(state["message"])
         params = dict(state.get("params") or {})
         params.update(det.get("params") or {})
-        return {
-            "intent": det.get("intent"),
-            "params": params,
-            "reasoning": [f"Classified as '{det.get('intent')}' "
-                          f"({det.get('reasoning', '')[:90]})"],
+
+        llm = await self._llm_intent(state, det)
+        if llm:
+            intent = llm["intent"]
+            params.update({k: v for k, v in (llm.get("params") or {}).items()
+                           if v not in (None, "", 0) or k.startswith("has_")})
+            note = (f"Classified as '{intent}' by {self._model_for('intent_detection')} "
+                    f"({(llm.get('reasoning') or '')[:90]})")
+        else:
+            intent = det.get("intent")
+            note = (f"Classified as '{intent}' by regex fallback — model routing "
+                    f"unavailable ({det.get('reasoning', '')[:70]})")
+        return {"intent": intent, "params": params, "reasoning": [note]}
+
+    _INTENTS = [
+        "general_clinical", "risk_assessment", "pathway", "triage", "patient_lookup",
+        "vitals", "lab_check", "medication_review", "sofa", "note_analysis",
+        "cohort_stats", "hospital_status", "trolley_watch",
+    ]
+
+    async def _llm_intent(self, state: ChatState, det: dict) -> Optional[dict]:
+        schema = {
+            "type": "object",
+            "properties": {
+                "intent": {"type": "string", "enum": self._INTENTS},
+                "reasoning": {"type": "string"},
+                "params": {
+                    "type": "object",
+                    "properties": {
+                        "patient_id": {"type": "string"},
+                        "age": {"type": "integer"},
+                        "gender": {"type": "string"},
+                        "cancer_type": {"type": "string"},
+                        "stage_proxy": {"type": "integer"},
+                        "department": {"type": "string"},
+                    },
+                },
+            },
+            "required": ["intent", "reasoning"],
         }
+        prompt = (
+            "Route a clinician's question in a hospital assistant. Pick ONE intent:\n"
+            "- general_clinical: medical knowledge, no patient or hospital data\n"
+            "- risk_assessment: risk/prognosis for a patient (ID or described, e.g. "
+            "'68M stage 3 NSCLC'), incl. cancer, readmission, mortality risk\n"
+            "- pathway: treatment plan / recommended therapy\n"
+            "- triage: ESI/acuity from given vital signs\n"
+            "- patient_lookup / vitals / lab_check / medication_review: stored "
+            "records for a specific patient ID\n"
+            "- sofa: SOFA / sepsis / sickest patients\n"
+            "- note_analysis: analyse a pasted clinical note\n"
+            "- cohort_stats: oncology cohort statistics\n"
+            "- hospital_status: THIS hospital's live census, beds, ED load\n"
+            "- trolley_watch: national INMO / TrolleyGAR figures\n"
+            "Extract only params stated in the question (age, gender M/F — "
+            "'68M' means a 68-year-old male — "
+            "cancer_type, stage 1-4 as stage_proxy, patient_id, department). "
+            "Never invent values.\n"
+            f"Keyword hint (may be wrong): {det.get('intent')}\n\n"
+            f"Question: {state['message']}"
+        )
+        eng = self.engine
+        prev = eng.model
+        eng.model = self._model_for("intent_detection")
+        try:
+            raw = await eng._call_ollama([{"role": "user", "content": prompt}],
+                                         think=False, fmt=schema)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("llm_intent_failed: %s", exc)
+            return None
+        finally:
+            eng.model = prev
+        parsed = self._json_block(raw)
+        if not isinstance(parsed, dict) or parsed.get("intent") not in self._INTENTS:
+            return None
+        return parsed
+
+    def _model_for(self, task: str, state: Optional[ChatState] = None) -> str:
+        """Routed model for a task. The dropdown override applies to answer
+        synthesis only — routing/planning need tool + JSON support, which an
+        arbitrary picked model may lack."""
+        eng = self.engine
+        if state is not None and task not in ("intent_detection", "tool_planning"):
+            um = state.get("user_model")
+            if um:
+                return um
+        return eng.MODEL_ROUTING.get(task, eng.REASONING_MODEL)
 
     async def plan(self, state: ChatState) -> ChatState:
         """Decide which data is needed, as an explicit ordered list.
@@ -306,32 +437,11 @@ class ClinicalGraph:
         offered = {
             name: spec for name, spec in TOOLS.items()
             if not (spec.get("needs") and not known.get(spec["needs"]))
+            and not (name in ("oncology_risk", "treatment_pathway")
+                     and not (known.get("cancer_type") or known.get("stage_proxy")
+                              or state.get("intent") in ("risk_assessment", "pathway")))
         }
-        tools = "\n".join(
-            f"- {name}: {spec['desc']}"
-            + (f" ARGS: {spec['args']}" if spec["args"] else "")
-            for name, spec in offered.items()
-        )
-        prompt = (
-            "You plan which hospital data to fetch to answer a question. "
-            "You do NOT answer it.\n\n"
-            f"Question: {state['message']}\n"
-            f"Rule-based intent guess: {state.get('intent')}\n"
-            f"Known values: {json.dumps(known, default=str)}\n"
-            + (f"Already retrieved: {already}\n" if already else "")
-            + f"\nTools:\n{tools}\n\n"
-            "Reply with ONLY a JSON array, at most 3 steps, no prose:\n"
-            '[{"tool": "<name>", "args": {}, "why": "<short reason>"}]\n'
-            "Return [] if the question is general medical knowledge needing no "
-            "hospital data. Never invent a patient_id.\n"
-            "If the question asks about TWO different things, emit one step for "
-            "each — you may use api_search more than once with different "
-            "queries."
-        )
-        raw = await self._ask(prompt)
-        steps = self._json_block(raw)
-        if not isinstance(steps, list):
-            steps = []
+        steps = await self._plan_with_tools(state, offered, known, already)
         # Keep only steps naming a real tool — a hallucinated tool name must
         # not reach the dispatcher.
         clean = [
@@ -354,6 +464,7 @@ class ClinicalGraph:
             floor = INTENT_FLOOR.get(state.get("intent") or "")
             if floor and floor in offered and floor not in already_tools:
                 args = ({"query": state["message"]} if floor == "api_search"
+                        else dict(known) if floor in ("oncology_risk", "treatment_pathway")
                         else ({"department": known["department"]}
                               if floor == "sofa_cohort" and known.get("department")
                               else {}))
@@ -362,7 +473,9 @@ class ClinicalGraph:
                 floor_used = True
 
         note = (
-            ("Plan: " + "; ".join(f"{s['tool']} ({s.get('why', '')[:50]})" for s in clean)
+            ("Plan: " + "; ".join(
+                f"{s['tool']}({json.dumps(s.get('args') or {}, default=str)[:60]})"
+                for s in clean)
              + (" [planner returned nothing; used the default source for this "
                 "intent]" if floor_used else ""))
             if clean else
@@ -373,6 +486,67 @@ class ClinicalGraph:
             "reasoning": [note],
             "plan_rounds": int(state.get("plan_rounds", 0)) + 1,
         }
+
+    async def _plan_with_tools(self, state: ChatState, offered: dict,
+                               known: dict, already: list) -> list:
+        """Ask the reasoning model to call tools natively (Ollama `tools`).
+
+        Replaces a prose prompt asking a 3B model for a bare JSON array, which
+        parsed unreliably and had no argument schema — it fetched the ED
+        census and national trolley count for a cancer-risk question. Tool
+        schemas give typed arguments (age/stage/cancer_type) the fetchers can
+        pass straight to the oncology models.
+        """
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": spec["desc"],
+                "parameters": spec.get("parameters") or (
+                    {"type": "object",
+                     "properties": {"query": {"type": "string"}},
+                     "required": ["query"]} if name == "api_search" else
+                    {"type": "object",
+                     "properties": {"department": {"type": "string"}}} if name == "sofa_cohort" else
+                    {"type": "object", "properties": {}}),
+            },
+        } for name, spec in offered.items()]
+        system = (
+            "You select hospital data tools needed to answer a clinician's question. "
+            "Call only the tools whose data the answer genuinely depends on — at most 3. "
+            "Hospital-wide tools (hospital_status, trolley_watch) are ONLY for questions "
+            "about hospital operations or crowding, never for a single patient's clinical "
+            "question. Fill arguments only from the question or known values; never invent "
+            "a patient_id. If no tool is needed, reply without calling any."
+        )
+        user = (f"Question: {state['message']}\n"
+                f"Routed intent: {state.get('intent')}\n"
+                f"Known values: {json.dumps(known, default=str)}"
+                + (f"\nAlready retrieved: {already}" if already else ""))
+        eng = self.engine
+        prev = eng.model
+        eng.model = self._model_for("tool_planning")
+        try:
+            msg = await eng._call_ollama_tools(
+                [{"role": "system", "content": system},
+                 {"role": "user", "content": user}], tools)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("tool_planning_failed: %s", exc)
+            return []
+        finally:
+            eng.model = prev
+        steps = []
+        for call in msg.get("tool_calls") or []:
+            fn = call.get("function") or {}
+            args = fn.get("arguments")
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
+            steps.append({"tool": fn.get("name"), "args": args or {},
+                          "why": "tool call"})
+        return steps
 
     async def _run_step(self, step: dict, params: dict, message: str):
         """Execute one plan step. Returns (key, data, error)."""
@@ -402,6 +576,10 @@ class ClinicalGraph:
                 d, e = await eng._fetch_labs({**params, **args})
             elif tool == "medications":
                 d, e = await eng._fetch_medications({**params, **args})
+            elif tool == "oncology_risk":
+                d, e = await eng._fetch_risk_assessment({**params, **args})
+            elif tool == "treatment_pathway":
+                d, e = await eng._fetch_pathway({**params, **args})
             elif tool == "api_search":
                 query = args.get("query") or message
                 key = f"api_search::{query[:40]}"
@@ -558,13 +736,14 @@ class ClinicalGraph:
         # CoT. Hardcoding clinical_response forced deepseek-r1:8b for everything,
         # which on the 8GB GPU spills to CPU and read-timeouts.
         _task = eng.INTENT_MODEL_MAP.get(state.get("intent") or "", "clinical_response")
-        eng.model = eng.MODEL_ROUTING.get(_task, eng.model)
+        eng.model = self._model_for(_task, state)
         try:
             answer = await eng._call_ollama(messages) or ""
         finally:
             eng.model = prev
         return {"answer": answer,
-                "reasoning": [f"Drafted answer ({len(answer)} chars)."]}
+                "reasoning": [f"Drafted answer with {self._model_for(_task, state)} "
+                              f"({len(answer)} chars)."]}
 
     async def verify(self, state: ChatState) -> ChatState:
         """Check every number in the answer against the retrieved data.
@@ -589,8 +768,20 @@ class ClinicalGraph:
                     "reasoning": ["No retrieved data — answered from clinical "
                                   "knowledge; figure verification not applicable."]}
 
-        haystack = json.dumps(data, default=str)
+        haystack = json.dumps(data, default=str) + " " + (state.get("message") or "")
         source_nums = set(re.findall(r"\d+(?:\.\d+)?", haystack))
+
+        pct_forms = set()
+        for src in source_nums:
+            try:
+                v = float(src)
+            except ValueError:
+                continue
+            if 0 < v <= 1 and "." in src:
+                for dp in (0, 1, 2):
+                    r = f"{v * 100:.{dp}f}"
+                    pct_forms.add(r)
+                    pct_forms.add(r.rstrip("0").rstrip(".") if "." in r else r)
 
         problems: List[str] = []
         for num in set(re.findall(r"\d+(?:\.\d+)?", answer)):
@@ -599,6 +790,10 @@ class ClinicalGraph:
             # Tolerate formatting: 1,682 -> 1682, 8.0 -> 8, percentages the
             # model derived from two source numbers are NOT tolerated.
             if num.rstrip("0").rstrip(".") in {s.rstrip("0").rstrip(".") for s in source_nums}:
+                continue
+            # A model probability rendered as a percentage (0.648 -> 64.8%) is
+            # a restatement, not a new figure.
+            if num in pct_forms:
                 continue
             if len(num) <= 1:          # list markers, "1." etc.
                 continue
@@ -687,13 +882,15 @@ class ClinicalGraph:
 
     async def run(self, message: str, session_id: str = "default",
                   history: Optional[list] = None,
-                  params: Optional[dict] = None) -> ChatState:
+                  params: Optional[dict] = None,
+                  user_model: Optional[str] = None) -> ChatState:
         graph = self.build().with_config(_lf_config(session_id))
         return await graph.ainvoke({
             "message": message,
             "session_id": session_id,
             "history": history or [],
             "params": params or {},
+            "user_model": user_model,
             "data": {},
             "errors": [],
             "reasoning": [],
@@ -703,7 +900,8 @@ class ClinicalGraph:
 
     async def stream_events(self, message: str, session_id: str = "default",
                             history: Optional[list] = None,
-                            params: Optional[dict] = None):
+                            params: Optional[dict] = None,
+                            user_model: Optional[str] = None):
         """Drive the pipeline, emitting the SSE vocabulary the dashboard
         speaks: ``thinking`` / ``sources`` / ``token`` / ``verification``.
 
@@ -724,6 +922,7 @@ class ClinicalGraph:
         init: ChatState = {
             "message": message, "session_id": session_id,
             "history": history or [], "params": params or {},
+            "user_model": user_model,
             "data": {}, "errors": [], "reasoning": [],
             "plan_rounds": 0, "revise_rounds": 0,
         }
@@ -795,7 +994,9 @@ class ClinicalGraph:
                         "Respond naturally. Reference specific values from the data."},
         ]
         emitted += 1
-        yield "thinking", f"Step {emitted}: Generating answer…"
+        _task_note = eng.INTENT_MODEL_MAP.get(state.get("intent") or "", "clinical_response")
+        yield "thinking", (f"Step {emitted}: Generating answer with "
+                           f"{self._model_for(_task_note, state)}…")
 
         parts: List[str] = []
         prev = eng.model
@@ -805,7 +1006,7 @@ class ClinicalGraph:
         # CoT. Hardcoding clinical_response forced deepseek-r1:8b for everything,
         # which on the 8GB GPU spills to CPU and read-timeouts.
         _task = eng.INTENT_MODEL_MAP.get(state.get("intent") or "", "clinical_response")
-        eng.model = eng.MODEL_ROUTING.get(_task, eng.model)
+        eng.model = self._model_for(_task, state)
         if _root is not None:
             try:
                 _syn = _root.start_observation(

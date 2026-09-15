@@ -369,6 +369,7 @@ async def chat(req: ChatRequest):
         final = await runner.run(
             req.message, session_id=req.session_id,
             history=req.history, params=_session_params(req.session_id),
+            user_model=user_model,
         )
         verdict = final.get("verdict") or {}
         answer = final.get("answer", "")
@@ -601,6 +602,7 @@ async def chat_stream(req: ChatRequest):
                     session_id=req.session_id,
                     history=req.history,
                     params=_session_params(req.session_id),
+                    user_model=user_model,
                 ):
                     if ev == "final":
                         txt = (payload or {}).get("response") or ""

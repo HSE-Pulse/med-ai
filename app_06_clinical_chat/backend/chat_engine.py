@@ -114,6 +114,52 @@ RESPONSE_SYSTEM_PROMPT = (
     "DToC = delayed transfers of care."
 )
 
+_ONCO_RISK_FIELDS = {
+    "age", "gender", "cancer_type", "stage_proxy", "drg_mortality", "num_procedures",
+    "has_surgery", "has_chemotherapy", "has_radiation", "chemo_drug_count",
+    "num_prior_admissions", "days_since_last_admission", "total_los_days",
+    "num_comorbidities", "charlson_score", "insurance", "time_to_first_procedure_days",
+}
+_ONCO_PATHWAY_FIELDS = {
+    "cancer_type", "age", "stage_proxy", "charlson_score",
+    "has_prior_chemo", "has_prior_surgery", "has_prior_radiation",
+}
+# The oncology models were trained on these site labels; clinicians write
+# "NSCLC", "adenocarcinoma of the lung", "CRC".
+_CANCER_TYPE_ALIASES = [
+    (r"lung|nsclc|sclc|bronch", "Lung"),
+    (r"breast", "Breast"),
+    (r"colo|rect|bowel|crc", "Colorectal"),
+    (r"prostat", "Prostate"),
+    (r"leuk|\baml\b", "Leukemia (Myeloid)"),
+    (r"lymph", "Non-Hodgkin Lymphoma"),
+    (r"myeloma", "Multiple Myeloma"),
+]
+
+
+def _oncology_payload(params: dict, fields: set) -> dict:
+    """Keep only fields the oncology schema accepts, normalised. Unknown keys
+    (patient_id, pack_years, ...) would be rejected or silently ignored."""
+    out = {k: v for k, v in (params or {}).items() if k in fields and v not in (None, "")}
+    ct = out.get("cancer_type")
+    if isinstance(ct, str):
+        for pat, label in _CANCER_TYPE_ALIASES:
+            if re.search(pat, ct, re.I):
+                out["cancer_type"] = label
+                break
+    g = out.get("gender")
+    if isinstance(g, str) and g:
+        out["gender"] = "F" if g.strip().lower().startswith(("f", "w")) else "M"
+    if "stage_proxy" in out:
+        m = re.search(r"[1-4]", str(out["stage_proxy"]).replace("IV", "4")
+                      .replace("III", "3").replace("II", "2").replace("I", "1"))
+        if m:
+            out["stage_proxy"] = int(m.group(0))
+        else:
+            out.pop("stage_proxy")
+    return out
+
+
 def _wants_cohort_ranking(params: dict) -> bool:
     """A SOFA question with no patient is a cohort question."""
     return not params.get("patient_id")
@@ -343,19 +389,26 @@ class ClinicalChatEngine:
     # the numbers. llama3.2:3b does this in 2-3 seconds vs deepseek-r1:8b's
     # 20-30 seconds of chain-of-thought. Reserve deepseek-r1 for open-ended
     # knowledge / pathway / differential-diagnosis reasoning.
+    # Reasoning model with native tool calling — the default for routing,
+    # planning and synthesis. qwen3:8b is the only local model exposing both
+    # the `tools` and `thinking` capabilities, and one model for every step
+    # means one 5.5 GB load on the 8 GB GPU instead of swapping between two.
+    # The previous default (llama3.2:3b for "structured" intents) was fast
+    # but wrote "Assess cancer risk: 68M, Stage 3 NSCLC" up as an ED census
+    # report, because the 3B planner had fetched the census.
+    REASONING_MODEL = os.environ.get("CHAT_REASONING_MODEL", "qwen3:8b")
     MODEL_ROUTING = {
-        "intent_detection": "llama3.2:3b",        # fast (65 t/s) — just classify intent
-        "clinical_summary": "llama3.2:3b",        # fast prose over ML output (default for structured intents)
-        "clinical_response": "deepseek-r1:8b",    # best medical accuracy (93% MedQA) + CoT — open-ended reasoning
-        "medical_qa": "deepseek-r1:8b",           # chain-of-thought reasoning for clinical questions
+        "intent_detection": REASONING_MODEL,       # JSON-schema routing, think off
+        "tool_planning": REASONING_MODEL,          # native Ollama tool calls, think off
+        "clinical_summary": REASONING_MODEL,       # prose over ML output, think on
+        "clinical_response": REASONING_MODEL,      # open-ended reasoning, think on
+        "medical_qa": REASONING_MODEL,
         "note_analysis": "MedAIBase/MedGemma1.5:4b-it",  # purpose-built for medical text
         "biomedical": "koesn/llama3-openbiollm-8b:q4_K_M",  # domain-specific biomedical
-        "fast_fallback": "llama3.2:3b",            # when speed matters over accuracy
+        "fast_fallback": "llama3.2:3b",            # only when the reasoning model fails
     }
 
-    # Intent -> model task mapping. Structured intents (where the ML model
-    # produces the authoritative numbers) use the fast summary model by
-    # default; open-ended reasoning uses deepseek-r1.
+    # Intent -> model task mapping. Everything reasons by default.
     INTENT_MODEL_MAP = {
         "triage": "clinical_summary",
         "risk_assessment": "clinical_summary",
@@ -364,20 +417,27 @@ class ClinicalChatEngine:
         "vitals": "clinical_summary",
         "lab_check": "clinical_summary",
         "medication_review": "clinical_summary",
-        "pathway": "clinical_response",            # multi-step reasoning still wants CoT
+        "pathway": "clinical_response",
         "note_analysis": "note_analysis",
-        "cohort_stats": "fast_fallback",
+        "cohort_stats": "clinical_summary",
+        "hospital_status": "clinical_summary",
+        "trolley_watch": "clinical_summary",
         "general_clinical": "medical_qa",
     }
+
+    THINKING_MODELS = ("qwen3", "deepseek-r1")
+
+    def _is_thinking_model(self, model: str | None = None) -> bool:
+        return any(t in (model or self.model) for t in self.THINKING_MODELS)
 
     def __init__(
         self,
         ollama_base: str = "http://localhost:11434",
-        model: str = "deepseek-r1:8b",
+        model: str | None = None,
         openai_api_key: str | None = None,
     ):
         self.ollama_base = ollama_base
-        self.model = model  # user-selected override (from frontend dropdown)
+        self.model = model or self.REASONING_MODEL  # user-selected override (from frontend dropdown)
         self.api_endpoints = {
             "ed": os.environ.get("ED_TRIAGE_URL", "http://localhost:8201"),
             "oncology": os.environ.get("ONCOLOGY_AI_URL", "http://localhost:8204"),
@@ -1160,9 +1220,7 @@ class ClinicalChatEngine:
 
     async def _fetch_risk_assessment(self, params: dict) -> tuple[dict | None, str | None]:
         base = self.api_endpoints["oncology"]
-        payload = {k: v for k, v in params.items() if k not in ("patient_id", "hadm_id")}
-        if not payload:
-            payload = {"patient_id": params.get("patient_id", "unknown")}
+        payload = _oncology_payload(params, _ONCO_RISK_FIELDS)
         async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
             resp = await client.post(f"{base}/predict-risk", json=payload)
             resp.raise_for_status()
@@ -1170,7 +1228,7 @@ class ClinicalChatEngine:
 
     async def _fetch_pathway(self, params: dict) -> tuple[dict | None, str | None]:
         base = self.api_endpoints["oncology"]
-        payload = {k: v for k, v in params.items() if k not in ("hadm_id",)}
+        payload = _oncology_payload(params, _ONCO_PATHWAY_FIELDS)
         async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
             resp = await client.post(f"{base}/recommend-pathway", json=payload)
             resp.raise_for_status()
@@ -1963,19 +2021,36 @@ class ClinicalChatEngine:
 
     # ── Ollama communication ─────────────────────────────────────────────
 
-    async def _call_ollama(self, messages: list[dict]) -> str:
-        """Send a chat request to Ollama and return the assistant content."""
+    async def _call_ollama(self, messages: list[dict], think: bool | None = None,
+                           fmt: dict | str | None = None) -> str:
+        """Send a chat request to Ollama and return the assistant content.
+
+        ``think`` is only sent to thinking-capable models (Ollama rejects it
+        elsewhere). ``fmt`` is a JSON schema for structured output.
+        """
+        body: dict = {"model": self.model, "messages": messages, "stream": False,
+                      "keep_alive": "24h"}
+        if think is not None and self._is_thinking_model():
+            body["think"] = think
+        if fmt is not None:
+            body["format"] = fmt
         async with httpx.AsyncClient(timeout=120.0, verify=False, trust_env=False) as client:
-            resp = await client.post(
-                f"{self.ollama_base}/api/chat",
-                json={
-                    "model": self.model,
-                    "messages": messages,
-                    "stream": False,
-                },
-            )
+            resp = await client.post(f"{self.ollama_base}/api/chat", json=body)
             resp.raise_for_status()
             return resp.json()["message"]["content"]
+
+    async def _call_ollama_tools(self, messages: list[dict], tools: list[dict]) -> dict:
+        """One native tool-calling round. Returns the assistant message dict
+        (``content`` and ``tool_calls``). Thinking is off: the model is
+        choosing tools here, not answering."""
+        body: dict = {"model": self.model, "messages": messages, "tools": tools,
+                      "stream": False, "keep_alive": "24h"}
+        if self._is_thinking_model():
+            body["think"] = False
+        async with httpx.AsyncClient(timeout=120.0, verify=False, trust_env=False) as client:
+            resp = await client.post(f"{self.ollama_base}/api/chat", json=body)
+            resp.raise_for_status()
+            return resp.json().get("message") or {}
 
     async def _call_ollama_stream(self, messages: list[dict]):
         """Call Ollama with ``stream: True`` and yield ``(kind, text)`` tuples.
@@ -1998,6 +2073,8 @@ class ClinicalChatEngine:
                         "model": self.model,
                         "messages": messages,
                         "stream": True,
+                        "keep_alive": "24h",
+                        **({"think": True} if self._is_thinking_model() else {}),
                         "options": {
                             # num_predict caps CoT *and* answer together. At 512
                             # a reasoning model (deepseek-r1) spends nearly all
@@ -2005,7 +2082,7 @@ class ClinicalChatEngine:
                             # the "answers stuck in between" symptom. Budget for
                             # both: the CoT is streamed separately as `thinking`
                             # so a longer cap costs the reader nothing.
-                            "num_predict": int(os.environ.get("CHAT_NUM_PREDICT", "2048")),
+                            "num_predict": int(os.environ.get("CHAT_NUM_PREDICT", "4096")),
                         },
                     },
                 ) as resp:
