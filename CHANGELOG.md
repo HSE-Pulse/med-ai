@@ -11,6 +11,57 @@ top-level `VERSION` file (Python packaging reads it) and is mirrored into
 
 ## [Unreleased]
 
+### Added
+- Deterioration: every escalation carries a clinical priority — a
+  deterministic, explainable 0-100 score with `priority`, `priority_band`,
+  `priority_reasons` and `age_minutes` on each row of
+  `GET /deterioration/escalations`.
+- Deterioration: `collapse=true` folds repeat escalations for the same
+  admission into one row with `repeat_count`, `first_escalated_at` and
+  `collapsed_ids`. Opt-in, because collapsing changes what acknowledging a
+  row means: `/acknowledge` still closes a single `escalation_id`.
+- Deterioration: optional JEV (TypeSafe System One) re-ranking of the
+  escalation queue, enabled by `JEV_API_KEY` (off when unset). Advisory only:
+  there is no suppress action, and low-confidence, failed or malformed
+  answers fall back to the deterministic score. Tunables: `JEV_API_URL`,
+  `JEV_MODEL`, `JEV_TIMEOUT_SECONDS`, `JEV_MAX_CONCURRENCY`,
+  `JEV_MIN_CONFIDENCE` (0.55), `JEV_MAX_ROWS`.
+- `deterioration-ro` compose service: a read-only nginx gate for exposing the
+  deterioration API publicly — GET/HEAD only, 10 requests/s per address,
+  bound to `127.0.0.1:8240`.
+- Clinical chat: `oncology_risk` and `treatment_pathway` tools with
+  JSON-schema parameters, used as the default source for risk-assessment and
+  pathway questions.
+- 19 unit tests for escalation priority and JEV triage.
+
+### Changed
+- Deterioration: a rising NEWS2 trend now escalates only at or above
+  `TREND_ESCALATION_FLOOR` (default 4). Previously any rise of 2 or more
+  escalated regardless of absolute score, so a patient moving 0 -> 2 raised a
+  full escalation; on an observed queue 94% of open escalations were risk
+  band "low". Totals of 5+ and any single parameter scoring 3 still escalate
+  unchanged. Set the floor to 0 for the previous behaviour.
+- Deterioration: `GET /deterioration/escalations` now orders by clinical
+  priority. `order=time` restores newest-first.
+- Compose: `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` and `LANGFUSE_HOST`
+  are passed through from `.env` to every service.
+- Clinical chat: NSCLC, SCLC, AML, lymphoma and myeloma map onto the pathway
+  optimizer's cancer types; "68M" parses as age 68, male; the model chosen in
+  the dashboard is threaded through the agent.
+- CI: a push to `main` creates any missing GitHub Release from this file.
+
+### Fixed
+- Clinical chat answered cancer-risk questions from ED census data; they now
+  route to the oncology model.
+- Clinical chat verifier flagged a source probability restated as a
+  percentage (0.648 -> 64.8%) as an invented figure.
+
+### Upgrade notes
+- Expect far fewer deterioration escalations after upgrading. That is the
+  intended effect of the trend floor, not lost data.
+- Anything that reads `/deterioration/escalations` and depends on
+  newest-first order should pass `order=time`.
+
 ## [0.3.0] - 2026-09-05
 
 ### Added
