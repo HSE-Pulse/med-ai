@@ -11,6 +11,8 @@ top-level `VERSION` file (Python packaging reads it) and is mirrored into
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-09
+
 ### Added
 - Deterioration: every escalation carries a clinical priority — a
   deterministic, explainable 0-100 score with `priority`, `priority_band`,
@@ -134,7 +136,8 @@ top-level `VERSION` file (Python packaging reads it) and is mirrored into
   microservices, React dashboard, Kafka event backbone, digital twin
   simulation and observability compose stacks.
 
-[Unreleased]: https://github.com/HSE-Pulse/med-ai/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/HSE-Pulse/med-ai/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/HSE-Pulse/med-ai/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/HSE-Pulse/med-ai/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/HSE-Pulse/med-ai/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/HSE-Pulse/med-ai/releases/tag/v0.1.0
