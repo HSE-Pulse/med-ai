@@ -18,6 +18,12 @@ x-svc-env: &svc-env
   MONGO_URL: mongodb://cancer-mongo:27017
   REDIS_URL: redis://redis:6379
   OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+  # Credentials come from .env (gitignored), never from this file — the
+  # release secrets guard refuses to cut a release if a key literal appears
+  # in a tracked file, and it is right to.
+  LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+  LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+  LANGFUSE_HOST: ${LANGFUSE_HOST:-http://langfuse-web:3000}
   OTEL_EXPORTER_OTLP_PROTOCOL: grpc
   LOKI_URL: http://loki:3100
   CUDA_VISIBLE_DEVICES: ""
@@ -270,6 +276,17 @@ services:
     container_name: hse-deterioration
     environment: *svc-env
     ports: ["100.118.170.33:8220:8220"]
+
+  # Public read-only face of the deterioration API (same pattern as
+  # mlflow-ro / redpanda-console-ro): the upstream has no auth, so the
+  # internet gets GET/HEAD and nothing else.
+  deterioration-ro:
+    <<: *svc-defaults
+    image: nginx:1.27-alpine
+    container_name: hse-deterioration-ro
+    volumes:
+      - ./docker/deterioration-ro.conf:/etc/nginx/nginx.conf:ro
+    ports: ["127.0.0.1:8240:8080"]
 
   discharge_lounge:
     <<: *svc-defaults

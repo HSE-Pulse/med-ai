@@ -40,6 +40,8 @@ from shared.db.mongo import MongoManager
 from shared.integration.debouncer import ScoreAwareDebouncer
 from shared.integration.event_bus import get_event_bus
 from shared.integration.service_client import ServiceClient
+
+from app_20_deterioration.backend.app import jev_triage
 from shared.integration.sim_clock import get_sim_time
 
 logger = logging.getLogger("deterioration_monitor")
@@ -536,10 +538,21 @@ async def screen_news2(payload: dict) -> BaseResponse:
     _persist_snapshot(snapshot)
 
     # Escalate when the score merits it AND the debouncer allows
+    # A rising trend alone used to escalate at ANY absolute score, so a
+    # patient moving NEWS2 0->2 raised a full escalation. That produced a
+    # queue where 94% of unacknowledged rows were risk_band "low"
+    # (totals 1-4) — alert fatigue by construction, and the clinically
+    # meaningful rows were buried among them.
+    # RCP NEWS2: 1-4 is ward-based monitoring, not escalation. Trend is
+    # supporting information near threshold, not an escalation trigger from
+    # a low base. Gate it on a floor; env-tunable so it can be moved without
+    # a rebuild (TREND_ESCALATION_FLOOR=0 restores the old behaviour).
+    _trend_floor = int(os.environ.get("TREND_ESCALATION_FLOOR", "4"))
     should_escalate = (
         result["total"] >= 5
         or result["any_param_eq_3"]
-        or trend.get("is_clinically_rising", False)
+        or (trend.get("is_clinically_rising", False)
+            and result["total"] >= _trend_floor)
     )
     if should_escalate and await _state["debouncer"].should_fire(hadm_id, score=result["total"]):
         await _escalate_internal(hadm_id, snapshot)
@@ -976,16 +989,150 @@ async def trend(hadm_id: str, window_minutes: int = Query(240, ge=30, le=1440)) 
     return BaseResponse(data=result)
 
 
+_BAND_WEIGHT = {"critical": 55, "high": 42, "medium": 25, "low": 10}
+
+
+def _escalation_priority(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """Deterministic, explainable 0-100 clinical priority for an escalation.
+
+    Chronological ordering buried a NEWS2 12 under a NEWS2 3 that happened to
+    arrive later. This ranks by what actually matters, and says why — an
+    unexplained ranking is not usable at a bedside.
+    """
+    score = rec.get("score") or {}
+    total = score.get("total") or 0
+    band = str(score.get("risk_band") or "low").lower()
+    reasons: List[str] = []
+
+    pts = float(_BAND_WEIGHT.get(band, 10))
+    reasons.append(f"risk band {band} ({int(pts)})")
+    fine = min(int(total), 20) / 20.0 * 10.0
+    pts += fine
+    if total:
+        reasons.append(f"{rec.get('scoring_system','news2')} total {total} (+{fine:.0f})")
+
+    if score.get("any_param_eq_3") or score.get("any_pink"):
+        pts += 10
+        reasons.append("single-parameter red flag (+10)")
+
+    repeats = int(rec.get("repeat_count") or 1)
+    if repeats > 1:
+        bump = min(repeats - 1, 3) / 3.0 * 10.0
+        pts += bump
+        reasons.append(f"escalated {repeats}x unacknowledged (+{bump:.0f})")
+
+    age_min = 0.0
+    try:
+        esc = datetime.fromisoformat(str(rec.get("escalated_at","")).replace("Z", "+00:00"))
+        age_min = max(0.0, (datetime.now(timezone.utc) - esc).total_seconds() / 60.0)
+    except (ValueError, TypeError):
+        pass
+    if age_min > 0:
+        bump = min(age_min, 60.0) / 60.0 * 10.0   # anti-starvation, caps at 1h
+        pts += bump
+        reasons.append(f"waiting {int(age_min)} min (+{bump:.0f})")
+
+    pts = max(0.0, min(100.0, pts))
+    pband = ("critical" if pts >= 70 else "high" if pts >= 50
+             else "moderate" if pts >= 30 else "low")
+    return {"priority": round(pts, 1), "priority_band": pband,
+            "priority_reasons": reasons, "age_minutes": round(age_min, 1)}
+
+
 @app.get("/deterioration/escalations", response_model=BaseResponse, tags=["escalation"])
 async def list_escalations(
     limit: int = Query(200, ge=1, le=2000),
     unacknowledged: bool = False,
+    order: str = Query("priority", pattern="^(priority|time)$"),
+    collapse: bool = False,
 ) -> BaseResponse:
+    """Escalation queue.
+
+    order=priority (default) ranks clinically; order=time restores the old
+    newest-first behaviour. collapse=true folds repeat escalations for the
+    same admission into one row carrying repeat_count — 10 of 29 patients
+    held 2-3 open rows each, which is pure queue noise. OPT-IN, not default:
+    collapsing changes what acknowledging a row means - the caller sees one row,
+    but /acknowledge still closes a single escalation_id, so the patient
+    legitimately stays queued until collapsed_ids are closed too. A display layer
+    can opt in; consumers that ack-and-expect-it-gone must not.
+    """
     records = list(_state["escalations"].values())
     if unacknowledged:
         records = [r for r in records if not r.get("acknowledged")]
-    records = sorted(records, key=lambda r: r.get("escalated_at", ""), reverse=True)[:limit]
-    return BaseResponse(data=records)
+
+    if collapse:
+        by_adm: Dict[Any, Dict[str, Any]] = {}
+        for r in records:
+            # Key on acknowledgement too: merging an acknowledged row with an
+            # open one would let a closed escalation absorb live work and drop
+            # it out of the unacknowledged view.
+            key = (str(r.get("hadm_id") or r.get("escalation_id")),
+                   bool(r.get("acknowledged")))
+            keep = by_adm.get(key)
+            cur_t = (r.get("score") or {}).get("total") or 0
+            if keep is None:
+                r = {**r, "repeat_count": 1,
+                     "first_escalated_at": r.get("escalated_at"),
+                     "collapsed_ids": []}
+                by_adm[key] = r
+                continue
+            keep["repeat_count"] = int(keep.get("repeat_count", 1)) + 1
+            keep["collapsed_ids"] = list(keep.get("collapsed_ids") or []) + [r.get("escalation_id")]
+            keep_t = (keep.get("score") or {}).get("total") or 0
+            # keep the worst snapshot as representative; earliest time as first seen
+            if cur_t > keep_t:
+                merged = {**r, "repeat_count": keep["repeat_count"],
+                          "collapsed_ids": keep["collapsed_ids"]}
+                merged["first_escalated_at"] = min(
+                    str(keep.get("first_escalated_at") or ""), str(r.get("escalated_at") or "")) or None
+                by_adm[key] = merged
+            else:
+                keep["first_escalated_at"] = min(
+                    str(keep.get("first_escalated_at") or ""), str(r.get("escalated_at") or "")) or None
+        records = list(by_adm.values())
+
+    records = [{**r, **_escalation_priority(r)} for r in records]
+    for r in records:
+        r["priority_source"] = "heuristic"
+
+    # JEV (TypeSafe System One) re-ranks on top of the deterministic score
+    # when a key is configured. It advises only: the worst it can do is move
+    # a row down. Rows it cannot answer confidently keep their heuristic
+    # score, so the queue degrades to exactly the previous behaviour.
+    if jev_triage.enabled() and order == "priority":
+        try:
+            verdicts = await jev_triage.triage(records[: int(os.environ.get("JEV_MAX_ROWS", "60"))])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("jev triage unavailable, using heuristic only: %s", exc)
+            verdicts = {}
+        for r in records:
+            v = verdicts.get(r.get("escalation_id"))
+            if not v:
+                continue
+            r.update(v)
+            r["priority_source"] = "jev"
+            # Urgency 0-4 maps onto the same 0-100 space the heuristic uses,
+            # blended so a confident model moves the row without erasing the
+            # clinical arithmetic underneath it.
+            urg = v.get("jev_urgency")
+            if urg is not None:
+                model_pts = (float(urg) / 4.0) * 100.0
+                w = float(v.get("jev_confidence") or 0.0)
+                r["priority"] = round((1 - w) * r.get("priority", 0.0) + w * model_pts, 1)
+                r["priority_band"] = ("critical" if r["priority"] >= 70 else
+                                      "high" if r["priority"] >= 50 else
+                                      "moderate" if r["priority"] >= 30 else "low")
+            r["priority_reasons"] = list(r.get("priority_reasons") or []) + [
+                f"jev: {v.get('jev_action')} (confidence {v.get('jev_confidence')})"]
+
+    if order == "priority":
+        records.sort(key=lambda r: (r.get("jev_action_rank", 99),
+                                    -r.get("priority", 0.0),
+                                    r.get("escalated_at", "")))
+    else:
+        records.sort(key=lambda r: r.get("escalated_at", ""), reverse=True)
+    return BaseResponse(data=records[:limit])
 
 
 @app.get("/deterioration/audit", response_model=BaseResponse, tags=["escalation"])
